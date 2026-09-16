@@ -2429,6 +2429,12 @@ def test_a_removed_armed_publisher_is_destroyed_once_its_failsafe_is_acknowledge
             # because the bound ran out.
             wait_until(lambda: not rt._retiring_publishers, timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S / 2)
             wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 0)
+            # Retirement means the RTPS reader *acknowledged* the sample, not
+            # that this subscriber's callback has run: the witness has its own
+            # context and its own executor. Asserting on `received` straight
+            # after retirement reads one for the other, and loses the race
+            # often enough to go red on a busy runner -- which is what it did.
+            wait_until(lambda: len(received) == 2, timeout=DELIVERY_TIMEOUT_S)
         finally:
             stop_sub()
         return received

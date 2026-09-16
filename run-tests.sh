@@ -399,8 +399,13 @@ run() {
     $DOCKER run --rm --ulimit nofile=65536:524288 \
         -e PYTHONDONTWRITEBYTECODE=1 -e "ROS_DOMAIN_ID=${TEST_ROS_DOMAIN_ID}" \
         -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' "$@" \
-        python3 -m pytest test/ -q -p no:cacheprovider "${pytest_args[@]}"
+        python3 -m pytest test/ -q -p no:cacheprovider ${pytest_args[@]+"${pytest_args[@]}"}
 }
+# `${a[@]+"${a[@]}"}` rather than `"${a[@]}"`: under `set -u`, bash 3.2 --
+# which is what macOS ships, and what a developer runs this with -- treats an
+# empty array as unset and aborts. So `./run-tests.sh` with no pytest argument
+# died before starting a container, with `pytest_args[@]: unbound variable`
+# and nothing else. Two people read that as a suite failure today.
 pytest_args=("$@")
 
 # The checkout, and nothing above it. This used to mount the checkout's whole
