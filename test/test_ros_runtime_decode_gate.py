@@ -166,8 +166,17 @@ def test_timestamp_is_capture_time_from_the_raw_path(monkeypatch):
 
     wire, before_pull, after_pull = run(body)
     header, _ = _split_snapshot_frame(wire)
-    # Captured before the pull started, well before the 300ms encode
+    # Captured around the start of the pull, well before the 300ms encode
     # delay finishes — an encode-time bug would land this at or after
     # `after_pull`.
-    assert header["timestamp_ms"] < before_pull
+    #
+    # One publish interval of slack, and it is not padding: the publisher
+    # above keeps running at 30Hz through the pull, so a frame that lands
+    # 8ms after `before_pull` is read carries a capture stamp 8ms later —
+    # still a capture stamp, and still correct. A bare `< before_pull`
+    # tests the publisher's cadence against a clock read, which it loses
+    # roughly one run in three on a shared runner. The break this guards
+    # against lands ~300ms out, so 100ms still separates them by a
+    # factor of three.
+    assert header["timestamp_ms"] < before_pull + 100
     assert after_pull - header["timestamp_ms"] > 250
