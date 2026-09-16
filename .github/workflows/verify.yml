@@ -49,3 +49,33 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: ./ci/package.sh
+
+  # One check name a branch rule can require. The matrix's own checks are
+  # `test (humble)`, `test (jazzy)`, `test (lyrical)` — they are named after
+  # tools/distros.sh and move with it, so a rule pinned to them quietly stops
+  # protecting the distribution it can no longer find, and covers nothing for
+  # one that arrives. This name does not move.
+  verify:
+    needs: [test, package]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: every job this one stands for
+        env:
+          TEST: ${{ needs.test.result }}
+          PACKAGE: ${{ needs.package.result }}
+        run: |
+          set -euo pipefail
+          echo "test=$TEST package=$PACKAGE"
+          # `if: always()` above is the load-bearing half. Without it this job
+          # is *skipped* when a dependency fails, and GitHub counts a skipped
+          # required check as satisfied — this would report green exactly when
+          # it must not. Which is why the results are read here by hand rather
+          # than left to `needs:`.
+          [ "$TEST" = success ] || { echo "the suite did not pass" >&2; exit 1; }
+          # `package` skips itself on a tag by design (see its own `if:`);
+          # anything other than that or success is a packaging break.
+          case "$PACKAGE" in
+            success | skipped) ;;
+            *) echo "the packages did not build" >&2; exit 1 ;;
+          esac
