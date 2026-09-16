@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  DEVELOPMENT-CONTAINER WORKAROUND ONLY. Do not ship this, do not use it on a
+  real robot, do not reference it from package.xml/setup.py.
+
+  Fast DDS (the default RMW on ROS2 Humble) prefers shared memory for
+  same-host data delivery. Discovery still runs over UDP multicast, so two
+  participants in SEPARATE docker containers find each other fine (`ros2
+  topic list` works) — but the actual message data goes through `/dev/shm`,
+  which each container has its OWN, isolated copy of unless the containers
+  share it explicitly. The result is exactly "discovery works, data doesn't":
+  a subscription matches, and then nothing ever arrives.
+
+  This profile disables the shared-memory transport and forces plain UDP, so
+  run-fake-robot.sh and run-bridge.sh (two separate containers, by design —
+  one is meant to stand in for a robot's ROS graph, the other for the bridge
+  that connects to it) can actually exchange data on a dev machine.
+
+  On a REAL robot this must never apply: the bridge shares the host with the
+  robot's other ROS nodes, `/dev/shm` is genuinely shared there, and SHM is
+  both correct and faster than UDP for that same-host traffic. This file is
+  wired only into the two dev-container run scripts, not into the packaged
+  bridge.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_transport</transport_id>
+      <type>UDPv4</type>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="udp_only" is_default_profile="true">
+    <rtps>
+      <userTransports><transport_id>udp_transport</transport_id></userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>

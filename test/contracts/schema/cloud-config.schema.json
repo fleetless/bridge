@@ -1,0 +1,1635 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "type": {
+      "type": "string",
+      "const": "config"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "doc": {
+      "type": "object",
+      "properties": {
+        "fleetless": {
+          "type": "number",
+          "const": 1,
+          "description": "The format version, and the first line of the file. It decides how everything below is read, so a file that omits it — or names a version this cloud does not know — is **refused rather than half understood**."
+        },
+        "messages": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 63,
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+            "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+          },
+          "additionalProperties": {
+            "description": "The message as it will be sent, written out in full: literals are fixed, `${name}` is a hole a caller fills, and a field written `0.0` is one no client can change. Directly after `message:` a `${name}` standing alone names a shared message instead; anywhere inside a body it is a parameter. `null` is refused **at every depth** — omitting a key is the only spelling of \"not set\".",
+            "defaultSnippets": [
+              {
+                "label": "a shared message",
+                "description": "One reusable body, with one parameter hole in it.",
+                "body": {
+                  "linear": {
+                    "x": "\\${speed}"
+                  },
+                  "angular": {
+                    "z": 0
+                  }
+                }
+              }
+            ]
+          },
+          "description": "Reusable message bodies, keyed by name, inserted elsewhere by writing `${name}` directly after `message:`. A shared body may hold placeholders and whoever inserts it declares the parameters, so two publishers can send the same message under different bounds. **A shared message may not insert another**, so a `${name}` inside a body is always a parameter and never a second message.",
+          "defaultSnippets": [
+            {
+              "label": "a shared message",
+              "description": "One reusable body, with one parameter hole in it.",
+              "body": {
+                "${1:drive}": {
+                  "linear": {
+                    "x": "\\${speed}"
+                  },
+                  "angular": {
+                    "z": 0
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "datapoints": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 63,
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+            "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^\\/[A-Za-z_][A-Za-z0-9_]*(?:\\/[A-Za-z_][A-Za-z0-9_]*)*$",
+                "description": "The ROS topic this datapoint reads, as an absolute graph name. One datapoint reads **one** topic: a value assembled from two topics is not expressible here.",
+                "patternErrorMessage": "A ROS graph name is absolute: it begins with a slash, and each segment after a slash starts with a letter or an underscore and continues with letters, digits and underscores — `/camera/image_raw`. A relative name, a trailing slash, a dash or a dot is refused.",
+                "examples": [
+                  "/battery"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^[a-z][a-z0-9_]*\\/(?:msg|srv|action)\\/[A-Za-z][A-Za-z0-9]*$",
+                "description": "The message type carried by `topic`, spelled the way ROS 2 spells it, with the `msg` segment in the middle — `sensor_msgs/msg/BatteryState`, never `sensor_msgs/BatteryState`. It is declared here rather than discovered, so a configuration can be written for a robot that has never been connected; the cloud checks it against the robot's own message definitions only once one is there.",
+                "patternErrorMessage": "A ROS 2 type name has three segments: the package, then `msg`, `srv` or `action`, then the type — `sensor_msgs/msg/BatteryState`, `std_srvs/srv/Trigger`, `nav2_msgs/action/NavigateToPose`. The middle segment is the one usually left out. The package is lower-case with underscores; the type itself is letters and digits, conventionally CamelCase.",
+                "examples": [
+                  "sensor_msgs/msg/BatteryState"
+                ]
+              },
+              "field": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^[a-z_][a-z0-9_]*(?:\\[\\d+\\])?(?:\\.[a-z_][a-z0-9_]*(?:\\[\\d+\\])?)*$",
+                "description": "A dotted path into the message naming the single value this datapoint carries, each segment indexing at most one array level — `ranges[0]`, never `ranges[0][1]`, because ROS 2 has no nested arrays. Without it the datapoint is the whole message, and `numeric`, `chart` and `alerts` are then refused.",
+                "patternErrorMessage": "A field path is dotted and lower-case, and each segment may index at most one array level — `voltage`, `pose.position.x`, `ranges[0]`. ROS 2 has no nested arrays, so a second index on one segment could name nothing that exists.",
+                "examples": [
+                  "voltage",
+                  "pose.position.x",
+                  "ranges[0]"
+                ]
+              },
+              "rate_throttle_hz": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 20,
+                "description": "A ceiling on how often this datapoint is sent, in hertz. Omitted or `0` means no throttling. It is **a ceiling, not a clock**: a slow topic stays slow, a value is never repeated to manufacture a rate, and within a window the newest value wins. The bridge enforces it, so the robot's bandwidth is genuinely saved.",
+                "examples": [
+                  2,
+                  0.5
+                ]
+              },
+              "description": {
+                "description": "Prose about what this value is, for whoever meets it in the console later. It changes nothing the robot does, so a publish that touches only it pushes no configuration at all — but it is carried verbatim into `robot_describe`, where a model that has never seen this robot reads it. The datapoint is offered whenever the role grants it; without one it is offered with `description: null` and the model has less to go on, as for actions, services, publishers and cameras. Omission is the only way to say nothing; an empty string is refused, here and on all five.",
+                "examples": [
+                  "What this value is, for whoever meets it in the console."
+                ],
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              },
+              "numeric": {
+                "type": "object",
+                "properties": {
+                  "scale": {
+                    "type": "number",
+                    "description": "A factor the robot multiplies the raw value by before sending it (`value * scale + offset`). The arithmetic happens once, at the source, so REST, realtime and history can never disagree about a number.",
+                    "examples": [
+                      100
+                    ]
+                  },
+                  "offset": {
+                    "type": "number",
+                    "description": "A constant the robot adds after `scale` (`value * scale + offset`), for a value whose zero sits in the wrong place. Like `scale` it is applied before sending, so history stores the converted value and a later correction cannot reach what is already stored.",
+                    "examples": [
+                      -273.15
+                    ]
+                  },
+                  "unit": {
+                    "type": "string",
+                    "maxLength": 32,
+                    "description": "The unit of the value **after** `scale` and `offset`, not the robot's own. It is shown beside the value and carried by `robot_describe` as its own field, so a model does not have to guess whether 15 means percent, volts or minutes.",
+                    "examples": [
+                      "%"
+                    ]
+                  },
+                  "decimals": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 6,
+                    "description": "How many fraction digits the console shows the value with — value tile, chart axis and tooltip, and the datapoint detail page — and the number `robot_describe` reports as its own field, so a model formats the value the way the console does. Presentation only: the stored value keeps the precision it arrived with, and absent means the console's own default rather than zero.",
+                    "examples": [
+                      1
+                    ]
+                  }
+                },
+                "additionalProperties": false,
+                "description": "Arithmetic and formatting for a numeric value. `scale` and `offset` are applied **on the robot**, before sending, which is why REST, realtime and history all carry identical numbers. `unit` and `decimals` change nothing the robot does, so a publish that touches only those pushes no configuration.",
+                "defaultSnippets": [
+                  {
+                    "label": "a unit, and the arithmetic that produces it",
+                    "description": "A 0..1 fraction sent as a percentage to one decimal. `scale` is applied on the robot before sending, so history stores the converted value and a later correction cannot reach what is already stored.",
+                    "body": {
+                      "scale": 100,
+                      "unit": "\"%\"",
+                      "decimals": 1
+                    }
+                  }
+                ]
+              },
+              "retention": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean",
+                    "description": "Whether values are written to the time series and become queryable. Off by default: without it the value is live only, and nobody who was not watching will ever see it."
+                  },
+                  "interval_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3600,
+                    "description": "How often a value is written to history, in seconds; absent means `300`. **Not** how often it is sent — that is `rate_throttle_hz`. Stored points are billed, so this is the direct lever on what a robot costs, and a bumper that is true for 200 ms does not appear unless a write falls inside it.",
+                    "examples": [
+                      300,
+                      60
+                    ]
+                  },
+                  "max_buffer_values": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100000,
+                    "description": "How many values the robot holds while the bridge is disconnected, to be pushed once it reconnects. The catch-up runs behind live telemetry and job results at a limited rate, so closing a gap never delays the present; without it the series simply has a gap, which is an honest answer.",
+                    "examples": [
+                      5000
+                    ]
+                  }
+                },
+                "additionalProperties": false,
+                "description": "What outlives the moment: whether this value is written to the time series, how often, and how many points the robot buffers while the bridge is away. Absent means no history at all — the value is live only.",
+                "defaultSnippets": [
+                  {
+                    "label": "history, on, with its interval and buffer",
+                    "description": "Writes this value to the time series every 300 seconds and holds 5000 points on the robot while the bridge is away. Stored points are billed, so both numbers are worth choosing rather than inheriting.",
+                    "body": {
+                      "enabled": true,
+                      "interval_seconds": 300,
+                      "max_buffer_values": 5000
+                    }
+                  }
+                ]
+              },
+              "chart": {
+                "type": "object",
+                "properties": {
+                  "y_min": {
+                    "type": "number",
+                    "description": "A fixed floor for the chart's y axis; omitted, the axis scales to the data. `0` is a real floor and is read as `0`, never as unset.",
+                    "examples": [
+                      0
+                    ]
+                  },
+                  "y_max": {
+                    "type": "number",
+                    "description": "A fixed ceiling for the chart's y axis; omitted, the axis scales to the data. It may not sit below `y_min`: a reversed pair is refused here because nothing downstream catches it, and the chart would render empty.",
+                    "examples": [
+                      100
+                    ]
+                  },
+                  "style": {
+                    "type": "string",
+                    "enum": [
+                      "line",
+                      "step"
+                    ],
+                    "description": "How the drawing joins two samples, which is not a matter of taste. `line` claims the value moved evenly between them, roughly true of a temperature or a charge; `step` holds and then jumps, the only honest drawing for a mode, a switch or a counter, where a straight line would show values that never existed.",
+                    "enumDescriptions": [
+                      "Straight lines between samples, so the drawing claims the value moved evenly from one to the next. Right for a quantity that really is continuous — a temperature, a charge level — where a reading taken between two samples would have landed somewhere on that line.",
+                      "Each value is held until the next one arrives, then jumps to it. Right for anything that does not slide between its values — a mode, a state, a switch, a counter — where a sloped line would draw readings the robot never reported."
+                    ]
+                  },
+                  "default_window_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 43200,
+                    "description": "How far back the chart reaches when it is first opened, in minutes; absent means `60`. Only the starting zoom: a viewer may look further, and nothing about what is stored follows from it.",
+                    "examples": [
+                      1440
+                    ]
+                  }
+                },
+                "additionalProperties": false,
+                "description": "How the console draws this value over time: axis bounds, whether the line interpolates or steps, and the window a chart opens on. **Display only** — it changes no stored value, no alert and nothing the robot does, so a publish that touches only it pushes no configuration.",
+                "defaultSnippets": [
+                  {
+                    "label": "axis bounds, and how two samples are joined",
+                    "description": "A fixed 0..100 axis rather than one that scales to the data, and a choice between interpolating and stepping between samples — which is not a matter of taste.",
+                    "body": {
+                      "y_min": 0,
+                      "y_max": 100,
+                      "style": "${1|line,step|}"
+                    }
+                  }
+                ]
+              },
+              "alerts": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 63,
+                  "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+                  "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+                },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "condition": {
+                      "type": "object",
+                      "properties": {
+                        "fire_at": {
+                          "anyOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "boolean"
+                            }
+                          ],
+                          "description": "The value at which the alert starts firing. Alone it is an **equality**: it fires while the value equals `fire_at` and is ok again as soon as it differs, which is what makes a boolean or a string condition meaningful. Adding `resolve_at` turns it into a threshold instead.",
+                          "examples": [
+                            15,
+                            true
+                          ]
+                        },
+                        "resolve_at": {
+                          "type": "number",
+                          "description": "The value at which a firing alert becomes ok again — allowed only when `fire_at` is a number, and it **must differ from it**. That gap is the hysteresis, and it makes the condition a threshold whose direction follows from which of the two values is higher. Without a gap a value sitting on the line flips on every sample.",
+                          "examples": [
+                            18
+                          ]
+                        }
+                      },
+                      "required": [
+                        "fire_at"
+                      ],
+                      "additionalProperties": false,
+                      "description": "When this alert fires and when it is ok again. It carries **no discriminator**: upper threshold, lower threshold or equality all follow from the two values in it. Editing it resets the alert to `ok` on the next publish, while a publish that leaves it untouched keeps the running state.",
+                      "defaultSnippets": [
+                        {
+                          "label": "a threshold, with its hysteresis",
+                          "description": "Fires below 15 and is ok again above 18. The gap is what keeps a value sitting on the line from flipping on every sample; the direction follows from which of the two is higher, and nothing else declares it.",
+                          "body": {
+                            "fire_at": 15,
+                            "resolve_at": 18
+                          }
+                        },
+                        {
+                          "label": "an equality",
+                          "description": "Fires while the value equals `fire_at` and is ok as soon as it differs — the only form a boolean or a string condition can take. No `resolve_at`: adding one would turn this into a threshold, and is refused unless `fire_at` is a number.",
+                          "body": {
+                            "fire_at": true
+                          }
+                        }
+                      ]
+                    },
+                    "severity": {
+                      "type": "string",
+                      "enum": [
+                        "warning",
+                        "error"
+                      ],
+                      "description": "How bad it is when this alert fires; absent means `warning`. It changes no behaviour — nothing is escalated, retried or delivered differently — it travels with the org event and colours the alert wherever it is shown.",
+                      "enumDescriptions": [
+                        "Worth seeing. This is what an alert that names no severity gets.",
+                        "Worth acting on. The only difference from `warning` is how the alert is shown: the same event is written, at the same moment, to the same places."
+                      ]
+                    },
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 120,
+                      "description": "A human-readable label shown wherever this alert appears, in place of its bare key. It is not the alert's identity — the key is — so the label can be reworded freely, while changing the key deletes one alert and creates another.",
+                      "examples": [
+                        "Battery low"
+                      ]
+                    },
+                    "enabled": {
+                      "type": "boolean",
+                      "description": "Whether this alert is evaluated at all. Absent means on, the opposite of `retention.enabled`: an alert that is written down watches unless it is explicitly switched off, which is how one is silenced without losing the key that identifies it."
+                    }
+                  },
+                  "required": [
+                    "condition"
+                  ],
+                  "additionalProperties": false,
+                  "defaultSnippets": [
+                    {
+                      "label": "an alert, with its condition",
+                      "description": "One whole alert: the label shown in place of its key, and the threshold with the gap that keeps it from flipping on every sample.",
+                      "body": {
+                        "condition": {
+                          "fire_at": 15,
+                          "resolve_at": 18
+                        },
+                        "name": "${2:Battery low}"
+                      }
+                    }
+                  ]
+                },
+                "description": "Alerts watching this value, keyed by slug; each moves between `ok` and `firing` and writes an org event on every transition. No mail is sent. **The key is the identity**, so renaming an alert is a delete plus a create: its runtime state is lost, and an alert that is still true fires again.",
+                "defaultSnippets": [
+                  {
+                    "label": "an alert, with its condition",
+                    "description": "One whole alert: the label shown in place of its key, and the threshold with the gap that keeps it from flipping on every sample.",
+                    "body": {
+                      "${1:battery_low}": {
+                        "condition": {
+                          "fire_at": 15,
+                          "resolve_at": 18
+                        },
+                        "name": "${2:Battery low}"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "topic",
+              "type"
+            ],
+            "additionalProperties": false,
+            "defaultSnippets": [
+              {
+                "label": "a datapoint",
+                "description": "One value the robot publishes: one field of one topic.",
+                "body": {
+                  "topic": "${2:/battery}",
+                  "type": "${3:sensor_msgs/msg/BatteryState}",
+                  "field": "${4:voltage}",
+                  "description": "${5:What this value is, for whoever meets it in the console.}"
+                }
+              },
+              {
+                "label": "a numeric datapoint, with history and a chart",
+                "description": "A number with its unit, what is kept of it and how it is drawn — the blocks a plain datapoint leaves out.",
+                "body": {
+                  "topic": "${2:/battery}",
+                  "type": "${3:sensor_msgs/msg/BatteryState}",
+                  "field": "${4:percentage}",
+                  "description": "${5:What this value is, for whoever meets it in the console.}",
+                  "numeric": {
+                    "scale": 100,
+                    "unit": "\"%\"",
+                    "decimals": 1
+                  },
+                  "retention": {
+                    "enabled": true,
+                    "interval_seconds": 300
+                  },
+                  "chart": {
+                    "y_min": 0,
+                    "y_max": 100,
+                    "style": "line"
+                  }
+                }
+              }
+            ]
+          },
+          "description": "Values the robot publishes, each one field of one topic or a whole topic, and **never several topics**. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "defaultSnippets": [
+            {
+              "label": "a datapoint",
+              "description": "One value the robot publishes: one field of one topic.",
+              "body": {
+                "${1:battery_voltage}": {
+                  "topic": "${2:/battery}",
+                  "type": "${3:sensor_msgs/msg/BatteryState}",
+                  "field": "${4:voltage}",
+                  "description": "${5:What this value is, for whoever meets it in the console.}"
+                }
+              }
+            },
+            {
+              "label": "a numeric datapoint, with history and a chart",
+              "description": "A number with its unit, what is kept of it and how it is drawn — the blocks a plain datapoint leaves out.",
+              "body": {
+                "${1:battery}": {
+                  "topic": "${2:/battery}",
+                  "type": "${3:sensor_msgs/msg/BatteryState}",
+                  "field": "${4:percentage}",
+                  "description": "${5:What this value is, for whoever meets it in the console.}",
+                  "numeric": {
+                    "scale": 100,
+                    "unit": "\"%\"",
+                    "decimals": 1
+                  },
+                  "retention": {
+                    "enabled": true,
+                    "interval_seconds": 300
+                  },
+                  "chart": {
+                    "y_min": 0,
+                    "y_max": 100,
+                    "style": "line"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "actions": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 63,
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+            "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "ros_name": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^\\/[A-Za-z_][A-Za-z0-9_]*(?:\\/[A-Za-z_][A-Za-z0-9_]*)*$",
+                "description": "The action server on the robot, as an absolute graph name — this is what the bridge sends the goal to. Clients never see it: they address this entry by its slug, so a server can be renamed on the robot without a single app changing.",
+                "patternErrorMessage": "A ROS graph name is absolute: it begins with a slash, and each segment after a slash starts with a letter or an underscore and continues with letters, digits and underscores — `/camera/image_raw`. A relative name, a trailing slash, a dash or a dot is refused.",
+                "examples": [
+                  "/navigate_to_pose"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^[a-z][a-z0-9_]*\\/(?:msg|srv|action)\\/[A-Za-z][A-Za-z0-9]*$",
+                "description": "The action type `ros_name` implements, with the `action` segment in the middle — `nav2_msgs/action/NavigateToPose`, never `nav2_msgs/NavigateToPose`. Declared rather than introspected, so an action can be configured for a robot that has never connected; the cloud checks it against the robot's own definitions only once one is there.",
+                "patternErrorMessage": "A ROS 2 type name has three segments: the package, then `msg`, `srv` or `action`, then the type — `sensor_msgs/msg/BatteryState`, `std_srvs/srv/Trigger`, `nav2_msgs/action/NavigateToPose`. The middle segment is the one usually left out. The package is lower-case with underscores; the type itself is letters and digits, conventionally CamelCase.",
+                "examples": [
+                  "nav2_msgs/action/NavigateToPose"
+                ]
+              },
+              "message": {
+                "description": "The message as it will be sent, written out in full: literals are fixed, `${name}` is a hole a caller fills, and a field written `0.0` is one no client can change. Directly after `message:` a `${name}` standing alone names a shared message instead; anywhere inside a body it is a parameter. `null` is refused **at every depth** — omitting a key is the only spelling of \"not set\"."
+              },
+              "parameters": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 63,
+                  "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+                  "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+                },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "bool",
+                        "byte",
+                        "char",
+                        "int8",
+                        "uint8",
+                        "int16",
+                        "uint16",
+                        "int32",
+                        "uint32",
+                        "int64",
+                        "uint64",
+                        "float32",
+                        "float64",
+                        "string",
+                        "wstring"
+                      ],
+                      "description": "The ROS 2 primitive a value of this parameter must be, spelled the way ROS 2 spells it — `float64`, not `double`. It **decides which other constraints are allowed at all**: `min_value` and `max_value` need a numeric type, `regex` needs a string one, and a constraint on the wrong type is refused rather than quietly ignored.",
+                      "enumDescriptions": [
+                        "A `true`/`false` flag. The one type that takes no constraint at all: no bounds, no `regex`, no `enum`.",
+                        "One raw octet, `0` to `255`, carrying no character meaning. It counts as an integer here, so bounds and an `enum` apply to it.",
+                        "A single-octet character code, `0` to `255`. ROS 2 keeps it apart from `byte` although the width is the same, and it travels as a number rather than as a one-character string.",
+                        "A whole number from `-128` to `127`.",
+                        "A whole number from `0` to `255`.",
+                        "A whole number from `-32768` to `32767`.",
+                        "A whole number from `0` to `65535`.",
+                        "A whole number from `-2147483648` to `2147483647` — the usual choice for a count or an index.",
+                        "A whole number from `0` to `4294967295`.",
+                        "A whole number from `-9223372036854775808` to `9223372036854775807`.",
+                        "A whole number from `0` to `18446744073709551615`.",
+                        "A single-precision number, roughly seven significant digits.",
+                        "A double-precision number, roughly fifteen significant digits. This is what other languages call `double`; ROS 2 spells it `float64` and so does this field.",
+                        "Text, carried as UTF-8. One of the two types a `regex` may constrain.",
+                        "Text as wide characters, and rare — nearly every ROS 2 interface uses `string`. It takes a `regex` on the same terms."
+                      ]
+                    },
+                    "default": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ],
+                      "description": "The value used when a caller omits this parameter: **without a `default` the parameter is required**, because the message cannot be built without it. It must itself satisfy `min_value`, `max_value`, `enum` and `regex` — a default the constraints reject is refused here rather than becoming the one value that reaches the robot unchecked."
+                    },
+                    "min_value": {
+                      "type": "number",
+                      "description": "The lowest value a caller may send; numeric types only. It is **enforced in the cloud, before anything reaches the robot** — this is where a speed limit actually holds, rather than in the app that is supposed to respect it.",
+                      "examples": [
+                        -0.5
+                      ]
+                    },
+                    "max_value": {
+                      "type": "number",
+                      "description": "The highest value a caller may send; numeric types only, and it may not sit below `min_value`. A reversed pair is refused at parse time, because nothing downstream catches it and every call would then fail against a bound no value can satisfy.",
+                      "examples": [
+                        0.5
+                      ]
+                    },
+                    "enum": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          }
+                        ]
+                      },
+                      "description": "The complete set of values a caller may send. Integer and string types only — **never a float**, because equality on floating point is unreliable and an enumerated float list is a trap that only shows up in operation. Every entry must match `type`, and a `default` must be one of them."
+                    },
+                    "regex": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "A pattern the value must match; string types only. It is compiled as a JavaScript regular expression and is **not anchored**, so `[a-z]+` accepts any value that merely contains a lowercase run — a pattern meant to cover the whole value writes its own `^` and `$`.",
+                      "examples": [
+                        "^[a-z_]+$"
+                      ]
+                    },
+                    "description": {
+                      "description": "What this parameter means, in the developer's own words, and documentation only — the robot does nothing with it. It travels into the input schema `robot_describe` publishes for this call, beside the bounds, so `type` and the range say what the value *is* and this is the only place that says what it *does*.",
+                      "examples": [
+                        "What a caller is choosing when they set this."
+                      ],
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 500
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ],
+                  "additionalProperties": false,
+                  "defaultSnippets": [
+                    {
+                      "label": "a parameter, with its bounds",
+                      "description": "One hole a caller fills: what type it is, what values it may take, and what it means. Without a `default` it is required, and the bounds are enforced in the cloud before anything reaches the robot.",
+                      "body": {
+                        "type": "${2:float64}",
+                        "min_value": -0.5,
+                        "max_value": 0.5,
+                        "description": "${3:What a caller is choosing when they set this.}"
+                      }
+                    }
+                  ]
+                },
+                "description": "The holes in this entry's `message` that a caller fills, keyed by **parameter name** rather than by field path — so the name survives the field moving inside the message, and a caller sends something that means what it says. Every declared parameter must appear somewhere in the message and every `${name}` in the message must be declared; either half alone is an error.",
+                "defaultSnippets": [
+                  {
+                    "label": "a parameter, with its bounds",
+                    "description": "One hole a caller fills: what type it is, what values it may take, and what it means. Without a `default` it is required, and the bounds are enforced in the cloud before anything reaches the robot.",
+                    "body": {
+                      "${1:speed}": {
+                        "type": "${2:float64}",
+                        "min_value": -0.5,
+                        "max_value": 0.5,
+                        "description": "${3:What a caller is choosing when they set this.}"
+                      }
+                    }
+                  }
+                ]
+              },
+              "description": {
+                "description": "What this action does, in the developer's own words — documentation for the console and for MCP clients, which is all it is: the robot does nothing with it. It is carried verbatim into `robot_describe` and read by a model that has never seen this robot. The action is offered whenever the role grants it; without one it is offered with `description: null`, and the model has nothing but the slug.",
+                "examples": [
+                  "Drives to a target pose on the map."
+                ],
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "required": [
+              "ros_name",
+              "type"
+            ],
+            "additionalProperties": false,
+            "defaultSnippets": [
+              {
+                "label": "an action",
+                "description": "One thing the robot does on request, reported as a job with progress.",
+                "body": {
+                  "ros_name": "${2:/navigate_to_pose}",
+                  "type": "${3:nav2_msgs/action/NavigateToPose}",
+                  "description": "${4:Drives to a target pose on the map.}"
+                }
+              }
+            ]
+          },
+          "description": "Things the robot does on request that take time, each reported as a job with progress. **At most one job runs per action slug**: a second call is refused `busy`, and every observer of that slug watches the same job. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "defaultSnippets": [
+            {
+              "label": "an action",
+              "description": "One thing the robot does on request, reported as a job with progress.",
+              "body": {
+                "${1:navigate}": {
+                  "ros_name": "${2:/navigate_to_pose}",
+                  "type": "${3:nav2_msgs/action/NavigateToPose}",
+                  "description": "${4:Drives to a target pose on the map.}"
+                }
+              }
+            }
+          ]
+        },
+        "services": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 63,
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+            "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "ros_name": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^\\/[A-Za-z_][A-Za-z0-9_]*(?:\\/[A-Za-z_][A-Za-z0-9_]*)*$",
+                "description": "The ROS service the robot answers on, as an absolute graph name. The call is one request and one reply with no progress in between, so whatever this service does has to finish inside that reply; anything long-running belongs in `actions`.",
+                "patternErrorMessage": "A ROS graph name is absolute: it begins with a slash, and each segment after a slash starts with a letter or an underscore and continues with letters, digits and underscores — `/camera/image_raw`. A relative name, a trailing slash, a dash or a dot is refused.",
+                "examples": [
+                  "/reset_odometry"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^[a-z][a-z0-9_]*\\/(?:msg|srv|action)\\/[A-Za-z][A-Za-z0-9]*$",
+                "description": "The service type `ros_name` implements, with the `srv` segment in the middle — `std_srvs/srv/Trigger`. A type whose request has no fields, like `Trigger`, needs neither `message` nor `parameters`: there is nothing to fill.",
+                "patternErrorMessage": "A ROS 2 type name has three segments: the package, then `msg`, `srv` or `action`, then the type — `sensor_msgs/msg/BatteryState`, `std_srvs/srv/Trigger`, `nav2_msgs/action/NavigateToPose`. The middle segment is the one usually left out. The package is lower-case with underscores; the type itself is letters and digits, conventionally CamelCase.",
+                "examples": [
+                  "std_srvs/srv/Trigger"
+                ]
+              },
+              "message": {
+                "description": "The message as it will be sent, written out in full: literals are fixed, `${name}` is a hole a caller fills, and a field written `0.0` is one no client can change. Directly after `message:` a `${name}` standing alone names a shared message instead; anywhere inside a body it is a parameter. `null` is refused **at every depth** — omitting a key is the only spelling of \"not set\"."
+              },
+              "parameters": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 63,
+                  "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+                  "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+                },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "bool",
+                        "byte",
+                        "char",
+                        "int8",
+                        "uint8",
+                        "int16",
+                        "uint16",
+                        "int32",
+                        "uint32",
+                        "int64",
+                        "uint64",
+                        "float32",
+                        "float64",
+                        "string",
+                        "wstring"
+                      ],
+                      "description": "The ROS 2 primitive a value of this parameter must be, spelled the way ROS 2 spells it — `float64`, not `double`. It **decides which other constraints are allowed at all**: `min_value` and `max_value` need a numeric type, `regex` needs a string one, and a constraint on the wrong type is refused rather than quietly ignored.",
+                      "enumDescriptions": [
+                        "A `true`/`false` flag. The one type that takes no constraint at all: no bounds, no `regex`, no `enum`.",
+                        "One raw octet, `0` to `255`, carrying no character meaning. It counts as an integer here, so bounds and an `enum` apply to it.",
+                        "A single-octet character code, `0` to `255`. ROS 2 keeps it apart from `byte` although the width is the same, and it travels as a number rather than as a one-character string.",
+                        "A whole number from `-128` to `127`.",
+                        "A whole number from `0` to `255`.",
+                        "A whole number from `-32768` to `32767`.",
+                        "A whole number from `0` to `65535`.",
+                        "A whole number from `-2147483648` to `2147483647` — the usual choice for a count or an index.",
+                        "A whole number from `0` to `4294967295`.",
+                        "A whole number from `-9223372036854775808` to `9223372036854775807`.",
+                        "A whole number from `0` to `18446744073709551615`.",
+                        "A single-precision number, roughly seven significant digits.",
+                        "A double-precision number, roughly fifteen significant digits. This is what other languages call `double`; ROS 2 spells it `float64` and so does this field.",
+                        "Text, carried as UTF-8. One of the two types a `regex` may constrain.",
+                        "Text as wide characters, and rare — nearly every ROS 2 interface uses `string`. It takes a `regex` on the same terms."
+                      ]
+                    },
+                    "default": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ],
+                      "description": "The value used when a caller omits this parameter: **without a `default` the parameter is required**, because the message cannot be built without it. It must itself satisfy `min_value`, `max_value`, `enum` and `regex` — a default the constraints reject is refused here rather than becoming the one value that reaches the robot unchecked."
+                    },
+                    "min_value": {
+                      "type": "number",
+                      "description": "The lowest value a caller may send; numeric types only. It is **enforced in the cloud, before anything reaches the robot** — this is where a speed limit actually holds, rather than in the app that is supposed to respect it.",
+                      "examples": [
+                        -0.5
+                      ]
+                    },
+                    "max_value": {
+                      "type": "number",
+                      "description": "The highest value a caller may send; numeric types only, and it may not sit below `min_value`. A reversed pair is refused at parse time, because nothing downstream catches it and every call would then fail against a bound no value can satisfy.",
+                      "examples": [
+                        0.5
+                      ]
+                    },
+                    "enum": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          }
+                        ]
+                      },
+                      "description": "The complete set of values a caller may send. Integer and string types only — **never a float**, because equality on floating point is unreliable and an enumerated float list is a trap that only shows up in operation. Every entry must match `type`, and a `default` must be one of them."
+                    },
+                    "regex": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "A pattern the value must match; string types only. It is compiled as a JavaScript regular expression and is **not anchored**, so `[a-z]+` accepts any value that merely contains a lowercase run — a pattern meant to cover the whole value writes its own `^` and `$`.",
+                      "examples": [
+                        "^[a-z_]+$"
+                      ]
+                    },
+                    "description": {
+                      "description": "What this parameter means, in the developer's own words, and documentation only — the robot does nothing with it. It travels into the input schema `robot_describe` publishes for this call, beside the bounds, so `type` and the range say what the value *is* and this is the only place that says what it *does*.",
+                      "examples": [
+                        "What a caller is choosing when they set this."
+                      ],
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 500
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ],
+                  "additionalProperties": false,
+                  "defaultSnippets": [
+                    {
+                      "label": "a parameter, with its bounds",
+                      "description": "One hole a caller fills: what type it is, what values it may take, and what it means. Without a `default` it is required, and the bounds are enforced in the cloud before anything reaches the robot.",
+                      "body": {
+                        "type": "${2:float64}",
+                        "min_value": -0.5,
+                        "max_value": 0.5,
+                        "description": "${3:What a caller is choosing when they set this.}"
+                      }
+                    }
+                  ]
+                },
+                "description": "The holes in this entry's `message` that a caller fills, keyed by **parameter name** rather than by field path — so the name survives the field moving inside the message, and a caller sends something that means what it says. Every declared parameter must appear somewhere in the message and every `${name}` in the message must be declared; either half alone is an error.",
+                "defaultSnippets": [
+                  {
+                    "label": "a parameter, with its bounds",
+                    "description": "One hole a caller fills: what type it is, what values it may take, and what it means. Without a `default` it is required, and the bounds are enforced in the cloud before anything reaches the robot.",
+                    "body": {
+                      "${1:speed}": {
+                        "type": "${2:float64}",
+                        "min_value": -0.5,
+                        "max_value": 0.5,
+                        "description": "${3:What a caller is choosing when they set this.}"
+                      }
+                    }
+                  }
+                ]
+              },
+              "description": {
+                "description": "What this service does, in the developer's own words. The robot does nothing with it — the readers are the console and MCP clients, and without one the service is still offered, with `description: null`, exactly as for an action. It sits on the configuration rather than on the app, so one wording is true for every app that reaches this robot.",
+                "examples": [
+                  "Resets odometry to the origin."
+                ],
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "required": [
+              "ros_name",
+              "type"
+            ],
+            "additionalProperties": false,
+            "defaultSnippets": [
+              {
+                "label": "a service",
+                "description": "One request, one reply, no progress in between.",
+                "body": {
+                  "ros_name": "${2:/reset_odometry}",
+                  "type": "${3:std_srvs/srv/Trigger}",
+                  "description": "${4:Resets odometry to the origin.}"
+                }
+              }
+            ]
+          },
+          "description": "ROS service calls the robot answers — one request, one reply. Unlike an action a service reports **no progress** and the call returns with its result already on the job, so there is nothing left to observe; a second concurrent call is still refused `busy`, exactly as for an action. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "defaultSnippets": [
+            {
+              "label": "a service",
+              "description": "One request, one reply, no progress in between.",
+              "body": {
+                "${1:reset_odometry}": {
+                  "ros_name": "${2:/reset_odometry}",
+                  "type": "${3:std_srvs/srv/Trigger}",
+                  "description": "${4:Resets odometry to the origin.}"
+                }
+              }
+            }
+          ]
+        },
+        "publishers": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 63,
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+            "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^\\/[A-Za-z_][A-Za-z0-9_]*(?:\\/[A-Za-z_][A-Za-z0-9_]*)*$",
+                "description": "The ROS topic the message is published onto, as an absolute graph name. **No client ever names a topic**: a caller addresses this entry by its slug, so the topics an app can write to are exactly the ones written in this file.",
+                "patternErrorMessage": "A ROS graph name is absolute: it begins with a slash, and each segment after a slash starts with a letter or an underscore and continues with letters, digits and underscores — `/camera/image_raw`. A relative name, a trailing slash, a dash or a dot is refused.",
+                "examples": [
+                  "/cmd_vel"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "maxLength": 255,
+                "pattern": "^[a-z][a-z0-9_]*\\/(?:msg|srv|action)\\/[A-Za-z][A-Za-z0-9]*$",
+                "description": "The message type of `topic`, spelled the way ROS 2 spells it, with the `msg` segment. It fixes the shape that `message` and `failsafe.message` must both fill, which is why one publisher carries one type and a second type needs a second publisher.",
+                "patternErrorMessage": "A ROS 2 type name has three segments: the package, then `msg`, `srv` or `action`, then the type — `sensor_msgs/msg/BatteryState`, `std_srvs/srv/Trigger`, `nav2_msgs/action/NavigateToPose`. The middle segment is the one usually left out. The package is lower-case with underscores; the type itself is letters and digits, conventionally CamelCase.",
+                "examples": [
+                  "geometry_msgs/msg/Twist"
+                ]
+              },
+              "message": {
+                "description": "The message as it will be sent, written out in full: literals are fixed, `${name}` is a hole a caller fills, and a field written `0.0` is one no client can change. Directly after `message:` a `${name}` standing alone names a shared message instead; anywhere inside a body it is a parameter. `null` is refused **at every depth** — omitting a key is the only spelling of \"not set\"."
+              },
+              "parameters": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 2,
+                  "maxLength": 63,
+                  "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+                  "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+                },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "type": {
+                      "type": "string",
+                      "enum": [
+                        "bool",
+                        "byte",
+                        "char",
+                        "int8",
+                        "uint8",
+                        "int16",
+                        "uint16",
+                        "int32",
+                        "uint32",
+                        "int64",
+                        "uint64",
+                        "float32",
+                        "float64",
+                        "string",
+                        "wstring"
+                      ],
+                      "description": "The ROS 2 primitive a value of this parameter must be, spelled the way ROS 2 spells it — `float64`, not `double`. It **decides which other constraints are allowed at all**: `min_value` and `max_value` need a numeric type, `regex` needs a string one, and a constraint on the wrong type is refused rather than quietly ignored.",
+                      "enumDescriptions": [
+                        "A `true`/`false` flag. The one type that takes no constraint at all: no bounds, no `regex`, no `enum`.",
+                        "One raw octet, `0` to `255`, carrying no character meaning. It counts as an integer here, so bounds and an `enum` apply to it.",
+                        "A single-octet character code, `0` to `255`. ROS 2 keeps it apart from `byte` although the width is the same, and it travels as a number rather than as a one-character string.",
+                        "A whole number from `-128` to `127`.",
+                        "A whole number from `0` to `255`.",
+                        "A whole number from `-32768` to `32767`.",
+                        "A whole number from `0` to `65535`.",
+                        "A whole number from `-2147483648` to `2147483647` — the usual choice for a count or an index.",
+                        "A whole number from `0` to `4294967295`.",
+                        "A whole number from `-9223372036854775808` to `9223372036854775807`.",
+                        "A whole number from `0` to `18446744073709551615`.",
+                        "A single-precision number, roughly seven significant digits.",
+                        "A double-precision number, roughly fifteen significant digits. This is what other languages call `double`; ROS 2 spells it `float64` and so does this field.",
+                        "Text, carried as UTF-8. One of the two types a `regex` may constrain.",
+                        "Text as wide characters, and rare — nearly every ROS 2 interface uses `string`. It takes a `regex` on the same terms."
+                      ]
+                    },
+                    "default": {
+                      "anyOf": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "boolean"
+                        }
+                      ],
+                      "description": "The value used when a caller omits this parameter: **without a `default` the parameter is required**, because the message cannot be built without it. It must itself satisfy `min_value`, `max_value`, `enum` and `regex` — a default the constraints reject is refused here rather than becoming the one value that reaches the robot unchecked."
+                    },
+                    "min_value": {
+                      "type": "number",
+                      "description": "The lowest value a caller may send; numeric types only. It is **enforced in the cloud, before anything reaches the robot** — this is where a speed limit actually holds, rather than in the app that is supposed to respect it.",
+                      "examples": [
+                        -0.5
+                      ]
+                    },
+                    "max_value": {
+                      "type": "number",
+                      "description": "The highest value a caller may send; numeric types only, and it may not sit below `min_value`. A reversed pair is refused at parse time, because nothing downstream catches it and every call would then fail against a bound no value can satisfy.",
+                      "examples": [
+                        0.5
+                      ]
+                    },
+                    "enum": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          }
+                        ]
+                      },
+                      "description": "The complete set of values a caller may send. Integer and string types only — **never a float**, because equality on floating point is unreliable and an enumerated float list is a trap that only shows up in operation. Every entry must match `type`, and a `default` must be one of them."
+                    },
+                    "regex": {
+                      "type": "string",
+                      "minLength": 1,
+                      "description": "A pattern the value must match; string types only. It is compiled as a JavaScript regular expression and is **not anchored**, so `[a-z]+` accepts any value that merely contains a lowercase run — a pattern meant to cover the whole value writes its own `^` and `$`.",
+                      "examples": [
+                        "^[a-z_]+$"
+                      ]
+                    },
+                    "description": {
+                      "description": "What this parameter means, in the developer's own words, and documentation only — the robot does nothing with it. It travels into the input schema `robot_describe` publishes for this call, beside the bounds, so `type` and the range say what the value *is* and this is the only place that says what it *does*.",
+                      "examples": [
+                        "What a caller is choosing when they set this."
+                      ],
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 500
+                    }
+                  },
+                  "required": [
+                    "type"
+                  ],
+                  "additionalProperties": false,
+                  "defaultSnippets": [
+                    {
+                      "label": "a parameter, with its bounds",
+                      "description": "One hole a caller fills: what type it is, what values it may take, and what it means. Without a `default` it is required, and the bounds are enforced in the cloud before anything reaches the robot.",
+                      "body": {
+                        "type": "${2:float64}",
+                        "min_value": -0.5,
+                        "max_value": 0.5,
+                        "description": "${3:What a caller is choosing when they set this.}"
+                      }
+                    }
+                  ]
+                },
+                "description": "The holes in this entry's `message` that a caller fills, keyed by **parameter name** rather than by field path — so the name survives the field moving inside the message, and a caller sends something that means what it says. Every declared parameter must appear somewhere in the message and every `${name}` in the message must be declared; either half alone is an error.",
+                "defaultSnippets": [
+                  {
+                    "label": "a parameter, with its bounds",
+                    "description": "One hole a caller fills: what type it is, what values it may take, and what it means. Without a `default` it is required, and the bounds are enforced in the cloud before anything reaches the robot.",
+                    "body": {
+                      "${1:speed}": {
+                        "type": "${2:float64}",
+                        "min_value": -0.5,
+                        "max_value": 0.5,
+                        "description": "${3:What a caller is choosing when they set this.}"
+                      }
+                    }
+                  }
+                ]
+              },
+              "failsafe": {
+                "type": "object",
+                "properties": {
+                  "timeout_ms": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 60000,
+                    "description": "How long the bridge waits for the client's next send before sending the failsafe message itself, in milliseconds. The deadline runs **on the robot**, so it still fires when the link to the cloud is what failed — which is the case it exists for.",
+                    "examples": [
+                      500,
+                      1000
+                    ]
+                  },
+                  "message": {
+                    "description": "What the bridge sends once `timeout_ms` runs out — for a drive command, a zero twist. It must be safe in **every** state, because it is sent precisely when nobody is watching any more, and it may hold no placeholder: there is no caller left to fill one."
+                  }
+                },
+                "required": [
+                  "timeout_ms",
+                  "message"
+                ],
+                "additionalProperties": false,
+                "description": "What the bridge sends **by itself** once a client stops sending, and how long it waits first. This is the format's safety story in one field: a client that crashes, loses its connection or whose operator closes the window does not leave a robot driving. The message may hold no placeholder, inline or through a shared message — there is nobody left to fill one.",
+                "defaultSnippets": [
+                  {
+                    "label": "a deadline, and the message it sends",
+                    "description": "Half a second of silence and then a zero twist. The deadline runs on the robot, so it still fires when the link to the cloud is what failed — which is the case it exists for.",
+                    "body": {
+                      "timeout_ms": 500,
+                      "message": {
+                        "linear": {
+                          "x": 0
+                        },
+                        "angular": {
+                          "z": 0
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "quiet_timeout_ms": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 600000,
+                "description": "How long this publisher must stay silent before a **different** user may send to it. Whoever sends holds it implicitly exclusive, with no session and no lock, so this one number is the whole handover policy: too short and two operators fight over one robot, too long and a crashed client blocks it for everyone.",
+                "examples": [
+                  2000
+                ]
+              },
+              "description": {
+                "description": "What sending to this publisher does, in the developer's own words. It is documentation for the console and for MCP clients — the robot does nothing with it — and as for actions and services, the publisher is offered whether or not one is written, with `description: null` when it is not. A caller sends here repeatedly and continuously rather than once, which is why this kind alone carries `failsafe` and `quiet_timeout_ms`.",
+                "examples": [
+                  "Velocity command. If sending stops, the robot stops."
+                ],
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "required": [
+              "topic",
+              "type",
+              "message",
+              "failsafe",
+              "quiet_timeout_ms"
+            ],
+            "additionalProperties": false,
+            "defaultSnippets": [
+              {
+                "label": "a publisher, with its parameters and its failsafe",
+                "description": "A topic clients may send to: what is fixed, what a caller fills, and what the bridge sends by itself once the caller falls silent.",
+                "body": {
+                  "topic": "${2:/cmd_vel}",
+                  "type": "${3:geometry_msgs/msg/Twist}",
+                  "message": {
+                    "linear": {
+                      "x": "\\${speed}"
+                    },
+                    "angular": {
+                      "z": "\\${turn}"
+                    }
+                  },
+                  "parameters": {
+                    "speed": {
+                      "type": "float64",
+                      "min_value": -0.5,
+                      "max_value": 0.5,
+                      "default": 0
+                    },
+                    "turn": {
+                      "type": "float64",
+                      "min_value": -0.5,
+                      "max_value": 0.5,
+                      "default": 0
+                    }
+                  },
+                  "failsafe": {
+                    "timeout_ms": 500,
+                    "message": {
+                      "linear": {
+                        "x": 0
+                      },
+                      "angular": {
+                        "z": 0
+                      }
+                    }
+                  },
+                  "quiet_timeout_ms": 2000,
+                  "description": "${4:Velocity command. If sending stops, the robot stops.}"
+                }
+              }
+            ]
+          },
+          "description": "Topics clients may send to, and where the format's whole safety story lives. The `message` template fixes every value a caller cannot change, and **`failsafe` is required**: once a client falls silent the bridge sends the failsafe message itself, so an operator whose window closed does not leave a robot driving. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "defaultSnippets": [
+            {
+              "label": "a publisher, with its parameters and its failsafe",
+              "description": "A topic clients may send to: what is fixed, what a caller fills, and what the bridge sends by itself once the caller falls silent.",
+              "body": {
+                "${1:drive}": {
+                  "topic": "${2:/cmd_vel}",
+                  "type": "${3:geometry_msgs/msg/Twist}",
+                  "message": {
+                    "linear": {
+                      "x": "\\${speed}"
+                    },
+                    "angular": {
+                      "z": "\\${turn}"
+                    }
+                  },
+                  "parameters": {
+                    "speed": {
+                      "type": "float64",
+                      "min_value": -0.5,
+                      "max_value": 0.5,
+                      "default": 0
+                    },
+                    "turn": {
+                      "type": "float64",
+                      "min_value": -0.5,
+                      "max_value": 0.5,
+                      "default": 0
+                    }
+                  },
+                  "failsafe": {
+                    "timeout_ms": 500,
+                    "message": {
+                      "linear": {
+                        "x": 0
+                      },
+                      "angular": {
+                        "z": 0
+                      }
+                    }
+                  },
+                  "quiet_timeout_ms": 2000,
+                  "description": "${4:Velocity command. If sending stops, the robot stops.}"
+                }
+              }
+            }
+          ]
+        },
+        "cameras": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 2,
+            "maxLength": 63,
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
+            "patternErrorMessage": "A name is lower-case: it starts with a letter, continues with letters and digits, and joins further words with a single underscore — `battery_voltage`. Capitals, dashes, dots, spaces, a leading digit and a doubled or trailing underscore are all refused."
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "source": {
+                "oneOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "ros",
+                        "description": "Selects the ROS image-topic source: this camera then carries `topic` and `type`, and no field of another kind."
+                      },
+                      "topic": {
+                        "type": "string",
+                        "maxLength": 255,
+                        "pattern": "^\\/[A-Za-z_][A-Za-z0-9_]*(?:\\/[A-Za-z_][A-Za-z0-9_]*)*$",
+                        "description": "The ROS image topic the bridge subscribes to, as an absolute graph name. Clients never name it — they address the camera by its slug — so the topic can be renamed on the robot without an app changing.",
+                        "patternErrorMessage": "A ROS graph name is absolute: it begins with a slash, and each segment after a slash starts with a letter or an underscore and continues with letters, digits and underscores — `/camera/image_raw`. A relative name, a trailing slash, a dash or a dot is refused.",
+                        "examples": [
+                          "/camera/image_raw"
+                        ]
+                      },
+                      "type": {
+                        "type": "string",
+                        "maxLength": 255,
+                        "pattern": "^[a-z][a-z0-9_]*\\/(?:msg|srv|action)\\/[A-Za-z][A-Za-z0-9]*$",
+                        "description": "The message type of `topic`: `sensor_msgs/msg/Image` for raw frames, `sensor_msgs/msg/CompressedImage` for a camera that already encodes. Declared here rather than introspected, so a camera can be configured for a robot that has never connected.",
+                        "patternErrorMessage": "A ROS 2 type name has three segments: the package, then `msg`, `srv` or `action`, then the type — `sensor_msgs/msg/BatteryState`, `std_srvs/srv/Trigger`, `nav2_msgs/action/NavigateToPose`. The middle segment is the one usually left out. The package is lower-case with underscores; the type itself is letters and digits, conventionally CamelCase.",
+                        "examples": [
+                          "sensor_msgs/msg/Image"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "topic",
+                      "type"
+                    ],
+                    "additionalProperties": false,
+                    "description": "Frames come from an image topic the robot already publishes. It is the only source the bridge **subscribes** to rather than opens, so it needs no URL, no device and nobody to authenticate to.",
+                    "defaultSnippets": [
+                      {
+                        "label": "ros — an image topic the robot already publishes",
+                        "description": "Subscribes to a topic that is already there; nothing is opened and there is nobody to authenticate to.",
+                        "body": {
+                          "kind": "ros",
+                          "topic": "${1:/camera/image_raw}",
+                          "type": "${2|sensor_msgs/msg/Image,sensor_msgs/msg/CompressedImage|}"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "rtsp",
+                        "description": "Selects the RTSP source: this camera then carries `url`, and optionally `transport` and `credentials`."
+                      },
+                      "url": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2048,
+                        "pattern": "^rtsps?:\\/\\/",
+                        "description": "Where the stream lives, reached from the robot rather than from the cloud. **`rtsp://` or `rtsps://` only** — the bridge opens this with a library that would equally honour `file:`, so an unconstrained URL would turn a configuration document into arbitrary file access on the robot. The bridge re-checks the scheme itself, so a validator that changed could not make a robot serve files.",
+                        "patternErrorMessage": "The URL has to begin with `rtsp://` or `rtsps://` — `rtsp://cam-1.plant.local/stream1`. No other scheme is accepted: the bridge opens this with a library that would equally honour `file:`.",
+                        "examples": [
+                          "rtsp://cam-1.plant.local/stream1"
+                        ]
+                      },
+                      "transport": {
+                        "description": "How the RTSP payload is carried. Omitted means `tcp`: `udp` loses frames on a congested link and loses them silently, so the result looks like a failing camera rather than like a choice made here.",
+                        "enumDescriptions": [
+                          "The frames are interleaved into the RTSP connection itself, which is what a congested or lossy link needs — nothing is dropped on the way. This is what an omitted `transport` means.",
+                          "The frames travel in their own UDP stream: lower latency on a quiet network, and silent frame loss on any other."
+                        ],
+                        "type": "string",
+                        "enum": [
+                          "tcp",
+                          "udp"
+                        ]
+                      },
+                      "credentials": {
+                        "type": "object",
+                        "properties": {
+                          "username": {
+                            "description": "The account name the camera expects. For MJPEG the bridge sends a real HTTP `Authorization: Basic` header and leaves the URL untouched. RTSP offers no such channel through ffmpeg, so there the name goes inside the connect URL instead — built fresh for that one call and never written back into the stored document.",
+                            "examples": [
+                              "ops"
+                            ],
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128
+                          },
+                          "password": {
+                            "description": "The password for `username`. **There is no secret store behind this**: the value written here is the value stored, so treat it as readable by everyone who may read this robot's configuration, now and in its history.",
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128
+                          }
+                        },
+                        "additionalProperties": false,
+                        "description": "Username and password for the stream, standing **in clear text in the document**. A published version is immutable, so a password here cannot be removed from history or rotated without republishing — which is why the publish audit event carries only the version number and never the document body. Userinfo in the `url` works too; an explicit block here wins over it.",
+                        "defaultSnippets": [
+                          {
+                            "label": "username and password",
+                            "description": "Both fields, in clear text — which is what this block is. The password default is deliberately not a password: `CHANGE-ME` is stored like any other value, but it is **visible** rather than plausible, so a reviewer reading the diff sees it and the camera rejects it at connect time — where a default that looked like a password would simply be published and kept.",
+                            "body": {
+                              "username": "${1:ops}",
+                              "password": "${2:CHANGE-ME}"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "url"
+                    ],
+                    "additionalProperties": false,
+                    "description": "Frames come from an RTSP stream the robot itself can reach — a network camera on its own LAN. The bridge opens the connection; the cloud never does, and never needs a route to the camera.",
+                    "defaultSnippets": [
+                      {
+                        "label": "rtsp — a network camera the robot itself can reach",
+                        "description": "A stream the bridge opens over RTSP. The scheme is written out because the format constrains it; the host and the path are what vary.",
+                        "body": {
+                          "kind": "rtsp",
+                          "url": "rtsp://${1:cam-1.plant.local}/${2:stream1}"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "mjpeg",
+                        "description": "Selects the MJPEG-over-HTTP source: this camera then carries `url`, and optionally `credentials`."
+                      },
+                      "url": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2048,
+                        "pattern": "^https?:\\/\\/",
+                        "description": "Where the stream lives. **`http://` or `https://` only** — as for the `rtsp` URL, the bridge opens it with a library that would also serve `file:`. Plain `http://` is permitted because these cameras usually sit on the robot's own network, but Basic credentials on such a URL then travel in the clear.",
+                        "patternErrorMessage": "The URL has to begin with `http://` or `https://` — `http://cam-1.plant.local/video.mjpg`. No other scheme is accepted: the bridge opens this with a library that would equally serve `file:`.",
+                        "examples": [
+                          "http://cam-1.plant.local/video.mjpg"
+                        ]
+                      },
+                      "credentials": {
+                        "type": "object",
+                        "properties": {
+                          "username": {
+                            "description": "The account name the camera expects. For MJPEG the bridge sends a real HTTP `Authorization: Basic` header and leaves the URL untouched. RTSP offers no such channel through ffmpeg, so there the name goes inside the connect URL instead — built fresh for that one call and never written back into the stored document.",
+                            "examples": [
+                              "ops"
+                            ],
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128
+                          },
+                          "password": {
+                            "description": "The password for `username`. **There is no secret store behind this**: the value written here is the value stored, so treat it as readable by everyone who may read this robot's configuration, now and in its history.",
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128
+                          }
+                        },
+                        "additionalProperties": false,
+                        "description": "Username and password for the stream, standing **in clear text in the document**. A published version is immutable, so a password here cannot be removed from history or rotated without republishing — which is why the publish audit event carries only the version number and never the document body. Userinfo in the `url` works too; an explicit block here wins over it.",
+                        "defaultSnippets": [
+                          {
+                            "label": "username and password",
+                            "description": "Both fields, in clear text — which is what this block is. The password default is deliberately not a password: `CHANGE-ME` is stored like any other value, but it is **visible** rather than plausible, so a reviewer reading the diff sees it and the camera rejects it at connect time — where a default that looked like a password would simply be published and kept.",
+                            "body": {
+                              "username": "${1:ops}",
+                              "password": "${2:CHANGE-ME}"
+                            }
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "url"
+                    ],
+                    "additionalProperties": false,
+                    "description": "Frames come from an MJPEG stream over HTTP — one JPEG after another, the simplest network source there is. Unlike `rtsp` there is no `transport` to choose: it is HTTP, and any `credentials` therefore travel as HTTP Basic.",
+                    "defaultSnippets": [
+                      {
+                        "label": "mjpeg — one JPEG after another over HTTP",
+                        "description": "The simplest network source there is. `https://` is accepted too, and is what any credentials on this URL need.",
+                        "body": {
+                          "kind": "mjpeg",
+                          "url": "http://${1:cam-1.plant.local}/${2:video.mjpg}"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "kind": {
+                        "type": "string",
+                        "const": "v4l2",
+                        "description": "Selects the local capture-device source: this camera then carries `device` and nothing else."
+                      },
+                      "device": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^\\/dev\\/[A-Za-z0-9][A-Za-z0-9._/-]*$",
+                        "description": "The capture device, resolved on the robot and never by the cloud; a `/dev/v4l/by-id/...` symlink survives a reboot that renumbers `/dev/video0`. **Constrained to `/dev/`** — the string reaches OpenCV, which will just as happily open an ordinary video file or an `http://` URL and publish its pixels to the cloud. The bridge re-derives the same constraint rather than trusting the wire.",
+                        "patternErrorMessage": "A capture device is a path under `/dev/`, and the character straight after it is a letter or a digit — `/dev/video0`, or a stable `/dev/v4l/by-id/...` symlink. Nothing outside `/dev/` is accepted: the string reaches OpenCV, which would as happily open an ordinary file.",
+                        "examples": [
+                          "/dev/video0"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "device"
+                    ],
+                    "additionalProperties": false,
+                    "description": "Frames come from a capture device attached to the robot itself, such as a USB camera on `/dev/video0`. Nothing leaves the robot to fetch them, and there is nothing to authenticate to, so this source takes no `credentials`.",
+                    "defaultSnippets": [
+                      {
+                        "label": "v4l2 — a capture device attached to the robot",
+                        "description": "A USB camera on the robot itself. A `/dev/v4l/by-id/...` symlink survives a reboot that renumbers `/dev/video0`.",
+                        "body": {
+                          "kind": "v4l2",
+                          "device": "${1:/dev/video0}"
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "description": "Where this camera's frames come from. `kind` picks one of four sources and fixes which other fields the source may carry, so an impossible camera is unrepresentable rather than merely invalid — there is no way to write an RTSP camera with a ROS topic."
+              },
+              "width": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 7680,
+                "description": "The width the bridge scales frames to before sending, in pixels — what the bridge produces, not what the sensor captures; a snapshot can arrive narrower, since the bridge reduces both dimensions together to fit its JPEG byte ceiling. It stands in the configuration and never in a viewer's request, so no client can make the robot encode a larger frame than the developer allowed.",
+                "examples": [
+                  1280
+                ]
+              },
+              "height": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 4320,
+                "description": "The height the bridge scales every frame to, in pixels; with `width` it is the size the live stream carries. A snapshot can arrive **smaller** than this — its JPEG has a byte ceiling, and the bridge gives up quality first and then resolution to fit, reporting the size it actually encoded.",
+                "examples": [
+                  720
+                ]
+              },
+              "fps": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 60,
+                "description": "How many frames a second the bridge forwards, at most. It is a ceiling, not a clock: a camera that delivers ten frames a second stays at ten. Both modes read the same throttled pipeline, so this also bounds how fresh a snapshot can be.",
+                "examples": [
+                  15
+                ]
+              },
+              "bitrate_kbps": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 50000,
+                "description": "The ceiling for the **live** encoding, in kilobits per second — this is what bounds a watched camera against the robot's uplink. Snapshots are not covered by it: they are JPEGs under their own byte ceiling. Raising `width`, `height` or `fps` against a fixed bitrate buys blur, not detail.",
+                "examples": [
+                  2000
+                ]
+              },
+              "snapshot_interval_seconds": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3600,
+                "description": "How often a still frame is captured, in seconds. **It runs whether or not anyone is watching**, unlike the live stream, which the cloud refcounts — first viewer starts it, last one ends it. The cloud caches the one frame and serves every reader from it, so a hundred pollers cost the robot exactly one image per interval.",
+                "examples": [
+                  5
+                ]
+              },
+              "description": {
+                "description": "What this camera shows, in the developer's own words — documentation for whoever reads the configuration, for the console and for MCP clients; the robot does nothing with it. A camera without one is still offered, with `description: null`, as for actions, services and publishers. What `camera_snapshot` serves is the latest snapshot with its age; a live session is never a tool.",
+                "examples": [
+                  "Forward-facing camera on the mast."
+                ],
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 2000
+              }
+            },
+            "required": [
+              "source",
+              "width",
+              "height",
+              "fps",
+              "bitrate_kbps",
+              "snapshot_interval_seconds"
+            ],
+            "additionalProperties": false,
+            "defaultSnippets": [
+              {
+                "label": "a camera",
+                "description": "A complete camera entry with every required field.",
+                "body": {
+                  "source": {
+                    "kind": "v4l2",
+                    "device": "${2:/dev/video0}"
+                  },
+                  "width": 1280,
+                  "height": 720,
+                  "fps": 15,
+                  "bitrate_kbps": 2000,
+                  "snapshot_interval_seconds": 5,
+                  "description": "${3:Forward-facing camera on the mast.}"
+                }
+              }
+            ]
+          },
+          "description": "Video the robot streams, and the still frames the cloud serves from it. `width`, `height`, `fps` and `bitrate_kbps` are what **the bridge produces before sending**, not what the camera captures — they live in the configuration rather than in a viewer's request precisely so that no viewer can make a robot send more. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "defaultSnippets": [
+            {
+              "label": "a camera",
+              "description": "A complete camera entry with every required field.",
+              "body": {
+                "${1:front}": {
+                  "source": {
+                    "kind": "v4l2",
+                    "device": "${2:/dev/video0}"
+                  },
+                  "width": 1280,
+                  "height": 720,
+                  "fps": 15,
+                  "bitrate_kbps": 2000,
+                  "snapshot_interval_seconds": 5,
+                  "description": "${3:Forward-facing camera on the mast.}"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "fleetless"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "type",
+    "version",
+    "doc"
+  ]
+}

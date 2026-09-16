@@ -1,0 +1,56 @@
+# A vX.Y.Z tag is a release: the tag is checked, the suite runs on every
+# distribution, the tag's tree is packaged once, and those files become a
+# GitHub release with SHA256SUMS.
+#
+# **It stops there.** Publishing to the apt repository is a separate, deliberate
+# dispatch of the apt publishing workflow, which fetches exactly these assets,
+# refuses them unless this workflow uploaded them and their sums match, and
+# signs them. reprepro will not take a second build of a version, and a robot
+# running `apt upgrade` takes a new one within minutes -- so a tag is allowed
+# to be a mistake, and a publish is not.
+name: release
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - run: ./ci/release-check.sh "$GITHUB_REF_NAME"
+
+  test:
+    needs: check
+    uses: ./.github/workflows/verify.yml
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: package the tag's tree
+        run: ./ci/package.sh
+      - name: the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./ci/github-release.sh "$GITHUB_REF_NAME"
+      - name: summary
+        run: |
+          {
+            echo "### ${GITHUB_REF_NAME} released — not published"
+            echo
+            echo '```'; cat dist/SHA256SUMS; echo '```'
+            echo
+            echo "Publish with the apt publishing workflow, input \`bridge_tag=${GITHUB_REF_NAME}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,24 @@
+{
+  "AUDIT_RETENTION_DAYS": 90,
+  "ASSET_UPLOAD_HEADERS": {
+    "kind": "x-fleetless-asset-kind",
+    "name": "x-fleetless-asset-name",
+    "nameEncoded": "x-fleetless-asset-name-encoded",
+    "syncId": "x-fleetless-sync-id",
+    "size": "x-fleetless-asset-size"
+  },
+  "ASSET_UPLOAD_MAX_BYTES": 67108864,
+  "SNAPSHOT_HEADERS": {
+    "ageMs": "x-fleetless-age-ms",
+    "timestampMs": "x-fleetless-timestamp-ms",
+    "width": "x-fleetless-width",
+    "height": "x-fleetless-height"
+  },
+  "URDF_ASSET_NAME": "robot_description",
+  "ASSET_KINDS": [
+    "urdf",
+    "mesh",
+    "texture",
+    "other"
+  ]
+}

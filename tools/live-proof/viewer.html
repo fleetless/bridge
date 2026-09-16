@@ -1,0 +1,92 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<meta charset="utf-8">
+<title>fleetless bridge live proof</title>
+<body style="margin:0;background:#111;color:#eee;font:13px monospace">
+<div id="log">booting</div>
+<video id="v" autoplay playsinline muted style="width:640px;height:480px;background:#000"></video>
+<!-- Pinned by content, not only by version: the viewer is the instrument, and
+     an instrument whose bytes a CDN can change is one that can start
+     measuring something else without anybody editing this file. A hash
+     mismatch fails loudly (the driver reports "livekit-client did not
+     load") rather than silently. -->
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.15.4/dist/livekit-client.umd.js"
+        integrity="sha384-EpSY/2J7umRsmvgVNveWAArzM6T2UbPb0mM17PD4spSJvy69EYiN/Eqwm01zoO2n"
+        crossorigin="anonymous"></script>
+<script>
+// A subscriber that says out loud what it can and cannot tell. window.__state
+// is the only thing the driver reads; every field is a fact the page observed,
+// never a summary.
+window.__state = { sdkLoaded: false, connected: null, error: null, tracks: [], attached: false };
+window.__connect = async (url, token) => {
+  const LK = window.LivekitClient;
+  if (!LK) { window.__state.error = 'livekit-client did not load'; return window.__state; }
+  window.__state.sdkLoaded = true;
+  window.__state.sdkVersion = LK.version;
+  // adaptiveStream and dynacast off: both make the viewer's own subscription
+  // depend on whether the <video> is visible, which in a headless browser is a
+  // question with no stable answer — and the thing under test here is the
+  // publisher, not the viewer's bandwidth policy.
+  const room = new LK.Room({ adaptiveStream: false, dynacast: false });
+  window.__room = room;
+  room.on(LK.RoomEvent.TrackSubscribed, (track, pub, participant) => {
+    window.__state.tracks.push({ kind: track.kind, sid: pub.trackSid, from: participant.identity, mime: pub.mimeType });
+    if (track.kind === 'video') {
+      track.attach(document.getElementById('v'));
+      window.__state.attached = true;
+    }
+  });
+  // The hold mode's whole claim is "a video track stayed subscribed" -- which
+  // means `tracks` must lose an entry when the publisher goes away, not only
+  // gain one when it arrives. Without this handler a track that unsubscribed
+  // (the publisher stopped, or was deleted) stays in the array forever, and
+  // the hold loop below would keep reading a video track that no longer
+  // exists.
+  room.on(LK.RoomEvent.TrackUnsubscribed, (track, pub) => {
+    window.__state.tracks = window.__state.tracks.filter((t) => t.sid !== pub.trackSid)
+  });
+  room.on(LK.RoomEvent.Disconnected, (r) => { window.__state.disconnected = String(r); });
+  try {
+    await room.connect(url, token, { autoSubscribe: true });
+    window.__state.connected = true;
+    window.__state.remoteParticipants = [...room.remoteParticipants.keys()];
+  } catch (e) {
+    window.__state.connected = false;
+    window.__state.error = String((e && e.message) || e);
+  }
+  return window.__state;
+};
+// Read the decoded frame out of the <video>, not a screenshot: headless
+// Chromium composites WebRTC video as black often enough that a working stream
+// looks broken in a page capture.
+window.__grab = () => {
+  const v = document.getElementById('v');
+  if (!v || !v.videoWidth) return null;
+  const c = document.createElement('canvas');
+  c.width = 160; c.height = 120;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(v, 0, 0, 160, 120);
+  const d = ctx.getImageData(0, 0, 160, 120).data;
+  let min = 255, max = 0, sum = 0;
+  const px = [];
+  for (let i = 0; i < d.length; i += 4) {
+    const g = (d[i] + d[i + 1] + d[i + 2]) / 3;
+    if (g < min) min = g;
+    if (g > max) max = g;
+    sum += g;
+    px.push(d[i], d[i + 1], d[i + 2]);
+  }
+  return { w: v.videoWidth, h: v.videoHeight, readyState: v.readyState,
+           min: Math.round(min), max: Math.round(max), mean: Math.round(sum / (d.length / 4)),
+           px };
+};
+// Ends the viewer's session the way a real viewer going away does: the room
+// itself is torn down, not just the tab closed, so the server's own
+// disconnect detection is what the quality proof measures rather than
+// whatever a browser's page-unload path happens to do.
+window.__disconnect = async () => {
+  if (window.__room) await window.__room.disconnect();
+};
+
+document.getElementById('log').textContent = 'ready';
+</script>

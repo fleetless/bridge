@@ -1,0 +1,51 @@
+# The suite on every push, once per ROS distribution, then the packages.
+#
+# **One job per distribution.** A green Humble run says nothing about Jazzy
+# (run-tests.sh): each distribution has its own image, its own Python and its
+# own site directory. The matrix is held against tools/distros.sh by
+# test/test_ci_workflows.py.
+#
+# **The packages on every push, not only on a tag.** ci/package.sh builds all
+# three and installs each from a throwaway repository, so a packaging break is
+# found by the commit that made it rather than by the release after it.
+#
+# release.yml calls this on a tag and gets the tests only: it packages the
+# tag's tree itself, once, and those are the bytes it releases.
+#
+# **Hosted runners, because the bridge is public.** A pull request is a
+# stranger's code, and a build runner on private hardware would run it inside
+# a private network; GitHub's own runners are disposable and free for public
+# repositories.
+name: verify
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [humble, jazzy, lyrical]
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./run-tests.sh --distro "${{ matrix.distro }}"
+
+  package:
+    needs: test
+    # A branch push packages; release.yml's call, which is always a tag,
+    # does not. Not a boolean input: on a push `inputs` is empty, and GitHub
+    # compares `null != false` as `0 != 0`, which skipped this job on every
+    # push.
+    if: github.ref_type != 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: ./ci/package.sh

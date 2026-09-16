@@ -1,0 +1,106 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: Apache-2.0
+# Hand-rolled rather than bloom-generated: bloom needs live rosdistro network
+# access to resolve dependencies at build time, which the offline
+# `build-deb.sh` and containerised suites here deliberately do not have.
+# Every dependency this package declares (`package.xml`) now resolves through
+# a public rosdep key — including `python3-jsonschema`, a test dependency
+# never installed on a robot — so there is no repo-local rosdep source left
+# either; that gap closed alongside the pip removal a recent version made.
+# What remains is only the network dependency, and it is enough on its own:
+# patching bloom's output every run would still be two sources of truth
+# instead of one. This file and debian/control are that one source, built
+# from package.xml by hand and kept in step with it deliberately, the same
+# discipline test_packaging.py already applies to setup.py/launch/package.xml.
+
+INSTALL_PREFIX = /opt/ros/@ROS_DISTRO@
+PKG = ros-@ROS_DISTRO@-fleetless-bridge
+DESTDIR = $(CURDIR)/debian/$(PKG)
+PYTHON3_VERSION := $(shell python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
+# Where every apt-distributed ros-@ROS_DISTRO@-* Python package actually lands.
+# Not assumed from `--install-layout=deb`'s own default, which computes plain
+# lib/python3/dist-packages for a non-/usr prefix and is importable nowhere —
+# and NOT the same directory on every ROS distribution either, which is why the
+# suffix comes from the table in tools/distros.sh rather than being written
+# here. Humble's own packages sit in local/lib/pythonX.Y/dist-packages; jazzy's
+# and lyrical's sit in lib/pythonX.Y/site-packages, and those are the only
+# directories their setup.sh puts on PYTHONPATH.
+#
+# A build against the wrong one imports fine inside this package's own build
+# sandbox, produces a .deb that `apt install` accepts without a murmur, and
+# then raises ModuleNotFoundError on the robot — the kind of gap that has to be
+# checked by installing the thing, not by reading distutils' docs. It was live:
+# the first jazzy and lyrical packages built here installed cleanly and could
+# not be imported.
+#
+# The Python version is still computed rather than tabulated: it is the version
+# of the interpreter in the container this build runs in, which is that
+# distribution's own by construction.
+PYTHON3_SITE = $(INSTALL_PREFIX)/@PYTHON_SITE@
+
+%:
+	dh $@ --buildsystem=pybuild
+
+override_dh_auto_build:
+	python3 setup.py build
+
+override_dh_auto_install:
+	# --prefix=$(INSTALL_PREFIX), not /usr: this installs into the same
+	# shared ROS prefix as every apt-distributed ros-@ROS_DISTRO@-* package, so
+	# the module becomes importable and the executable becomes runnable
+	# through the *existing* environment hooks $(INSTALL_PREFIX)/setup.bash
+	# already provides — no new hook needed, because those hooks act on
+	# the whole prefix, not per-package. --install-lib is pinned explicitly
+	# to PYTHON3_SITE rather than left to --install-layout=deb's own
+	# heuristic (see PYTHON3_SITE's comment above). setup.cfg's own
+	# `install_scripts=$base/lib/fleetless_bridge` is what puts the
+	# `bridge` executable where `ros2 run`'s ament-index lookup expects it,
+	# once $base resolves to this prefix.
+	python3 setup.py install \
+		--root=$(DESTDIR) \
+		--prefix=$(INSTALL_PREFIX) \
+		--install-layout=deb \
+		--install-lib=$(PYTHON3_SITE) \
+		--single-version-externally-managed \
+		--no-compile
+	# LICENSE and NOTICE ship with the binary package. debian/copyright
+	# carries the standard short notice and the /usr/share/common-licenses
+	# pointer, which is correct Debian practice and covers the licence text
+	# — but not NOTICE, and Apache-2.0 section 4(d) asks a redistributor to
+	# pass NOTICE on to anyone they redistribute to. Somebody rebundling this
+	# .deb into a robot image is doing exactly that, and could not comply
+	# from a package that does not contain the file. The second copy, beside
+	# the installed PKG-INFO, is what that file's own `License-File: LICENSE`
+	# / `License-File: NOTICE` lines point at: setuptools writes those
+	# unconditionally, so without the copies an SBOM tool that follows them
+	# finds nothing and reports a package whose metadata names a licence file
+	# it does not ship.
+	install -D -m 644 LICENSE $(DESTDIR)/usr/share/doc/$(PKG)/LICENSE
+	install -D -m 644 NOTICE $(DESTDIR)/usr/share/doc/$(PKG)/NOTICE
+	set -e; for d in $(DESTDIR)$(PYTHON3_SITE)/*.egg-info; do \
+		test -d "$$d" || { echo "no egg-info under $(PYTHON3_SITE)" >&2; exit 1; }; \
+		install -m 644 LICENSE NOTICE "$$d/"; \
+	done
+
+override_dh_auto_test:
+	# Deliberately empty. The suite (./run-tests.sh) runs in a container
+	# with the full dev/test dependency set — pytest, a real rclpy node on
+	# a real DDS domain, cv_bridge — none of which dpkg-buildpackage's own
+	# build sandbox has, and reproducing it here would be a second, worse
+	# copy of Dockerfile.dev.
+
+override_dh_python3:
+	# Installed under $(INSTALL_PREFIX), not /usr/lib/python3/dist-packages —
+	# dh_python3's default byte-compilation and ${python3:Depends}
+	# generation assume the latter and would either find nothing or fail
+	# looking in the wrong place.
+
+# The .deb, .buildinfo and .changes land in the PARENT of this checkout —
+# dpkg-buildpackage's own default, and deliberately left alone: redirecting
+# just dh_builddeb's destdir breaks dpkg-genbuildinfo/dpkg-genchanges, which
+# independently look for the built files at the default location regardless
+# (verified — redirecting only one of the three left the other two unable to
+# find what the first had moved). `apt/README.md`'s "Publishing a .deb"
+# copies it into dist/ itself once the build is done, which is one place to
+# relocate an artifact instead of three tools' worth of location flags to keep
+# in step with each other.

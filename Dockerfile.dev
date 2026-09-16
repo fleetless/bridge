@@ -1,0 +1,62 @@
+# Dev and test image for the bridge: ros:<distro> plus the Python bits the
+# bridge and its suite need. Used by ./run-tests.sh and ./run-bridge.sh; Docker
+# caches it, so only the first run pays for the downloads.
+#
+# The distribution is a build argument, and picks the base image; that is the
+# only thing left that differs per distribution at this layer. This used to
+# also carry the numpy bound and the PEP 668 pip flag for a rendered
+# rosdep/constraints.txt.in; both are gone along with the PyPI installs they
+# existed for (see tools/distros.sh).
+#
+# ROS_DISTRO_TAG and not ROS_DISTRO: the base image sets ROS_DISTRO itself as
+# an ENV, and an ARG of the same name shadows it for the rest of the build,
+# which would leave every `ros-$ROS_DISTRO-*` lookup below reading a build
+# argument rather than the image's own answer.
+#
+# this used to be a hand-maintained apt/pip list that quietly drifted
+# from what the code actually imports — `package.xml` declared two
+# dependencies while the process needed at least six, so the first honest
+# `rosdep install` on a clean machine failed. Now `package.xml` is the one
+# list, and this image installs from it rather than maintaining a second one
+# here. `ros-<distro>-example-interfaces`, `sensor_msgs`, `geometry_msgs`
+# and `python3-pytest` are `test_depend`s in the same manifest, for the
+# reasons already documented there. Every one of them, `python3-jsonschema`
+# included, is a public rosdep key resolving to apt on every distribution
+# this bridge is built for — no repo-local rosdep source is registered here
+# any more; `rosdep/README.md` records why `python3-av` is the one gap left.
+ARG ROS_DISTRO_TAG=humble
+FROM ros:${ROS_DISTRO_TAG}
+
+COPY package.xml /tmp/fleetless_bridge/package.xml
+
+# The Debian build tooling is installed here, on top of what `package.xml`
+# resolves, because it is the one thing rosdep cannot supply: `debian/control`'s
+# Build-Depends are a packaging concern, and `package.xml` has no vocabulary for
+# them (an `ament_python` manifest declares build, exec and test dependencies of
+# the ROS package, not of the .deb that wraps it). Without these five,
+# `dpkg-buildpackage -us -uc -b` — the command `CONTRIBUTING.md` and
+# `apt/README.md` both document against this image — aborts at
+# `dpkg-checkbuilddeps` with "Unmet build dependencies", before it starts.
+# They are listed here rather than left to the reader to apt-install because a
+# recipe that needs an undocumented step is a recipe that does not work.
+#
+# No pip anywhere: `jsonschema` (a test dependency, never shipped) is
+# declared as `python3-jsonschema`, a public rosdep key that resolves to apt
+# on every distribution this bridge is built for — Humble's apt version
+# (3.2.0) is older than this suite would ideally use, and `test/schemas.py`
+# falls back accordingly; see its own docstring for the guard that keeps
+# that fallback honest. So `python3-pip` is not installed and
+# `rosdep install` needs no PEP 668 override on any of the three
+# distributions. Nothing this image builds for the robot uses pip today:
+# `debian/postinst` is empty and `debian/control.in`'s `Depends:` is apt
+# packages exclusively — `debian/postinst.in` ran `pip3 install` as root at
+# configure time until a recent version removed it (see README.md's own
+# history section for what that means for robots already on the version
+# before this one).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-rosdep \
+        debhelper dh-python python3-all python3-setuptools fakeroot \
+    && (rosdep init 2>/dev/null || true) \
+    && rosdep update \
+    && rosdep install --from-paths /tmp/fleetless_bridge --ignore-src -y \
+    && rm -rf /var/lib/apt/lists/*

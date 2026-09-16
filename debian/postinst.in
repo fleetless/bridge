@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Deliberately empty. Every runtime dependency this package needs is an
+# ordinary apt package (see debian/control's Depends:), resolved by apt
+# itself before this script ever runs. There used to be three that apt
+# could not resolve -- websockets, jsonschema, livekit -- and this script
+# installed them from PyPI at configure time, under this package's own
+# constraints file. All three are gone: websockets and jsonschema were
+# replaced by python3-aiohttp and dropped to a test-only dependency
+# respectively, and livekit's SDK was replaced by python3-aiortc plus this
+# package's own signalling. `apt install` now needs no network access
+# beyond whatever the package's own mirror requires, and nothing runs here
+# as root at install time.
+#
+# Kept as a file rather than removed, so the checkout says "there is
+# nothing to do here" rather than leaving a reader to wonder whether a
+# maintainer script was simply never written.
+
+#DEBHELPER#
+
+exit 0

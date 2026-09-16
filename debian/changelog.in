@@ -1,0 +1,274 @@
+ros-@ROS_DISTRO@-fleetless-bridge (3.1.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * **Relicensed to the Apache License 2.0.** The package's installed
+    copyright file — `/usr/share/doc/ros-@ROS_DISTRO@-fleetless-bridge/copyright`,
+    the file Debian policy designates for this question — now declares
+    Apache-2.0 and points at the public source. The source tree carries
+    `LICENSE`, `NOTICE` and an SPDX header on every source file to match.
+    Only `ros-humble-fleetless-bridge` was ever published before this
+    version — up to and including 3.0.0, its copyright declared the software
+    closed and not redistributable, and named a source host outside this
+    repository. `ros-jazzy-fleetless-bridge` and `ros-lyrical-fleetless-bridge`
+    were never published before this version, so it is their first release
+    and their whole published history is Apache-2.0. `LICENSE` and `NOTICE`
+    are now installed with the package: the Apache licence asks a
+    redistributor to pass the NOTICE file on, which they cannot do from a
+    .deb that does not contain it.
+  * **The cloud transport and the live-video stack were both rewritten, so
+    this is a minor version, not a patch.** `websockets` is replaced by
+    `python3-aiohttp` for the cloud connection, and the LiveKit SDK is
+    replaced entirely by `python3-aiortc` plus this package's own JSON
+    signalling client — the SDK's wheel is pip-only, with a protobuf floor
+    no supported Ubuntu ships, which is what kept this package off the ROS
+    index. `bitrate_kbps`, pause-on-no-viewer and TURN relay all still work,
+    proved directly against aiortc rather than through the SDK. No pip
+    anywhere any more: `debian/postinst` installed three packages from PyPI
+    as root at configure time as recently as this same package's previous
+    build on Humble (`3.0.0`, still the only version ever published); this
+    one Depends on apt packages exclusively, and `rosdep install` needs no
+    PEP 668 override on any of the three distributions this package builds
+    for. 3.0.1 was never published — this version replaces it as the tree's
+    next release.
+  * **Removing a driven publisher no longer loses its failsafe.** Removing,
+    retargeting or stopping a publisher that had been published to sent its
+    failsafe and destroyed the publisher in the same breath. A sample the
+    middleware dropped on first send then had no writer left to resend it,
+    and the robot kept its last command. The publisher now stays until every
+    reliable subscriber has acknowledged that failsafe, for at most four
+    seconds, and waiting for it holds up no other publisher's watchdog --
+    except when a driven publisher changes its message type on the same
+    topic, where the old one gets at most half a second before it makes
+    way. Shutdown takes up to those four seconds longer when a subscriber
+    does not answer.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Tue, 08 Sep 2026 12:00:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (3.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * **The configuration format changed, and this version does not read the
+    old one.** A robot's configuration is now a `fleetless.yaml` document:
+    six sections keyed by slug rather than five arrays of objects carrying a
+    `slug` field, names spelled with underscores rather than dashes, and a
+    `fleetless: 1` header the bridge refuses a frame without. A 2.x bridge
+    and a 3.x cloud cannot talk to each other in either direction,
+    which is why this is a major version. Upgrade the cloud and the robot in
+    one window.
+  * Actions, services and publishers send a **message template**. The
+    developer writes the Goal, Request or published message literally and
+    marks with `${name}` the positions a caller may fill; the bridge
+    substitutes at those positions and nowhere else. A field written `0.0` in
+    the configuration is `0.0` on the wire and no client can reach it — the
+    format's safety story is structural now rather than a rule that has to
+    hold. `params.unflatten` and the dotted field paths it existed for are
+    gone with it.
+  * A **failsafe** is a group: `{timeout_ms, message}`, the deadline sitting
+    beside the message it exists to trigger. Its message must resolve with no
+    placeholder left in it, and the bridge checks that **after** following a
+    reference into the shared `messages:` map — contracts states plainly that
+    it cannot answer that half, because a schema over one publisher cannot
+    see the map. This is the only place the reference case is caught before a
+    robot arms a failsafe it could never send.
+  * `rate_throttle_hz` replaces the `rate: {mode, hz}` object: a plain
+    ceiling, 0 to 20, where **zero or absent means no throttling at all**.
+    That is a behaviour change and it is the one worth reading twice. The old
+    `on_change` mode dropped a sample equal to the last one sent; "no
+    throttling" does not. A battery holding a steady 87 % now reports every
+    sample, where a bridge that treated the two as the same would have gone
+    silent for hours and looked like a robot that had stopped.
+  * `buffer` becomes `retention`: `enabled` and `max_buffer_values` are the
+    disconnect buffer this bridge already had. `retention.interval_seconds`
+    is parsed and deliberately never read — it decides how often the *cloud*
+    writes to history, which is not a decision this side can make.
+  * Camera credentials arrive **inline** in `doc.cameras[].source.credentials`.
+    The `credentials` sibling on the config frame is gone with the store
+    behind it, and an explicit block still beats userinfo in the URL. The
+    `/dev/` containment rule and the URL scheme restrictions are unchanged
+    and re-derived here on purpose: the libraries these values reach also
+    serve `file:` and `ftp:`.
+  * `snapshot_interval_ms` becomes `snapshot_interval_seconds`, 1 to 3600.
+    A unit change, not a rename — the same number means something a thousand
+    times different, so every site was re-read rather than renamed.
+  * `PRESSURE_SLUG` was `bridge-pressure` here and `bridge_pressure` in the
+    contracts. The re-vendored schema caught the drift. A robot on this
+    version sends the underscore spelling, which a 2.x cloud does not
+    know — and the symptom is a datapoint that silently never arrives, not an
+    error.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Wed, 02 Sep 2026 12:00:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (2.2.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * The pressure counters 2.1.0 started collecting are now on the wire: a
+    `bridge-pressure` datapoint -- per-tier sent/bytes/drops/high-water,
+    the measured send rate, the snapshot byte budget, and video/uplink
+    state -- goes out every 10 seconds while connected, on the same
+    reserved-slug path as `bridge-state`, so history, realtime, REST and
+    MCP exposure fall out of the ordinary datapoint machinery for free.
+    No frame while disconnected: an honest gap, same as every datapoint.
+  * Tier 2's `high_water` is now truly per-session, not a stale peak
+    carried over from whichever connection last touched it. The two
+    queues that feed it -- live samples and camera state -- outlive the
+    session they were built for, so a dropped connection now baselines
+    both to their own current depth as *that* session ends, before the
+    next one's writer is even built. Not to zero: a camera-state backlog
+    that piled up while nothing was connected at all is real depth, and
+    still shows up correctly -- at its actual size -- on the very first
+    frame of the reconnect that finally gets to drain it.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Wed, 26 Aug 2026 18:00:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (2.1.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * One prioritized writer now owns the socket. Every outgoing frame --
+    hello, pongs, config acknowledgements, job outcomes, live telemetry,
+    camera state, developer tooling, buffered history and snapshots -- is
+    ranked into one of six tiers (0 highest, session liveness, down to 5,
+    snapshots) and sent in that strict order, so a slow link starves the
+    cheapest thing first instead of whatever happened to be queued first.
+    A pong or a job outcome can no longer get stuck behind a backlog drain
+    or a large snapshot the way 2.0.2 could only patch around for
+    snapshots specifically.
+  * Snapshots are now fitted to the link, not just to the wire format.
+    The writer measures the actual send rate from the frames large enough
+    to have really left the robot -- a small frame is accepted into the
+    socket's write buffer and says nothing about the link -- and asks for
+    a snapshot sized to fit inside the same occupancy budget 2.0.2
+    introduced. So a slow robot gets a smaller snapshot instead of the
+    same flat 1.5 MiB every time, and a fast one is no longer held back by
+    a bound that only ever had to protect the slow case. As in 2.0.2, the
+    first snapshot of a session is what establishes the rate: it goes out
+    at the wire-format bound, and every later one is fitted to what that
+    one measured.
+  * Buffered history (a reconnect's backlog) is its own tier, drained
+    oldest first and only once nothing higher-priority is waiting. The
+    50 ms floor between backfill sends is retired -- it existed only to
+    keep backfill from crowding out live traffic, and that is now
+    structural: live traffic always sits in a higher tier and preempts
+    the drain between any two backfill items.
+  * A developer can now configure an uplink budget for live video, via
+    the `FLEETLESS_UPLINK_KBPS` environment variable or the
+    `/fleetless/uplink_kbps` topic (the topic always wins once anything
+    has been published on it, and the control socket keeps a reserve no
+    matter how small the budget is). A `camera_start` that would push the
+    running total over budget is refused with an honest `camera_state`
+    rather than opened and left to fight over bandwidth with what is
+    already live; lowering the budget below what is already running stops
+    streams newest-first until it fits again.
+  * A raw camera frame is converted to BGR only when something will
+    actually use it -- a live viewer or a snapshot request due right now.
+    A camera nobody is watching and nobody is snapshotting no longer pays
+    that conversion cost on every frame, which is most of them on a robot
+    with several cameras configured but only one in view at a time.
+  * The writer's own per-tier counters (frames sent, bytes sent, drops,
+    queue high-water mark), its measured send rate and the uplink budget's
+    state are now collected continuously. Nothing consumes them on the
+    wire yet -- that is the console pressure indicator, still to come --
+    but the bridge no longer has to be rebuilt to start measuring its own
+    backpressure.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Wed, 26 Aug 2026 12:00:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (2.0.2-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * A snapshot no longer holds the socket long enough to end the session.
+    `websockets` serializes sends, so a large binary frame is time the
+    `pong` behind it is not being sent, and the cloud closes after three
+    unanswered pings -- about six seconds for everything. The snapshot pump
+    now measures what the socket actually manages and drops a frame that
+    would occupy it for more than two seconds, sending one anyway after
+    five consecutive drops so the estimate can never latch off.
+  * `camera.SNAPSHOT_MAX_BYTES` bounds the same frame at 1.5 MiB, against
+    the ws library's 2 MiB ceiling. That bound is about the frame format
+    and knows nothing about the link: on a 151 kB/s uplink it
+    is ten seconds of exclusive use of the socket that also carries the
+    control channel.
+  * Datapoints, jobs, commands and live video are unaffected -- live video
+    goes through LiveKit and never touches this socket.
+  * Found while verifying 2.0.1 on a real robot: taking the config apply off the
+    receive loop stretched the sessions from 12-20 s to nearly three
+    minutes without making them survive, which is what made the second,
+    unrelated cause visible.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Tue, 25 Aug 2026 15:30:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (2.0.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * A slow config apply no longer costs the connection. `config`,
+    `introspect_request` and `type_request` were the only cloud frames the
+    bridge awaited inline in its receive loop; everything else is
+    dispatched and answered later. An apply that outlasted the cloud's pong
+    deadline therefore took the whole session down: the `ping` queued
+    behind it was never read, so no `pong` was sent, the cloud closed the
+    socket, and the reconnect was answered with the same config -- a loop
+    the robot could not leave on its own.
+  * Found on a real robot with one camera configured on a topic carrying 9.44 MB
+    frames at 2 Hz (19.3 MB/s). Thirteen minutes connected before the
+    camera was published, then 7 connects and 18 pong timeouts in 100
+    seconds after it. Nothing in the suite carries a message that size, and
+    no rehearsal subscribes to a real camera, so no test could have found
+    it -- the fix ships with two that would have.
+  * The three frames now run on one FIFO worker, so a config still cannot
+    overtake its predecessor, and a send failure ends the session exactly
+    as it did before.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Tue, 25 Aug 2026 14:00:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (2.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * Wire protocol bumped 1 -> 2 (the contracts' `PROTOCOL_VERSION`): `config_applied.errors` entries gained `kind` and
+    `code` beside `message`. The cloud's handshake check is `!==`, not a
+    floor, so a bridge announcing any other version is refused outright --
+    no telemetry, no cameras, no jobs -- until this package is installed.
+    Major, not patch: this is the wire itself changing shape, not a fix
+    inside one version of it, and a robot on the previous version is not
+    compatible with a cloud that requires this one.
+  * This is the package operators upgrade to when `getting-started.md`'s
+    "Upgrading an already-connected fleet" warning tells them to run
+    `sudo apt-get install --only-upgrade ros-@ROS_DISTRO@-fleetless-bridge` --
+    without this entry that command had nothing newer to offer, and
+    `bridge_version` read `1.0.1` for an upgraded and an un-upgraded robot
+    alike, so the one instrument an operator has during the outage window
+    could not tell the two states apart.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Fri, 21 Aug 2026 12:00:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (1.0.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * Meshes resolve again on a workspace built with `colcon build
+    --symlink-install`. The containment check that closes the package://
+    traversal compared the *physical* path (os.path.realpath) against the
+    share directory -- and colcon installs every file as a symlink back
+    into the source tree, so each mesh resolved to <ws>/src/... and failed
+    containment against <ws>/install/.../share/...
+  * The failure mode was the expensive part, not the bug: os.path.isfile
+    was true, the bytes were readable, and the reference was reported as
+    unresolvable -- which the console renders as "not found in the robot's
+    workspace. Add these to the robot's workspace, then sync again." Ten
+    meshes that were in the workspace, named individually, with a remedy
+    that cannot work. Found while testing the console against a real robot.
+  * The check is lexical now (normpath, no symlink following), so every
+    traversal test still fails closed; the residual (a
+    symlink inside an installed package pointing outside it) is documented
+    at the check rather than implied away.
+  * The launch file now sets PYTHONNOUSERSITE=1. cv_bridge is a C
+    extension built against numpy 1.x, so this package installs numpy
+    1.26.4 to /usr/local -- but a `pip install --user` in the operating
+    account's own home puts ~/.local ahead of /usr/local on sys.path, and
+    on one robot that meant numpy 2.2.6. The result was the worst available
+    shape: CvBridge still imports, the bridge starts, connects and reports
+    healthy, and the first real imgmsg_to_cv2 call dies with
+    'AttributeError: _ARRAY_API not found' -- every camera on the robot
+    broken, and nothing says so until someone opens one. Seen on a real
+    robot.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Tue, 18 Aug 2026 22:55:00 +0200
+
+ros-@ROS_DISTRO@-fleetless-bridge (1.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * First published build under the project's own apt repository. Replaces
+    the 0.2.0 package that predates the rebuild and shares no module
+    structure with this package. That one existed for Humble only, as
+    0.2.0-0jammy; on every other distribution this entry is the first
+    build there has ever been, and there was nothing to replace.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Tue, 18 Aug 2026 18:45:40 +0200

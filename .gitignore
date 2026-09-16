@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+build/
+install/
+log/
+.pytest_cache/
+
+# dpkg-buildpackage output: debian/control, debian/rules and the
+# other packaging sources are tracked; everything below is generated fresh
+# by every build and would otherwise show up as root-owned untracked litter
+# from a container build.
+.pybuild/
+*.egg-info/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/*.debhelper.log
+debian/ros-*-fleetless-bridge/
+/*.deb
+/*.buildinfo
+/*.changes
+/dist/
+
+# The live proof's own output: publisher and viewer logs, and the viewer's
+# screenshots. Evidence for one run, not a file anybody else needs.
+tools/live-proof/logs/

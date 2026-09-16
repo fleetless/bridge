@@ -1,0 +1,2237 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The bridge's connection to the cloud.
+
+One long-lived WebSocket carries the whole conversation: a hello handshake
+binds the connection to a robot, then the cloud drives a round-trip probe the
+bridge echoes, pushes the published configuration, asks for introspection and
+type data, and receives a stream of datapoint samples back.
+
+The socket is aiohttp's, wrapped by `_Socket` below into the four calls the
+rest of this file makes — `send`, `recv`, `close` and `close_code`. That
+wrapper is the whole of what this file knows about the transport, and most of
+the session's clocks live here too: `_handshake_timeout`, `_idle_timeout` and
+`CLOSE_TIMEOUT_S` are applied through `asyncio.wait`/`asyncio.wait_for`, not
+handed to the library. `KEEPALIVE_INTERVAL_S` is the one clock that is handed
+to the library — aiohttp's own heartbeat, which gives up on the pong at
+`KEEPALIVE_INTERVAL_S / 2` past the heartbeat itself. At the values below that
+lands at exactly `IDLE_TIMEOUT_S`, a tie rather than a timer clearly slacker
+than this file's own — see `KEEPALIVE_INTERVAL_S`'s own comment for what that
+means when both are due at once.
+
+`ros` (a `RosRuntime`, see ros_runtime.py) is optional and duck-typed rather
+than imported for its type, the same way `connect`/`sleep` are injectable —
+tests exercise the handshake/ping/reconnect behaviour without any ROS
+runtime at all. Three things run concurrently for the life of a session: the
+receive loop below (hello/ping/config/introspect/type/invoke/cancel/publish/
+camera_start/camera_stop/asset_request), `_pump_control` (applies configs and
+answers introspection out of the receive loop's way), and one
+`PrioritizedWriter` — **the only caller of `ws.send()`**.
+
+The six outgoing pumps this replaced each called `ws.send()` themselves.
+Frames never interleaved mid-write — the library writes one frame in one
+transport write; what nothing did was choose an *order*, and a snapshot ahead
+of a `pong` in send order is what starved a real robot's control channel.
+Now every producer feeds the writer instead — as a payload (`enqueue`) or as a
+pull source (`ros.samples`, `ros.backlog`, `ros.jobs.updates`,
+`ros.camera_states`, `ros.assets`, `ros.asset_progress`, and snapshots
+pulled from `ros.next_snapshot`) — and the writer drains them in strict
+tier order. See `PrioritizedWriter` and the `_TIER_*` constants.
+
+`hello.active_jobs` (renamed and widened) is how the
+cloud tells a reconnect from a restart: this process's own `RosRuntime.jobs`
+is asked what it still has *every* time hello is sent, not just the first —
+a job that finished and was delivered between one hello and the next must
+stop being named, and a job started after a mid-session reconnect (there is
+no such thing today, but nothing here assumes otherwise) would need to
+start being named.
+
+`ros.set_connected(...)` brackets every session: `True`
+right after `hello_ok`, `False` in `_converse`'s `finally`, regardless of
+how the session ended. This is what tells the subscription callback in
+ros_runtime.py whether a sample is live (goes straight to `ros.samples`) or
+buffered/dropped (`ros.backlog` or nowhere, depending on that datapoint's
+config) — no writer source has to ask the connection state itself; live
+samples and backfill simply sit in different tiers, and strict priority
+does the rest.
+"""
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import enum
+import logging
+import random
+import time
+from collections import deque
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
+
+import aiohttp
+
+from fleetless_bridge import __version__, sampling
+from fleetless_bridge.camera import SNAPSHOT_MAX_BYTES
+from fleetless_bridge.config import BridgeConfig
+from fleetless_bridge.protocol import (
+    APPLY_ERROR_CODE_WHOLE_KIND_FAILED,
+    APPLY_ERROR_KIND_ACTION,
+    APPLY_ERROR_KIND_CAMERA,
+    APPLY_ERROR_KIND_DATAPOINT,
+    APPLY_ERROR_KIND_PUBLISHER,
+    APPLY_ERROR_KIND_SERVICE,
+    CLOSE_CODE_ROBOT_DELETED,
+    CLOSE_CODE_SUPERSEDED,
+    ApplyError,
+    CloudAssetRequest,
+    CloudCameraStart,
+    CloudCameraStop,
+    CloudCancel,
+    CloudInvoke,
+    CloudPublish,
+    Config,
+    HelloError,
+    HelloOk,
+    IntrospectRequest,
+    Ping,
+    TypeRequest,
+    bridge_asset_progress_message,
+    bridge_assets_available_message,
+    bridge_camera_state_message,
+    config_applied_message,
+    datapoint_message,
+    hello_message,
+    introspect_message,
+    job_update_message,
+    parse_cloud_message,
+    pong_message,
+    type_definitions_message,
+)
+
+log = logging.getLogger(__name__)
+
+# How long the cloud may take to answer a hello before we give up on the
+# socket. Without this, a cloud that accepts the TCP connection and then says
+# nothing would keep the bridge waiting forever.
+HANDSHAKE_TIMEOUT_S = 10.0
+
+# How long a connection may stay silent before we treat it as dead. The cloud
+# pings far more often than this, but the bridge deliberately does not encode
+# the cloud's ping cadence — this only has to bound how long a half-open socket
+# can keep pretending to be alive.
+IDLE_TIMEOUT_S = 30.0
+
+BACKOFF_INITIAL_S = 1.0
+BACKOFF_FACTOR = 2.0
+BACKOFF_CAP_S = 30.0
+
+CLOSE_TIMEOUT_S = 5.0
+
+# `PrioritizedWriter`'s occupancy budget — one prioritized writer owns the
+# socket: how long any tier <= 4 payload may project to
+# take before it is sent anyway, with only a warning.
+#
+# 2.0's `SNAPSHOT_MAX_SOCKET_SECONDS` lives on as this number, generalized
+# from one frame kind to every tier. Its reasoning is unchanged and worth
+# keeping: one writer owns the socket, so every second any frame spends
+# on the wire is a second the `pong` queued behind it is not being sent —
+# and the cloud pings every 2 s and closes the socket after three
+# unanswered ones, so the whole session has about six seconds of slack for
+# everything. A third of that, because the rate estimate is an estimate:
+# being wrong by a factor of two must still not be what ends a session.
+#
+# `camera.SNAPSHOT_MAX_BYTES` bounds a snapshot in bytes, against the ws
+# library's own 2 MiB ceiling. That bound knows nothing about how long
+# those bytes take to leave the robot: on a 151 kB/s uplink it
+# is ten seconds of exclusive use of the one socket that also carries the
+# control channel. `snapshot_max_bytes()` is where the two meet.
+MAX_SEND_OCCUPANCY_S = 2.0
+
+# Only a send at least this large says anything about the *link*.
+#
+# `asyncio`'s default transport write high-water mark is 64 KiB. A send
+# below it is accepted straight into the write buffer and returns before a
+# single byte has had to leave the robot, so what `_record_send` times for
+# it is per-send CPU, not drain — only a send that outlives the buffer
+# measures the wire at all. This suite measured exactly that and wrote the
+# number down: `test_client_writer_wiring.py:81-88` records 50 backfill
+# frames of 400 kB each, 20 MB in total, all accepted by `send()` over
+# loopback before a ping sent after the second frame had round-tripped.
+#
+# What folding every send cost, since it is the reason this bound exists:
+# on a 151 kB/s uplink the steady estimate landed somewhere
+# between 300 kB/s and 3.8 MB/s depending on per-send overhead, which pins
+# `snapshot_max_bytes()` at the flat `SNAPSHOT_MAX_BYTES` ceiling — the
+# fitted-snapshot design inert, and 2.0.2's own guard already deleted in
+# its favour.
+#
+# The consequence, stated rather than implied: the estimate stays `None`
+# until the first send this large, so `snapshot_max_bytes()` returns the
+# wire-format ceiling and the **first snapshot is what establishes the
+# rate** — precisely 2.0.2's original seeding semantics, which seeded from
+# snapshots and nothing else. `_send`'s tier <= 4 occupancy warning is
+# silent for the same window, and that is the right silence: a warning
+# whose whole content is a rate cannot honestly fire before there is one.
+RATE_SAMPLE_MIN_BYTES = 65536
+
+# How often the pressure pump publishes `bridge_pressure` while the session
+# is open: the bridge's own bandwidth-shaping state, on the same reserved-slug
+# path as `bridge_state`.
+PRESSURE_INTERVAL_S = 10.0
+
+# Not in `contracts_constants.json` — `exportedConstants` in contracts'
+# `scripts/export-schemas.ts` carries only the values a non-TypeScript
+# consumer needs to vendor (asset headers, `URDF_ASSET_NAME`), and this slug
+# is not among them. Hand-typed from the wire contracts' own
+# `PRESSURE_SLUG`, under a comment naming it — the exact drift those
+# constants exist to prevent, same as `URDF_ASSET_NAME` and
+# `ASSET_UPLOAD_HEADERS` vendored them.
+#
+# And it drifted, exactly as that comment predicted: 3.0 changed the slug
+# grammar from dash- to underscore-separated, `RESERVED_SLUGS` moved with it
+# (`config.ts`), and this literal did not. Nothing in the bridge noticed
+# until the re-vendored `datapoint-frame` schema started refusing the frame
+# the pump builds — which is the whole reason the outgoing frames are
+# validated against a vendored copy at all.
+PRESSURE_SLUG = "bridge_pressure"
+
+# What a stalled ROS work queue looks like arriving out of the tier-5 pull.
+# `RosRuntime._submit_async` waits on a `concurrent.futures.Future` through
+# `run_in_executor(None, future.result, timeout)`, so a work queue that did
+# not reach this snapshot within `WORK_TIMEOUT_S` (ten seconds) surfaces at
+# `pull.result()` as `concurrent.futures.TimeoutError`.
+#
+# All three timeout classes are named because on Python 3.10 they are three
+# distinct classes: `concurrent.futures.TimeoutError is TimeoutError` is
+# `False`, and so is `asyncio.TimeoutError is concurrent.futures.
+# TimeoutError`. They become aliases in 3.11. 3.10 is the interpreter of the
+# OLDEST distribution this one source is built for — Humble's, checked in
+# this package's own test container — and the newer two (Jazzy 3.12, Lyrical
+# 3.14) are past the change, so on those catching one type would do. Naming
+# all three is what makes one source right on every distribution, and it also
+# says more than it has to: "a pull that timed out", whichever layer reported
+# it.
+_PULL_TIMEOUT_ERRORS = (
+    concurrent.futures.TimeoutError,
+    asyncio.TimeoutError,
+    TimeoutError,
+)
+
+# The tiers, exhaustively — the ordering the product asked for: session
+# liveness, then job outcomes an operator is waiting on, then telemetry and
+# camera health, then developer
+# tooling, then buffered history, then snapshots.
+#
+# Backfill's tier 4 is the placement the design weighed rather than
+# assumed: beside live datapoints it would let a reconnect after a long
+# outage stall an introspect click; below snapshots it would invert what
+# retention means, since a snapshot is expendable by design and buffered
+# history was explicitly asked for. Between them keeps every interactive
+# path responsive and still drains the durable data first.
+#
+# `BACKFILL_MIN_INTERVAL_S`, 2.0's 50 ms floor between backfill sends, is
+# retired with this: its one job — buffered history must never crowd out
+# live traffic — is now structural, because every live frame sits in a
+# higher tier and preempts the drain between any two items. What bounded
+# how long a drain could monopolize the link is the backlog's own
+# `buffer.max_values`, already enforced drop-oldest per slug.
+_TIER_SESSION = 0     # pong, hello
+_TIER_OUTCOME = 1     # config_applied, job_update
+_TIER_TELEMETRY = 2   # datapoint (live), camera_state
+_TIER_TOOLING = 3     # introspect, type_definitions, assets_available, asset_progress
+_TIER_BACKFILL = 4    # datapoint (backfill)
+
+# Tier 5: pulled via `snapshot_source.next(max_bytes)`, never pushed through
+# `enqueue()` or a `sources` entry — see `PrioritizedWriter.run`.
+_SNAPSHOT_TIER = 5
+
+# Every tier `BridgeClient.pressure_stats()` reports, whether or not
+# anything has used it yet — `PrioritizedWriter.counters()` only mentions a
+# tier once something has touched it (`enqueue`, a send, or `record_drops`),
+# and the console consumer this feeds must never need a null check per
+# field.
+_ALL_TIERS = (
+    _TIER_SESSION, _TIER_OUTCOME, _TIER_TELEMETRY, _TIER_TOOLING,
+    _TIER_BACKFILL, _SNAPSHOT_TIER,
+)
+_ZERO_TIER_COUNTERS = {"sent": 0, "bytes": 0, "drops": 0, "high_water": 0}
+_ZERO_BUDGET_SNAPSHOT = {
+    "uplink_kbps": None, "override_kbps": None,
+    "video_budget_kbps": None, "reserve_kbps": 0,
+}
+_ZERO_VIDEO_STATS = {"active_streams": 0, "bitrate_sum_kbps": 0}
+
+# How often `PrioritizedWriter.run` re-checks for work when idle. This is
+# what makes a due snapshot observable without busy-polling: without a
+# ceiling on the wake-event wait, a session with a `snapshot_source` but no
+# push/pull traffic at all would block on the event forever and never once
+# ask for a frame.
+_WRITER_TICK_S = 0.25
+
+# Returned by _recv instead of a frame.
+_STOPPED = object()
+_TIMED_OUT = object()
+
+# The largest frame this bridge will accept FROM the cloud. Every message the
+# cloud sends is small — the biggest is a config document — so this is a
+# ceiling and not a budget: a frame past it means something upstream is wrong,
+# and the session ends rather than the robot buffering a megabyte of it.
+# The bridge's own outgoing ceiling is a different number and lives elsewhere
+# (`camera.SNAPSHOT_MAX_BYTES`, fitted per frame by `snapshot_max_bytes()`).
+MAX_INCOMING_FRAME_BYTES = 1 << 20
+
+# How long a socket may be completely silent before the library sends a
+# WebSocket ping of its own, and half of which it then allows for the pong.
+#
+# **This exists because a robot's uplink sits behind NAT** and a genuinely
+# idle TCP connection is reclaimed by middleboxes without either end being
+# told; the cloud pings every 2 s, so on a healthy session this timer is
+# reset long before it ever fires.
+#
+# **It is a deadline, not only a keepalive, and at these values it is not
+# slacker than `IDLE_TIMEOUT_S` — it is the same deadline.** aiohttp derives
+# its own pong deadline as `heartbeat / 2` from this value, so the library
+# gives up at `KEEPALIVE_INTERVAL_S + KEEPALIVE_INTERVAL_S / 2` = 30 s past
+# the last activity — exactly `IDLE_TIMEOUT_S` above, not a looser bound
+# around it. Which of the two fires first on a given run is a scheduling
+# race, not a decision this file makes: when the library's wins, `_converse`
+# sees a closed socket and logs "the cloud closed the connection (code
+# 1006)" — the same line a killed cloud produces — instead of "nothing
+# received for 30 s", and an operator reading the robot's journal cannot
+# tell a hung cloud from this file's own keepalive giving up. No test in
+# this suite can see the tie: `helpers.make_client` overrides
+# `idle_timeout=2.0` for every test, so the library timer never competes
+# with this file's own in anything here.
+KEEPALIVE_INTERVAL_S = 20.0
+
+
+class ConnectionClosed(aiohttp.ClientConnectionError):
+    """The socket is gone: the peer sent a close frame, or the transport
+    ended under us.
+
+    It carries no code of its own — `_Socket.close_code` is where the peer's
+    close code is read, because that is the value the library maintains and
+    a second copy on the exception would be a second answer to one question.
+    """
+
+
+class ConnectionFailed(aiohttp.ClientError):
+    """The socket failed rather than closed: a protocol error, a frame over
+    `MAX_INCOMING_FRAME_BYTES`, or anything else the reader could not carry
+    on after.
+
+    This class exists because of one measured detail: aiohttp reports such a
+    failure as a `WSMsgType.ERROR` message whose payload is an
+    `aiohttp.WebSocketError`, and that class inherits from `Exception`
+    directly — it is neither an `OSError` nor an `aiohttp.ClientError`. An
+    adapter that re-raised it unchanged would raise something none of this
+    file's four catch sites names, and the session would die with a
+    traceback instead of reconnecting. So `_Socket.recv` raises only this,
+    `ConnectionClosed`, an `OSError` or an `aiohttp.ClientError`, and every
+    catch site below names that set.
+    """
+
+
+class _Socket:
+    """One WebSocket, reduced to the four things this file asks of it.
+
+    `send`, `recv`, `close` and `close_code` are the whole surface. Most of
+    the tests' own fakes implement only the three this file's own read/send
+    path actually calls (`send`, `recv`, `close`) -- `close_code` is read by
+    `_converse`'s own close-reason branch, not by anything a fake stands in
+    for elsewhere, so a fake missing it is a stand-in for those three calls
+    only, not for this class whole. A test that reaches `_converse`'s
+    close-reason branch through a fake needs one that has it.
+
+    It owns the `aiohttp.ClientSession` the socket was opened on, because
+    aiohttp's session owns the connector and the socket dies with it: closing
+    the socket without closing the session leaks a connector per reconnect,
+    and the bridge reconnects for a living.
+    """
+
+    def __init__(self, session: "aiohttp.ClientSession", ws) -> None:
+        self._session = session
+        self._ws = ws
+
+    @property
+    def close_code(self) -> Optional[int]:
+        """The peer's close code, once there is one. `None` until then."""
+        return self._ws.close_code
+
+    async def send(self, payload) -> None:
+        """Text as text, bytes as binary — the distinction is on the wire and
+        the cloud reads it (a snapshot is binary, everything else is JSON)."""
+        if isinstance(payload, str):
+            await self._ws.send_str(payload)
+        else:
+            await self._ws.send_bytes(payload)
+
+    async def recv(self):
+        """One frame: `str` for text, `bytes` for binary.
+
+        Every other message type is an end, not a frame, and leaves here as
+        an exception — see `ConnectionFailed` for why none of them may leave
+        as itself.
+        """
+        message = await self._ws.receive()
+        if message.type is aiohttp.WSMsgType.TEXT:
+            return message.data
+        if message.type is aiohttp.WSMsgType.BINARY:
+            return message.data
+        if message.type is aiohttp.WSMsgType.ERROR:
+            error = message.data if isinstance(message.data, BaseException) else None
+            if isinstance(error, (OSError, aiohttp.ClientError)):
+                # Already one of the two kinds the catch sites name; re-raising
+                # it keeps whatever it says about the failure.
+                raise error
+            raise ConnectionFailed(str(error) if error is not None else "socket error") from error
+        if message.type in (
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSING,
+            aiohttp.WSMsgType.CLOSED,
+        ):
+            raise ConnectionClosed("the connection is closed")
+        # PING and PONG do not reach here: `autoping` is left at its default,
+        # so the library answers a ping and swallows a pong inside `receive()`
+        # itself. Anything else is a message type this file has never seen,
+        # and guessing whether it's a "frame" or an "end" would be wrong.
+        raise ConnectionFailed("unexpected websocket message {}".format(message.type))
+
+    async def close(self) -> None:
+        """Close the socket, then release the session that owns it.
+
+        The session is closed in a `finally` because this is called from
+        `BridgeClient._close`, under a `wait_for` that may cancel it: a close
+        handshake the peer never answers must still not leak the connector.
+        `ClientSession.close()` does not wait for the peer, so it is safe
+        there.
+        """
+        try:
+            await self._ws.close()
+        finally:
+            await self._session.close()
+
+
+async def websocket_connect(
+    url: str,
+    *,
+    max_msg_size: int = MAX_INCOMING_FRAME_BYTES,
+    heartbeat: Optional[float] = KEEPALIVE_INTERVAL_S,
+) -> _Socket:
+    """Open one connection to the cloud. `BridgeClient`'s default `connect`.
+
+    The keywords are arguments rather than constants read inside so that a
+    test can drive the real adapter with a ceiling it can actually cross —
+    the `WSMsgType.ERROR` path is otherwise a megabyte of frame away, and a
+    path no test enters is a path that stops working quietly.
+    """
+    # aiohttp accepts `http://` and `https://` for a WebSocket, because the
+    # upgrade is an HTTP one, and this bridge does not: `FLEETLESS_CLOUD_URL`
+    # names a WebSocket endpoint, and an operator who wrote `https://` has
+    # made a mistake that no amount of reconnecting will fix. `_one_session`
+    # can only tell them so through `InvalidURL`, so the scheme is checked
+    # here — the library this replaced refused these itself, and nothing else
+    # in this file would have noticed the difference.
+    #
+    # Deliberately a scheme check and nothing more: everything else about the
+    # URL is aiohttp's to judge, and it raises the same class for it.
+    scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+    if scheme not in ("ws", "wss"):
+        raise aiohttp.InvalidURL(url)
+    session = aiohttp.ClientSession()
+    try:
+        ws = await session.ws_connect(url, max_msg_size=max_msg_size, heartbeat=heartbeat)
+    except BaseException:
+        # Including cancellation: `BridgeClient._open` races this against
+        # `stop()`, so the abandoned attempt is the ordinary case and not the
+        # exceptional one.
+        await session.close()
+        raise
+    return _Socket(session, ws)
+
+
+class StopReason(enum.Enum):
+    """Why `BridgeClient.run` returned."""
+
+    SHUTDOWN = "shutdown"
+    """We were asked to stop. Nothing is wrong."""
+
+    REJECTED = "rejected"
+    """The cloud will refuse us again until a human changes something."""
+
+
+class ExponentialBackoff:
+    """Delays of 1 s, 2 s, 4 s … up to a cap, between connection attempts —
+    each one jittered so a fleet that loses the cloud together does not retry
+    together. Without this, every bridge that dropped in the same
+    moment computes the same schedule and hits the cloud in lockstep on every
+    attempt, which is indistinguishable from a self-inflicted flood at the
+    exact moment the cloud is recovering.
+
+    "Equal jitter" (half the scheduled delay, plus up to the other half at
+    random) rather than "full jitter" (anywhere from zero to the scheduled
+    delay): full jitter can hand back a near-zero wait on any attempt,
+    including the first, which defeats the point of backing off at all. Equal
+    jitter keeps the floor the schedule already promises and only randomizes
+    the ceiling.
+
+    `random_func` is injectable the same way `connect`/`sleep` are on
+    `BridgeClient`: it returns a value in [0, 1), defaulting to
+    `random.random`, so a test can pin it (e.g. `lambda: 1.0` reproduces the
+    unjittered schedule exactly) or drive two independent instances with
+    their own generators to show they diverge.
+    """
+
+    def __init__(
+        self,
+        initial: float = BACKOFF_INITIAL_S,
+        factor: float = BACKOFF_FACTOR,
+        cap: float = BACKOFF_CAP_S,
+        random_func: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self._initial = initial
+        self._factor = factor
+        self._cap = cap
+        self._next = initial
+        self._random_func = random_func if random_func is not None else random.random
+
+    def reset(self) -> None:
+        self._next = self._initial
+
+    def next_delay(self) -> float:
+        scheduled = self._next
+        self._next = min(self._next * self._factor, self._cap)
+        return scheduled * (0.5 + 0.5 * self._random_func())
+
+
+class PrioritizedWriter:
+    """The one writer that owns the socket. Every other pump becomes a
+    *source* feeding this class instead of calling `ws.send()` itself:
+    the library writes each frame in one transport write (see the module
+    docstring above), so frames never interleave mid-write — but that says
+    nothing about *order*, and a snapshot ahead of a pong in send order is
+    exactly what starves the cloud's ping/pong on a slow link. This class is the only
+    thing between any source and the wire, and it drains strictly by tier:
+    a tier is considered only when every tier above it — both the
+    `enqueue()`-fed push deques and any `sources` entries — has nothing
+    ready right now.
+
+    A source in `sources` is duck-typed against three methods, matching
+    this file's existing preference for duck-typing over a formal
+    `Protocol` (see the module docstring's note on `ros`):
+
+        try_next() -> payload (str | bytes) | None   # pull, non-blocking
+        on_sent(item) -> None                          # e.g. job delivery tracking
+        on_send_failure(item) -> None                   # e.g. job put-back
+
+    Push tiers (`enqueue()`) have no such callback: nothing about a queued
+    pong or config-ack needs delivery tracking, the way `JobManager`'s
+    put-back does — see `_JobSource`'s own docstring for why that one
+    matters.
+
+    `snapshot_source`, tier 5, sits below every `sources` tier and is asked
+    for a frame only once nothing else is ready — see `run`. It is async
+    and separate from `sources` because encoding a frame is not free
+    (`camera.encode_snapshot_jpeg` runs on the executor): pulling one is
+    worth doing only after every cheaper tier has been checked.
+
+        snapshot_source.next(max_bytes: int) -> Awaitable[bytes | None]
+
+    Every send — push, pulled, or snapshot — is timed, and every send of
+    at least `RATE_SAMPLE_MIN_BYTES` folds into one throughput estimate —
+    the estimate is fed by every frame, the same fold 2.0.2's
+    retired `_record_snapshot_send` used for snapshots alone:
+    `(previous + observed) / 2`, seeded by the first large send. The size
+    bound is not a tuning knob — a send under the transport's 64 KiB write
+    high-water returns without any byte having left the robot, so folding
+    it measures per-send CPU and not the link; see
+    `RATE_SAMPLE_MIN_BYTES` for what that costs. `rate_estimate()`
+    exposes the estimate; `snapshot_max_bytes()` is the one place it is
+    spent, fitting a snapshot to `max_occupancy_s` of the current rate
+    rather than only the wire-format ceiling
+    (`camera.SNAPSHOT_MAX_BYTES`).
+
+    Tiers 0-4 are must-deliver: a payload that projects to take longer than
+    `max_occupancy_s` at the current rate is sent anyway, with a `log.warning`
+    naming the bytes, the rate and the projected seconds — refusing it would
+    break introspection on exactly the slow links this design exists for —
+    a large `type_definitions` reply is the case. Tier 5 is the only tier
+    ever shaped to fit: `snapshot_source` is trusted to respect what
+    `snapshot_max_bytes()` told it, and nothing here adds a second gate on
+    the bytes it returns: two policies for one decision, and the newer one
+    is always the weaker.
+
+    A send failure ends `run()` after telling the offending source
+    (`on_send_failure`) and logging once — the socket is already gone, the
+    same shape every pump above uses today, and `run()` never raises into
+    its caller: whatever awaits it just sees it return."""
+
+    def __init__(
+        self,
+        ws,
+        *,
+        sources,
+        snapshot_source=None,
+        max_occupancy_s: float = MAX_SEND_OCCUPANCY_S,
+    ) -> None:
+        self._ws = ws
+        # Sorted once here, not trusted from the caller: registration
+        # order must never decide scan order. `sources` is fixed for the
+        # writer's whole life — nothing adds to it after construction — so
+        # sorting once is enough; `_next_ready`
+        # below merges this pre-sorted list against the push tiers, which
+        # *are* dynamic (`enqueue()` can introduce one at any time) and so
+        # get sorted fresh on every call instead.
+        self._sources = sorted(sources, key=lambda pair: pair[0])
+        self._snapshot_source = snapshot_source
+        self._max_occupancy_s = max_occupancy_s
+        self._push: Dict[int, Deque] = {}
+        self._wake = asyncio.Event()
+        # `None` until the first send of at least `RATE_SAMPLE_MIN_BYTES`,
+        # so every frame before that one goes out unmeasured — a guessed
+        # rate low enough to be safe would drop the first frame on a
+        # healthy link, and there is nothing to guess from yet. In practice
+        # the first snapshot is what seeds this, because it is the first
+        # frame big enough to have drained the write buffer.
+        self._rate_bps: Optional[float] = None
+        # Whether the tier-5 pull is currently in a timeout streak, so a
+        # ROS work queue stalled for minutes logs once rather than four
+        # times a second. Cleared by the first pull that comes back without
+        # timing out; see `_run_once`.
+        self._pull_stalled = False
+        self._counters: Dict[int, Dict[str, int]] = {}
+        # The one tier-5 pull that may be in flight, or `None`. Never
+        # awaited inline; see `_run_once`.
+        self._pull: Optional["asyncio.Future"] = None
+
+    def _tier_counters(self, tier: int) -> Dict[str, int]:
+        return self._counters.setdefault(
+            tier, {"sent": 0, "bytes": 0, "drops": 0, "high_water": 0}
+        )
+
+    def enqueue(self, tier: int, payload) -> None:
+        """Pushes onto tier `tier`'s deque and wakes `run()`. For sources
+        fed through `sources` instead (pull, via `try_next`), call `wake()`
+        after making something available — `enqueue` is only for payloads
+        this writer owns outright, with nothing upstream to ask again."""
+        dq = self._push.setdefault(tier, deque())
+        dq.append(payload)
+        counters = self._tier_counters(tier)
+        counters["high_water"] = max(counters["high_water"], len(dq))
+        self._wake.set()
+
+    def rate_estimate(self) -> Optional[float]:
+        """Bytes/second, folded from every completed send of at least
+        `RATE_SAMPLE_MIN_BYTES`; `None` before the first such send — a
+        session that has only ever sent small control frames has not
+        measured the link and says so, rather than reporting the CPU cost
+        of its own `send()` calls as a link speed."""
+        return self._rate_bps
+
+    def snapshot_max_bytes(self) -> int:
+        """`min(camera.SNAPSHOT_MAX_BYTES, rate * max_occupancy_s)` — the
+        wire-format ceiling when the rate is not yet known, otherwise
+        whatever fits the occupancy budget at the current measured rate, so
+        that `encode_snapshot_jpeg` receives a true target instead of a flat
+        1.5 MiB.
+
+        "Not yet known" is the ordinary state at the start of a session,
+        not an edge case: the estimate only moves on sends of at least
+        `RATE_SAMPLE_MIN_BYTES`, and on most robots the first of those is a
+        snapshot. So the first snapshot of a session is asked for at the
+        wire-format ceiling and is itself what establishes the rate every
+        later one is fitted to — 2.0.2's seeding semantics, unchanged."""
+        if self._rate_bps is None or self._rate_bps <= 0:
+            return SNAPSHOT_MAX_BYTES
+        return min(SNAPSHOT_MAX_BYTES, int(self._rate_bps * self._max_occupancy_s))
+
+    def wake(self) -> None:
+        """Lets a pull-source feeder tell `run()` "something may be ready
+        now" without handing over a payload directly — `run()` still asks
+        the source itself via `try_next()`; this only shortens the wait."""
+        self._wake.set()
+
+    def record_drops(self, tier: int, count: int) -> None:
+        """Folds drops this writer did not itself perform into `tier`'s
+        counter. A pull source's underlying queue is where a drop is
+        actually decided — `CameraStateQueue` coalescing a superseded
+        state is the one this method exists for — and the source reports
+        it here when it is next asked for work, because that is the only
+        moment this class and that queue are in the same place. Without
+        this the counters would show a tier that never drops anything,
+        which is exactly the
+        instrument-that-cannot-fail shape this package keeps closing.
+
+        Not the same number as `SampleQueue.drain_drop_count()`, which is
+        read once per reconnect for its own log line and is deliberately
+        left alone: two readers read-and-resetting one counter would each
+        see a fraction of the truth."""
+        if count:
+            self._tier_counters(tier)["drops"] += count
+
+    def record_high_water(self, tier: int, value: int) -> None:
+        """Folds a *source-side* queue depth into `tier`'s high-water mark
+        — `record_drops`'s precedent, applied to the other counter only the
+        queue itself can see.
+
+        `enqueue()` is the only other writer of `high_water`, and it can
+        only ever see the writer's own push deques. A tier fed entirely by
+        pull sources therefore had a structurally zero gauge: tier 2 is
+        `SampleQueue` and `CameraStateQueue`, neither of which the writer
+        ever queues anything into, so "queue high-water mark" would have
+        rendered as a flat 0 in the console's indicator no matter
+        how deep the robot's backlog actually got — a dead gauge, which is
+        worse than an absent one.
+
+        `max`, not assignment: the sources report cumulative peaks that
+        never go down, and the writer's own push peak for the same tier
+        must not be lost by a later, smaller source reading (nor the other
+        way round)."""
+        counters = self._tier_counters(tier)
+        counters["high_water"] = max(counters["high_water"], value)
+
+    def counters(self) -> dict:
+        """A snapshot of per-tier `{"sent", "bytes", "drops", "high_water"}`
+        plus the overall `"rate_bps"` — for status/diagnostics, not for any
+        decision this class makes about itself."""
+        result: Dict[Any, Any] = {tier: dict(c) for tier, c in self._counters.items()}
+        result["rate_bps"] = self._rate_bps
+        return result
+
+    def _next_ready(self):
+        """The next `(tier, payload, source)` in strict tier order across
+        both push deques and pull sources, or `None` if nothing is ready
+        right now. `source` is `None` for a push item — there is nothing to
+        call `on_sent`/`on_send_failure` back on.
+
+        A merge of two already-ordered sequences — push tiers sorted fresh
+        here (dynamic: `enqueue()` can introduce a new one at any time) and
+        `self._sources`, sorted once in `__init__` because it never changes
+        after construction. On a tie, the push side goes first.
+
+        That tie-break is not vacuous: three tiers carry both. Tier 1 has
+        `config_applied` pushed by `_handle_config` and `_JobSource`'s job
+        outcomes pulled; tier 3 has `introspect` and `type_definitions`
+        pushed by the two request handlers and `_AssetSource`'s
+        availability/progress frames pulled. A queued
+        `type_definitions` — the largest frame the bridge ever puts on the
+        control channel, hundreds of kilobytes — goes out ahead of every
+        `asset_progress` frame already waiting in the same tier, and an
+        asset sync's progress reporting stalls for exactly as long as that
+        transfer takes. Accepted rather than fixed: both are developer
+        tooling of equal rank, the tooling reply is what a developer is
+        actively blocked on, and progress is a level whose next frame
+        corrects the gap.
+
+        Tier 2 is the third, since bridge 2.2.0: `_pump_pressure`'s own
+        push always beats `_CameraStateSource`/`_SampleSource`'s pull on a
+        tie, so a `bridge_pressure` datapoint due this tick jumps ahead of
+        whatever live sample or camera state was already waiting in the
+        same tier — the diagnostic overtaking its own tier's backlog,
+        deliberately: the two pulled sources still get their turn the very
+        next scan (the push side is empty again by then), and a gauge that
+        could itself be starved by the traffic it is measuring would be
+        the worse trade."""
+        push_tiers = iter(sorted(self._push.keys()))
+        sources = iter(self._sources)
+        next_push = next(push_tiers, None)
+        next_source = next(sources, None)
+        while next_push is not None or next_source is not None:
+            if next_source is None or (
+                next_push is not None and next_push <= next_source[0]
+            ):
+                tier = next_push
+                dq = self._push.get(tier)
+                next_push = next(push_tiers, None)
+                if dq:
+                    return tier, dq.popleft(), None
+                continue
+            tier, source = next_source
+            next_source = next(sources, None)
+            payload = source.try_next()
+            if payload is not None:
+                return tier, payload, source
+        return None
+
+    async def run(self) -> None:
+        """Drains strictly by tier for the life of the connection. When
+        nothing is ready: starts a tier-5 pull if none is already in
+        flight and there is a `snapshot_source`, then waits out one tick
+        of the wake event — so a due snapshot is noticed without
+        busy-polling, and a frame arriving in a higher tier meanwhile ends
+        the wait at once. Without a `snapshot_source`, the tick alone is
+        the wait, so an idle writer with no sources at all never
+        busy-loops.
+
+        The pull is deliberately *not* awaited inline. It was, and that
+        was a defect: `RosRuntime.next_snapshot` goes through
+        `_submit_async`, which queues behind whatever the ROS executor is
+        already doing (a `resolve_types`, a `graph_snapshot`, a camera
+        apply) and gives up only after `WORK_TIMEOUT_S` — ten seconds.
+        This writer is the *only* sender, so those ten seconds are ten
+        seconds a `pong` already sitting in tier 0 is not being sent, and
+        the cloud closes the socket after about six. Encoding a snapshot
+        is exactly the kind of work that must never be able to hold the
+        one socket, which is the whole premise of this class.
+
+        So: at most one pull in flight, started before the wait and
+        harvested by a later scan. Tier order is unaffected — a pulled
+        payload is only ever *sent* by an iteration that has already found
+        tiers 0-4 empty — and a pull that never finishes costs one pending
+        task rather than the session. One at a time also matters for the
+        thread pool: `_submit_async` parks a default-executor thread per
+        call, and starting a fresh pull every tick against a wedged ROS
+        executor would exhaust that pool and take every other
+        `_submit_async` caller down with it.
+
+        `event.clear()` happens before each scan, not after — the
+        check-then-wait race this avoids: enqueue()/wake() setting the
+        event between "we found nothing" and "we started waiting" must
+        still be seen, which a clear-after-wait ordering can lose.
+
+        A tier-5 pull that *times out* is the one exception this loop
+        handles itself rather than by closing the socket — see
+        `_run_once`. Anything else unexpected escaping a source's
+        `try_next`/`on_sent`/`on_send_failure`, or `snapshot_source.next`,
+        is caught once here rather than left to propagate into whatever
+        runs this coroutine as a bare task (`_converse` does, with
+        `asyncio.ensure_future(writer.run())`; `_run_once` is what this
+        loop awaits). Same shape as `_pump_control`'s 2.0.1 fix, cited in
+        its own docstring: off this loop, the same error would only end
+        `run()`'s own task and leave a
+        connected bridge that silently stops sending anything at all —
+        strictly worse than closing the socket and letting `_converse`'s
+        `recv()` notice and reconnect. Not swallow-and-continue: a source
+        that raises is broken, and looping back to it would just repeat
+        the same error every tick."""
+        try:
+            while True:
+                try:
+                    keep_going = await self._run_once()
+                except Exception:  # noqa: BLE001 - see the docstring above
+                    log.exception(
+                        "The prioritized writer hit an unexpected error and is "
+                        "closing the connection"
+                    )
+                    await self._safe_close()
+                    return
+                if not keep_going:
+                    return
+        finally:
+            self._cancel_pull()
+
+    async def _run_once(self) -> bool:
+        """One iteration of `run`'s loop. Returns whether to keep going —
+        `False` means a send failed (already logged in `_send`) and `run`
+        should end normally; an exception instead means something other
+        than the socket itself broke (a source bug), which `run` handles
+        separately."""
+        self._wake.clear()
+        item = self._next_ready()
+        if item is not None:
+            tier, payload, source = item
+            return await self._send(tier, payload, source)
+
+        if self._snapshot_source is None:
+            await self._tick()
+            return True
+
+        if self._pull is not None and self._pull.done():
+            # Cleared before the result is read: `.result()` re-raises
+            # whatever the pull failed with, and `run`'s handler must not
+            # then find a task it would try to cancel a second time.
+            pull, self._pull = self._pull, None
+            try:
+                payload = pull.result()
+            except _PULL_TIMEOUT_ERRORS:
+                # A ROS work queue that did not get to this snapshot in
+                # `WORK_TIMEOUT_S` is "nothing due this tick", not a broken
+                # source. Left to `run`'s catch-all it closed the session
+                # instead — and the reconnect then re-applies the whole
+                # configuration, which is *more* executor work queued
+                # behind the same stall, so a ten-second hiccup compounded
+                # into a reconnect loop. Before this branch existed at all
+                # (before the pressure work), a stalled executor only
+                # delayed snapshots. It does again.
+                #
+                # Socket-closure stays for every other exception: a source
+                # that raises is broken, and looping back to it would just
+                # repeat the same error every tick (see `run`).
+                if not self._pull_stalled:
+                    self._pull_stalled = True
+                    log.warning(
+                        "The snapshot pull timed out — the ROS work queue is "
+                        "stalled. Snapshots are paused until it recovers; the "
+                        "connection is unaffected. Logged once per stall, not "
+                        "once per attempt"
+                    )
+                await self._tick()
+                return True
+            # The streak ends at the first pull that answers at all,
+            # whether or not it had a frame — the next stall gets its own
+            # log line.
+            self._pull_stalled = False
+            if payload is not None:
+                return await self._send(_SNAPSHOT_TIER, payload, None)
+            # Nothing was due. Wait out a tick before asking again: the
+            # done callback below sets the wake event, so a source that
+            # answers `None` immediately — the ordinary case, most ticks
+            # having no camera due — would otherwise drive start-pull /
+            # harvest-nothing round and round at full CPU. The tick is
+            # what has always paced this loop; it just has to sit on this
+            # side of the pull now.
+            await self._tick()
+            return True
+
+        if self._pull is None:
+            # `snapshot_max_bytes()` is spent here, when the pull starts,
+            # not when its frame is sent — the estimate may have moved by
+            # then. An estimate is an estimate; what matters is that the
+            # target tracks the link at all, which it does.
+            self._pull = asyncio.ensure_future(
+                self._snapshot_source.next(self.snapshot_max_bytes())
+            )
+            # Without this the finished frame would wait out a full tick
+            # before anything looked at it.
+            self._pull.add_done_callback(lambda _task: self._wake.set())
+        await self._tick()
+        return True
+
+    def _cancel_pull(self) -> None:
+        """Abandons an in-flight pull when `run` ends. Synchronous on
+        purpose — this runs in a `finally` that may itself be unwinding a
+        cancellation, which is no place to await. The done callback
+        retrieves whatever the task ends up with, so an abandoned pull
+        that raised is never reported as an exception nobody read."""
+        pull, self._pull = self._pull, None
+        if pull is None:
+            return
+        pull.cancel()
+        pull.add_done_callback(lambda task: task.cancelled() or task.exception())
+
+    async def _tick(self) -> None:
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=_WRITER_TICK_S)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _safe_close(self) -> None:
+        """Best-effort — `run` is ending regardless of whether this
+        succeeds. Same shape as `BridgeClient._close`: the point is to make
+        `_converse`'s `recv()` notice the session is over, not to guarantee
+        a clean close."""
+        try:
+            await self._ws.close()
+        except Exception:  # noqa: BLE001 - best-effort, see above
+            pass
+
+    async def _send(self, tier: int, payload, source) -> bool:
+        """Sends one payload, timing it into the rate estimate. Returns
+        whether the socket is still usable — `False` ends `run()`."""
+        if tier < _SNAPSHOT_TIER and self._rate_bps:
+            projected = len(payload) / self._rate_bps
+            if projected > self._max_occupancy_s:
+                # Must-deliver: sent anyway — shaping is
+                # only for tier 5, which is fitted to the budget before it
+                # is ever handed here (`snapshot_max_bytes`).
+                log.warning(
+                    "Sending a %d-byte tier %d frame that projects to "
+                    "%.1f s at %.0f B/s, over the %.1f s occupancy budget "
+                    "— sent anyway, must-deliver tiers are never dropped "
+                    "for size",
+                    len(payload), tier, projected, self._rate_bps,
+                    self._max_occupancy_s,
+                )
+        started = time.monotonic()
+        try:
+            await self._ws.send(payload)
+        except (ConnectionClosed, OSError, aiohttp.ClientError) as exc:
+            log.warning("The connection dropped before a tier %d frame: %s", tier, exc)
+            if source is not None:
+                source.on_send_failure(payload)
+            return False
+        elapsed = time.monotonic() - started
+        self._record_send(len(payload), elapsed)
+        counters = self._tier_counters(tier)
+        counters["sent"] += 1
+        counters["bytes"] += len(payload)
+        if source is not None:
+            source.on_sent(payload)
+        return True
+
+    def _record_send(self, size: int, elapsed: float) -> None:
+        """Same fold 2.0.2 used for snapshots alone, now applied to every
+        frame this writer sends that is large enough to have measured the
+        link rather than its own CPU (see `RATE_SAMPLE_MIN_BYTES` for why
+        that bound is 64 KiB)."""
+        if size < RATE_SAMPLE_MIN_BYTES:
+            return
+        if elapsed <= 0:
+            return
+        observed = size / elapsed
+        self._rate_bps = (
+            observed if self._rate_bps is None else (self._rate_bps + observed) / 2
+        )
+
+
+class _GatedSource:
+    """Wraps a ROS-fed source so it produces nothing until the session is
+    open — `is_open()` is what `_converse` flips at `hello_ok`.
+
+    The pumps this design replaces were *started* at `hello_ok`; being
+    started late was their gate. The writer cannot work that way: it has to
+    exist from the first moment of `_converse`, because `hello` goes
+    through it, a `pong` may overtake the greeting
+    (test_client_pingpong.py), and a `config` can arrive ahead of
+    `hello_ok` (see `_pump_control`'s note on being started before the
+    receive loop). So the gate moves from *when a source starts* to *when
+    it answers*, and nothing that presumes a greeted session — a datapoint,
+    a job outcome, a backfill item — can leave before the cloud has said
+    which robot this is.
+
+    One wrapper rather than the same three-line check pasted into each of
+    the five sources: a rule five classes each implement separately is five
+    chances for one of them to forget it."""
+
+    def __init__(self, is_open: Callable[[], bool], inner) -> None:
+        self._is_open = is_open
+        self._inner = inner
+
+    def try_next(self):
+        if not self._is_open():
+            return None
+        return self._inner.try_next()
+
+    def on_sent(self, item) -> None:
+        # Not gated: a session that closed between the send and its
+        # acknowledgement must still let the source finish bookkeeping it
+        # already started (`JobManager.mark_delivered`, above all).
+        self._inner.on_sent(item)
+
+    def on_send_failure(self, item) -> None:
+        self._inner.on_send_failure(item)
+
+
+class _JobSource:
+    """Tier 1: `ros.jobs.updates` as job_update frames — what `_pump_jobs`
+    used to do, split into the writer's three callbacks.
+
+    This queue never drops a job's outcome (jobs.py), so the whole backlog
+    delivers on reconnect, not just the latest state. A send that fails
+    because the connection just dropped puts its update back at the front
+    rather than discarding it: `try_next` already removed it, and without
+    this, the very disconnect that drop-nothing promise exists to survive
+    would be exactly when an update goes missing.
+
+    `mark_delivered` runs only from `on_sent`, i.e. only after `ws.send()`
+    actually succeeded — a terminal update that merely got queued must not
+    yet retire its job from `active_jobs` (see jobs.py). A job that
+    finishes while disconnected, with its terminal update still queued at
+    the next hello, must keep being named as active until that update
+    genuinely reaches the cloud, or the cloud marks it `lost`
+    moments before the truthful outcome arrives for a job it has already
+    given up on.
+
+    `_inflight` holds the `JobUpdate` the wire frame was built from,
+    because the writer hands `on_sent`/`on_send_failure` the *payload*, not
+    the object. At most one can be outstanding: the writer sends what
+    `try_next` returned before it scans any source again."""
+
+    def __init__(self, ros) -> None:
+        self._ros = ros
+        self._inflight = None
+
+    def try_next(self):
+        update = self._ros.jobs.updates.try_get()
+        if update is None:
+            return None
+        self._inflight = update
+        return job_update_message(
+            update.job_id,
+            update.slug,
+            update.state,
+            timestamp_ms=update.timestamp_ms,
+            feedback=update.feedback,
+            progress=update.progress,
+            result=update.result,
+            error=update.error,
+            details=update.details,
+        )
+
+    def on_sent(self, payload) -> None:
+        update, self._inflight = self._inflight, None
+        if update is not None:
+            self._ros.jobs.mark_delivered(update)
+
+    def on_send_failure(self, payload) -> None:
+        update, self._inflight = self._inflight, None
+        if update is not None:
+            self._ros.jobs.updates.requeue_front(update)
+
+
+class _SampleSource:
+    """Tier 2: live datapoint samples. `SampleQueue` already drops oldest
+    on overflow and counts it for the once-per-reconnect log line
+    (`_log_dropped_samples`), so there is nothing to track here and nothing
+    to put back: a sample that missed the wire has a successor a moment
+    later, which is the whole reason it is allowed to drop at all.
+
+    What it *does* report is the queue's high-water mark, the same way
+    `_CameraStateSource` reports its own — before bridge 2.2.0's pressure
+    pump, this tier had no push deque at all, so without these two the
+    writer's tier-2 `high_water` could only ever be zero; the pump gives
+    tier 2 a push side of its own now, but a source-fed peak deeper than
+    whatever the pump's deque has reached still needs a way to surface,
+    which is what these two calls remain for. Its drop count is
+    deliberately *not* reported here; see
+    `PrioritizedWriter.record_drops` for why that one counter has exactly
+    one reader. `writer` is filled in by `_build_writer`, for the same
+    reason `_CameraStateSource.writer` is."""
+
+    def __init__(self, ros, tier: int) -> None:
+        self._ros = ros
+        self._tier = tier
+        self.writer: Optional[PrioritizedWriter] = None
+
+    def try_next(self):
+        if self.writer is not None:
+            self.writer.record_high_water(self._tier, self._ros.samples.high_water())
+        sample = self._ros.samples.try_get()
+        if sample is None:
+            return None
+        return datapoint_message(sample.slug, sample.value, sample.timestamp_ms)
+
+    def on_sent(self, payload) -> None:
+        pass
+
+    def on_send_failure(self, payload) -> None:
+        pass
+
+
+class _CameraStateSource:
+    """Tier 2: `ros.camera_states` as bridgeCameraState frames. Unlike
+    `_JobSource` there is no delivery tracking — a camera's live/not-live
+    state has nothing analogous to `active_jobs` reading it — so a send
+    failure just ends the session with nothing to requeue.
+
+    Registered *ahead of* `_SampleSource` in the same tier, which is the
+    one place registration order decides anything (`PrioritizedWriter.
+    _next_ready` scans same-tier sources in order). Deliberate: camera
+    states are rare and transition-driven, live samples are a continuous
+    stream, and a robot sampling steadily must not be able to keep a
+    camera's state — including the one answering an operator's
+    `camera_start` — off the wire indefinitely. The reverse order has no
+    such symmetric cost, since a dropped-oldest sample has a successor.
+
+    Whatever the queue coalesced away since the last ask is reported into
+    the writer's tier-2 drop counter here (see `record_drops`), and the
+    queue's own depth into the tier-2 high-water mark (see
+    `record_high_water` — the pressure pump pushes onto tier 2 too now,
+    but only these two sources can report a *source-side* depth, which is
+    the only thing `record_high_water` folds in). `writer` is
+    filled in by `_build_writer` immediately after the writer is
+    constructed — it cannot be a constructor argument, because this source
+    has to be in the list the writer is built from."""
+
+    def __init__(self, ros, tier: int) -> None:
+        self._ros = ros
+        self._tier = tier
+        self.writer: Optional[PrioritizedWriter] = None
+
+    def try_next(self):
+        dropped = self._ros.camera_states.drain_drop_count()
+        if self.writer is not None:
+            self.writer.record_drops(self._tier, dropped)
+            self.writer.record_high_water(
+                self._tier, self._ros.camera_states.high_water()
+            )
+        update = self._ros.camera_states.try_get()
+        if update is None:
+            return None
+        return bridge_camera_state_message(
+            update.slug, update.publishing, update.error,
+            cause=update.cause, observed_at_ms=update.observed_at_ms,
+            request_id=update.request_id,
+        )
+
+    def on_sent(self, payload) -> None:
+        pass
+
+    def on_send_failure(self, payload) -> None:
+        pass
+
+
+class _AssetSource:
+    """Tier 3: both asset queues, `ros.assets` (bridgeAssetsAvailable)
+    and `ros.asset_progress` (bridgeAssetProgress) — one source rather
+    than two, because they share a tier and nothing distinguishes their
+    priority. Availability first: it is the rarer frame and the one a sync
+    is reported *against*.
+
+    No delivery tracking and nothing to requeue on failure, same as
+    `_CameraStateSource`. A dropped `assets_available` is made good on the
+    next reconnect (`_handle_config` calls `report_current_urdf_
+    availability`); a dropped `asset_progress` is a gap in what the cloud
+    was told, not a stalled sync — `RosRuntime.sync_assets` has no notion
+    of the WebSocket at all and keeps running regardless."""
+
+    def __init__(self, ros) -> None:
+        self._ros = ros
+
+    def try_next(self):
+        update = _drain_one(self._ros.assets)
+        if update is not None:
+            return bridge_assets_available_message(update.urdf, update.meshes)
+        progress = _drain_one(self._ros.asset_progress)
+        if progress is None:
+            return None
+        return bridge_asset_progress_message(
+            progress.sync_id, progress.done, progress.total,
+            progress.failed, progress.state,
+        )
+
+    def on_sent(self, payload) -> None:
+        pass
+
+    def on_send_failure(self, payload) -> None:
+        pass
+
+
+class _BackfillSource:
+    """Tier 4: `ros.backlog`, the buffered history of datapoints configured
+    with `buffer.enabled`, oldest first within a slug.
+
+    Nothing here rate-limits: strict priority replaced
+    `BACKFILL_MIN_INTERVAL_S` outright (see the tier constants above). The
+    promise it enforced — buffered history never crowds out live traffic —
+    is now a property of the scan order rather than of a timer, and holds
+    between *every* pair of backfill items rather than only every 50 ms.
+
+    `pop_any` can return `None` while `has_pending()` was true a moment ago
+    (a config apply calling `backlog.remove()` races it); returning `None`
+    is the right answer then, and the writer simply asks again."""
+
+    def __init__(self, ros) -> None:
+        self._ros = ros
+
+    def try_next(self):
+        sample = self._ros.backlog.pop_any()
+        if sample is None:
+            return None
+        return datapoint_message(sample.slug, sample.value, sample.timestamp_ms)
+
+    def on_sent(self, payload) -> None:
+        pass
+
+    def on_send_failure(self, payload) -> None:
+        # Deliberately not put back. `BacklogStore` is bounded per slug and
+        # ordered by `timestamp_ms` on the cloud regardless; re-inserting a
+        # sample whose send failed would have to choose a slug and a
+        # position, and a lost history sample is the honest gap this tier
+        # already accepts (unlike a job outcome, which has no successor).
+        pass
+
+
+class _SnapshotSource:
+    """Tier 5, the pulled tier: asks the runtime for a frame encoded to
+    whatever the writer can currently afford. Gated on the
+    session being open for the same reason the `_GatedSource` wrapper
+    exists — this one carries the check itself, since its interface is a
+    single `async next` rather than the three-method pull contract."""
+
+    def __init__(self, is_open: Callable[[], bool], ros) -> None:
+        self._is_open = is_open
+        self._ros = ros
+
+    async def next(self, max_bytes: int):
+        if not self._is_open():
+            return None
+        return await self._ros.next_snapshot(max_bytes)
+
+
+def _drain_one(queue: "asyncio.Queue"):
+    """One item from a plain `asyncio.Queue`, or `None` — the `try_get`
+    the bridge's own queue classes have and `asyncio.Queue` does not."""
+    try:
+        return queue.get_nowait()
+    except asyncio.QueueEmpty:
+        return None
+
+
+def pressure_wire_value(stats: dict) -> dict:
+    """`pressure_stats()` -> the `bridgePressure` wire shape (vendored at
+    `test/contracts/schema/bridge-pressure.schema.json`): tiers keyed by
+    `str` (JSON has no integer keys), `timestamp_ms` removed (it rides on
+    the datapoint frame itself, not inside the value), `rate_bps` and
+    `snapshot_max_bytes` grouped under `link`. `video` needs nothing done
+    to it — `pressure_stats()` already assembles it in the wire shape.
+
+    Pure function, unit-testable without a client, a writer or a ROS
+    runtime: the schema test is the arbiter of "omit nothing else"."""
+    return {
+        "link": {
+            "rate_bps": stats["rate_bps"],
+            "snapshot_max_bytes": stats["snapshot_max_bytes"],
+        },
+        "tiers": {str(tier): counters for tier, counters in stats["tiers"].items()},
+        "video": stats["video"],
+    }
+
+
+class BridgeClient:
+    """Keeps the robot connected to the cloud for as long as that makes sense.
+
+    `connect` and `sleep` are injectable so the suite can drive a real
+    WebSocket server without waiting out real backoff delays.
+    """
+
+    def __init__(
+        self,
+        config: BridgeConfig,
+        *,
+        connect: Optional[Callable[[str], Awaitable]] = None,
+        sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+        pressure_sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+        backoff: Optional[ExponentialBackoff] = None,
+        handshake_timeout: float = HANDSHAKE_TIMEOUT_S,
+        idle_timeout: float = IDLE_TIMEOUT_S,
+        bridge_version: str = __version__,
+        ros: Optional[Any] = None,
+        max_send_occupancy_s: float = MAX_SEND_OCCUPANCY_S,
+    ) -> None:
+        self._config = config
+        self._max_send_occupancy_s = max_send_occupancy_s
+        self._connect = connect if connect is not None else websocket_connect
+        self._sleep = sleep if sleep is not None else asyncio.sleep
+        # Deliberately *not* `self._sleep`, despite `_pump_pressure` pacing
+        # itself the same way the backoff loop does: `helpers.make_client`
+        # (the whole suite's own harness) defaults `sleep=RecordingSleep()`
+        # for every test, real-suite-wide, so that it never has to wait out
+        # backoff's real delays. `RecordingSleep` records and returns
+        # near-instantly — right for a backoff test, wrong for a periodic
+        # pump, which would then re-enqueue onto tier 2 as fast as the loop
+        # can turn. Tier 2 outranks every pull-fed tier below it
+        # (`_next_ready`'s push-wins-ties rule), so a pump that never
+        # really waits starves tier 3/4/5 in *every* pre-existing test that
+        # reaches `hello_ok` with `ros` set — found the hard way, as
+        # `assets_available` frames a dozen tests wait on, never arriving.
+        # A dedicated injectable, real `asyncio.sleep` unless a test asks
+        # otherwise, keeps that default harmless everywhere except the
+        # tests that opt in on purpose (test_client_pressure_pump.py).
+        self._pressure_sleep = pressure_sleep if pressure_sleep is not None else asyncio.sleep
+        self._backoff = backoff if backoff is not None else ExponentialBackoff()
+        self._handshake_timeout = handshake_timeout
+        self._idle_timeout = idle_timeout
+        self._bridge_version = bridge_version
+        self._ros = ros
+        self._stop = asyncio.Event()
+        # Whether this session has been greeted (`hello_ok` seen) — read by
+        # every ROS-fed writer source through `_GatedSource`, which is
+        # where the reasoning lives. Reset per session in `_converse`.
+        self._session_open = False
+        self.robot_id: Optional[str] = None
+        # Set True by `_converse` at the top of every session; consumed and
+        # cleared by `_handle_config` on that session's first `config` frame
+        # — a fresh connection re-states every configured camera's
+        # current background health unconditionally, not only on the next
+        # transition, so a cloud that just restarted (and so lost its own
+        # health store) gets the truth back rather than nothing until the
+        # next thing happens to change. See RosRuntime.
+        # report_current_camera_health's own docstring for why.
+        self._first_config_since_hello = True
+        # The most recently built session's writer, or `None` before the
+        # first connection attempt (`_build_writer` has not run yet) — read
+        # by `pressure_stats()`. Deliberately *not* reset to `None` when a
+        # session ends: the counters of the last session are more useful
+        # than nothing until the next one starts and `_build_writer`
+        # overwrites this with a fresh, zeroed writer. That overwrite is
+        # also the answer to "does a reconnect reset the numbers?" — yes:
+        # a new `PrioritizedWriter` starts every session, so `pressure_
+        # stats()` reports the *current* session's pressure, never a
+        # lifetime total across reconnects. See `pressure_stats`'s own
+        # docstring.
+        self._last_writer: Optional[PrioritizedWriter] = None
+
+    def stop(self) -> None:
+        """Ask the bridge to shut down; safe to call from a signal handler."""
+        self._stop.set()
+
+    def pressure_stats(self) -> dict:
+        """One plain dict of pressure counters, collected now, assembled
+        from three sources — `self._last_writer.counters()`,
+        `self._ros.video_stats()` and
+        `self._ros.uplink_budget.snapshot()`:
+
+            {
+              "timestamp_ms": <capture time>,
+              "tiers": {0: {"sent", "bytes", "drops", "high_water"}, ...},
+              "rate_bps": Optional[float],
+              "snapshot_max_bytes": int,
+              "video": {"active_streams", "bitrate_sum_kbps",
+                        "uplink_kbps", "override_kbps",
+                        "video_budget_kbps", "reserve_kbps"},
+            }
+
+        Always this exact shape, every key present, nothing `None` where a
+        number is expected — the console's indicator must never
+        need a null check per field. That holds in both cases
+        that have nothing behind them: before the first connection
+        (`self._last_writer is None` — `_build_writer` has not run yet) and
+        for a ROS-less client (`self._ros is None`, e.g. every unit test
+        that builds a bare `BridgeClient`, or a bridge process started
+        without ROS wiring at all). Both fall back to an all-zero,
+        `None`-free shape rather than a missing key or a bare `{}`.
+
+        Counters reset with every new session, not just with the process:
+        `_build_writer` constructs a fresh `PrioritizedWriter` on every
+        connection attempt (see `_converse`), and `self._last_writer` always
+        points at the most recent one. So a reconnect zeroes `tiers` and
+        `rate_bps` back to "nothing sent yet" — this reports the *current*
+        session's pressure, not a lifetime total across reconnects. That
+        includes tier 2's `high_water` fed by `SampleQueue` and
+        `CameraStateQueue` (see the bullet below) — both outlive the
+        session, so `_converse`'s `finally` also baselines them at the end
+        of every session — `drain_high_water()` on each, read-and-reset,
+        seeded with whatever is still queued rather than zero (see each
+        method's own docstring) — so neither queue's own peak survives
+        into the next session unless the backlog genuinely does too.
+
+        `timestamp_ms` is bridge capture time
+        (`sampling.capture_timestamp_ms`), taken at collection — never
+        receive time.
+
+        **What the two per-tier gauges actually mean**, because "0" reads
+        as "nothing happened" and for two of these tiers it can only ever
+        mean "there is nothing here to count":
+
+        * `high_water` is the deepest a queue for that tier has been. For
+          tiers 0, 1 and 3 that is the writer's own push deque
+          (`PrioritizedWriter.enqueue`). Tier 2 now has a push side too —
+          `_pump_pressure`'s own `bridge_pressure` datapoint (bridge
+          2.2.0) — so its reading is the `max` of that deque's own depth
+          and the two pulled source queues' peaks — `SampleQueue.
+          high_water()` and `CameraStateQueue.high_water()`, folded in
+          through `record_high_water`. In practice this means an
+          otherwise-idle robot's tier-2 `high_water` reads `0` on the
+          pump's first frame and `>= 1` from its second one on — the pump
+          observing itself, the same way any gauge that shares its own
+          measured channel does. Tiers 1 and 3 *also* carry
+          a pull source each (`_JobSource`, `_AssetSource`) whose queue
+          depth is not folded in, so their reading is the push side only.
+          Tiers 4 and 5 stay 0 by construction and that is not a defect to
+          chase: backfill is pulled item by item straight out of
+          `BacklogStore` and a snapshot is encoded on demand, so neither
+          has a queue whose depth would mean anything.
+        * `drops` moves for exactly one thing today: `CameraStateQueue`
+          coalescing a superseded camera state away, reported by
+          `_CameraStateSource` into tier 2. `SampleQueue`'s own
+          drop-oldest count is deliberately not folded in — it is
+          read-and-reset once per reconnect for its own log line, and two
+          readers read-and-resetting one counter would each see a fraction
+          of the truth (`PrioritizedWriter.record_drops`). So a zero here
+          means "no camera state was coalesced away", never "nothing was
+          dropped anywhere".
+
+        **`tiers` is keyed by `int`.** `json.dumps` stringifies integer
+        keys, so a consumer that serializes this dict receives `"0"` …
+        `"5"`, not `0` … `5`. Left as ints here because that is what every
+        reader inside this process wants; `pressure_wire_value` (bridge
+        2.2.0) is what turns this into the `bridgePressure` wire shape for
+        the `bridge_pressure` datapoint `_pump_pressure` sends."""
+        writer_counters = (
+            self._last_writer.counters() if self._last_writer is not None else {}
+        )
+        rate_bps = writer_counters.get("rate_bps")
+        tiers = {
+            tier: writer_counters.get(tier, dict(_ZERO_TIER_COUNTERS))
+            for tier in _ALL_TIERS
+        }
+        snapshot_max_bytes = (
+            self._last_writer.snapshot_max_bytes()
+            if self._last_writer is not None
+            else SNAPSHOT_MAX_BYTES
+        )
+        budget = self._ros.uplink_budget if self._ros is not None else None
+        video = {
+            **(self._ros.video_stats() if self._ros is not None else _ZERO_VIDEO_STATS),
+            **(budget.snapshot() if budget is not None else _ZERO_BUDGET_SNAPSHOT),
+        }
+        return {
+            "timestamp_ms": sampling.capture_timestamp_ms(),
+            "tiers": tiers,
+            "rate_bps": rate_bps,
+            "snapshot_max_bytes": snapshot_max_bytes,
+            "video": video,
+        }
+
+    async def run(self) -> StopReason:
+        """Connect, and keep reconnecting, until stopped or refused for good."""
+        while not self._stop.is_set():
+            reason = await self._one_session()
+            if reason is not None:
+                return reason
+            if self._stop.is_set():
+                break
+            delay = self._backoff.next_delay()
+            log.info("Reconnecting in %.0f s", delay)
+            if await self._sleep_or_stop(delay):
+                break
+        return StopReason.SHUTDOWN
+
+    async def _one_session(self) -> Optional[StopReason]:
+        """One connection attempt. `None` means: worth trying again."""
+        url = self._config.cloud_url
+        try:
+            ws = await self._open(url)
+        except asyncio.TimeoutError:
+            log.warning(
+                "Could not open a connection to %s within %.0f s",
+                url,
+                self._handshake_timeout,
+            )
+            return None
+        except aiohttp.InvalidURL:
+            # Before the branch below, and not interchangeable with it:
+            # `InvalidURL` is an `aiohttp.ClientError` too, so the order is
+            # what keeps a URL nobody can fix from being retried forever.
+            log.error(
+                "FLEETLESS_CLOUD_URL is not a usable WebSocket URL: %s "
+                "(expected something like ws://host:port/bridge)",
+                url,
+            )
+            return StopReason.REJECTED
+        except (OSError, aiohttp.ClientError) as exc:
+            # Everything else that can stop a connection from opening: the
+            # host refusing it (`ClientConnectorError`, an `OSError`), DNS,
+            # or a cloud that answers the upgrade with an HTTP response
+            # (`WSServerHandshakeError`, a `ClientError`). All of them are
+            # worth another attempt after a backoff.
+            log.warning("Cannot reach %s: %s", url, exc)
+            return None
+
+        if ws is _STOPPED:
+            return StopReason.SHUTDOWN
+
+        log.info("Connected to %s", url)
+        try:
+            return await self._converse(ws)
+        finally:
+            await self._close(ws)
+
+    def _build_writer(self, ws) -> PrioritizedWriter:
+        """The session's one writer, with every source it will ever have.
+
+        `sources` is fixed for a writer's life, so this builds the whole
+        set up front and lets `_GatedSource` decide when each may answer —
+        see its docstring for why the gate could not simply stay "start the
+        pump at `hello_ok`" the way it used to be.
+
+        Tier order is carried by the `_TIER_*` constants, not by the order
+        of this list; the one thing the list order decides is which of the
+        two tier-2 sources is asked first, which `_CameraStateSource`
+        explains.
+
+        Does **not** baseline `self._ros.samples`/`self._ros.camera_states`
+        here, despite both needing a per-session reset (see `_converse`'s
+        `finally` for where that happens and why): whatever is already
+        queued at the moment this runs belongs to the session about to
+        start, not to the one before it, and resetting the gauge here
+        would discard that depth along with any stale one —
+        `test_a_camera_state_queue_depth_shows_up_in_pressure_stats`
+        queues four camera states and builds a writer around them with no
+        session in between, and expects that depth to count."""
+        sources = []
+        snapshot_source = None
+        reporting_sources = []
+        if self._ros is not None:
+
+            def is_open() -> bool:
+                return self._session_open
+
+            camera_states = _CameraStateSource(self._ros, _TIER_TELEMETRY)
+            samples = _SampleSource(self._ros, _TIER_TELEMETRY)
+            reporting_sources = [camera_states, samples]
+            sources = [
+                (_TIER_OUTCOME, _GatedSource(is_open, _JobSource(self._ros))),
+                (_TIER_TELEMETRY, _GatedSource(is_open, camera_states)),
+                (_TIER_TELEMETRY, _GatedSource(is_open, samples)),
+                (_TIER_TOOLING, _GatedSource(is_open, _AssetSource(self._ros))),
+                (_TIER_BACKFILL, _GatedSource(is_open, _BackfillSource(self._ros))),
+            ]
+            snapshot_source = _SnapshotSource(is_open, self._ros)
+        writer = PrioritizedWriter(
+            ws,
+            sources=sources,
+            snapshot_source=snapshot_source,
+            max_occupancy_s=self._max_send_occupancy_s,
+        )
+        for source in reporting_sources:
+            # The back-references, closed here because they cannot be
+            # closed at construction: these two sources report their own
+            # queues' drops and depths into the writer's counters, and the
+            # writer does not exist until the line above. Kept to the two
+            # tier-2 sources rather than handed to all of them — no other
+            # tier is fed by a queue the writer cannot see for itself.
+            source.writer = writer
+        self._last_writer = writer
+        return writer
+
+    async def _converse(self, ws) -> Optional[StopReason]:
+        """Say hello and serve the connection until it ends.
+
+        Nothing in here calls `ws.send()`. Every frame this session emits
+        is handed to the one `PrioritizedWriter` below, which is the only
+        caller of `ws.send()` for the connection's whole life
+        — the receive loop keeps parsing, it just stops sending. That is
+        what makes tier order mean anything: one frame never interleaves
+        with another, but that says nothing about *order*, and a snapshot
+        ahead of a `pong` in send order is what starved a real robot's
+        control channel.
+
+        A send failure therefore no longer surfaces at each call site; it
+        ends the writer, which ends the socket, which `recv()` below sees
+        as the end of the session — the outcome every one of those call
+        sites already produced."""
+        greeted = False
+        # reset once per session, same as `greeted` — see
+        # `_handle_config`'s use of it and `self._first_config_since_hello`'s
+        # own docstring in `__init__`.
+        self._first_config_since_hello = True
+        # Closed until `hello_ok`; see `_GatedSource`.
+        self._session_open = False
+        # The handshake gets one deadline for the whole of it, not one per
+        # frame, so a cloud that keeps sending other traffic without ever
+        # answering the hello still times out.
+        deadline = time.monotonic() + self._handshake_timeout
+        writer = self._build_writer(ws)
+        writer_task = asyncio.ensure_future(writer.run())
+        self._attach_wake(writer)
+        # Started before the loop rather than at `hello_ok`, so a cloud that
+        # sends a config ahead of the greeting is served in the same order
+        # it always was — its sources wait for `hello_ok` because they need
+        # a connected ROS runtime; this one does not.
+        control_queue: "asyncio.Queue" = asyncio.Queue()
+        control_task = asyncio.ensure_future(
+            self._pump_control(ws, control_queue, writer)
+        )
+        # Unlike `writer_task`/`control_task`, started at `hello_ok` below,
+        # not here: the pumps this design's writer replaced were started at
+        # `hello_ok` (see `_GatedSource`'s own docstring), and the pressure
+        # pump has no `_GatedSource` wrapper to give it that gate any other
+        # way — being started late *is* its gate, so it cannot leave a
+        # frame before the cloud has said which robot this is. `None` until
+        # then, and cancelled unconditionally in `finally` below regardless
+        # of whether it ever started.
+        pressure_task: Optional["asyncio.Task"] = None
+        writer.enqueue(
+            _TIER_SESSION,
+            hello_message(self._config.token, self._bridge_version, self._active_jobs()),
+        )
+
+        try:
+            while True:
+                timeout = (
+                    self._idle_timeout
+                    if greeted
+                    else max(0.0, deadline - time.monotonic())
+                )
+                try:
+                    frame = await self._recv(ws, timeout)
+                except ConnectionClosed:
+                    # `ws.close_code` rather than anything on the exception:
+                    # the socket is what carries the peer's code, and
+                    # `_Socket` deliberately keeps only one copy of it.
+                    #
+                    # This branch has to come first and that is not stylistic:
+                    # `ConnectionClosed` is an `aiohttp.ClientConnectionError`
+                    # and so is caught by the one below as well. Reversed,
+                    # every close code — supersede and robot-deleted
+                    # included — would be read as "retry", and the two bridges
+                    # would trade the robot back and forth forever.
+                    return self._reason_for_close(ws.close_code)
+                except (OSError, aiohttp.ClientError) as exc:
+                    # The socket did not close, it broke: a frame over
+                    # `MAX_INCOMING_FRAME_BYTES`, a protocol error, a write
+                    # that failed. Nothing here says the cloud refused us, so
+                    # the session ends and the next one is tried.
+                    log.warning("The connection failed: %s", exc)
+                    return None
+
+                if frame is _STOPPED:
+                    return StopReason.SHUTDOWN
+                if frame is _TIMED_OUT:
+                    if greeted:
+                        log.warning(
+                            "Nothing received for %.0f s — treating the connection "
+                            "as dead",
+                            timeout,
+                        )
+                    else:
+                        log.warning(
+                            "The cloud did not answer the hello within %.0f s",
+                            self._handshake_timeout,
+                        )
+                    return None
+
+                message = parse_cloud_message(frame)
+                if isinstance(message, HelloOk):
+                    greeted = True
+                    self.robot_id = message.robot_id
+                    # Only a handshake that actually succeeded proves the cloud is
+                    # healthy, so only that resets the backoff.
+                    self._backoff.reset()
+                    log.info("Connected as robot %s", message.robot_id)
+                    if self._ros is not None:
+                        self._log_dropped_samples()
+                        self._ros.set_connected(True)
+                    # Opened after `set_connected(True)`, not before: a
+                    # source must never be able to answer with something
+                    # the runtime still believes nobody is connected for.
+                    self._session_open = True
+                    writer.wake()
+                    # Guarded: a second `hello_ok` in the same session (the
+                    # cloud is not supposed to send one, but nothing here
+                    # gets to assume a well-behaved peer) would otherwise
+                    # overwrite `pressure_task` with a fresh one, leaking
+                    # the first — never cancelled, its `while True` loop
+                    # keeps calling `writer.enqueue()` for the rest of the
+                    # process, growing a deque the writer has stopped
+                    # draining (see `test_a_duplicate_hello_ok_still_runs_
+                    # only_one_pump`).
+                    if pressure_task is None:
+                        pressure_task = asyncio.ensure_future(self._pump_pressure(writer))
+                elif isinstance(message, HelloError):
+                    if message.terminal:
+                        log.error(
+                            "The cloud rejected this bridge (%s): %s. This will not "
+                            "change on its own — fix the configuration and start "
+                            "the bridge again.",
+                            message.code,
+                            message.message,
+                        )
+                        return StopReason.REJECTED
+                    log.warning(
+                        "The cloud refused the hello for now (%s): %s",
+                        message.code,
+                        message.message,
+                    )
+                    return None
+                elif isinstance(message, Ping):
+                    # Tier 0, and the reason the tier exists: the cloud
+                    # closes the socket after three unanswered pings, so
+                    # this must overtake whatever bulk is queued rather
+                    # than wait its turn behind it.
+                    writer.enqueue(_TIER_SESSION, pong_message(message.ts_ms))
+                elif isinstance(message, (Config, IntrospectRequest, TypeRequest)):
+                    # Queued, never awaited here: see `_pump_control`.
+                    control_queue.put_nowait(message)
+                elif isinstance(message, CloudInvoke):
+                    self._dispatch_invoke(message)
+                elif isinstance(message, CloudCancel):
+                    self._dispatch_cancel(message)
+                elif isinstance(message, CloudPublish):
+                    self._dispatch_publish(message)
+                elif isinstance(message, CloudCameraStart):
+                    self._dispatch_camera_start(message)
+                elif isinstance(message, CloudCameraStop):
+                    self._dispatch_camera_stop(message)
+                elif isinstance(message, CloudAssetRequest):
+                    self._dispatch_asset_request(message)
+                else:
+                    log.debug("Ignoring a frame from the cloud: %s", message.reason)
+        finally:
+            # Unconditional and first: however this session ends — a clean
+            # close, a timeout, an exception — the very next sample must
+            # stop being "live" the instant nothing is here to receive it,
+            # not once the pump tasks below have finished unwinding.
+            if self._ros is not None:
+                self._ros.set_connected(False)
+                # A dropped connection must not leave the robot publishing
+                # into a room nobody can tell it to stop —
+                # torn down here, in the same breath as set_connected(False),
+                # not left for whoever reconnects to notice and clean up.
+                await self._ros.stop_all_live()
+                # Tier 2's `high_water` baseline is per-session, not merely
+                # documented as such — reset *here*, at this session's
+                # end, not in the next one's `_build_writer`: both queues
+                # outlive every session (they belong to `RosRuntime`, not
+                # to this writer), so without a reset their `high_water()`
+                # would keep reading back this session's own peak into the
+                # next one's counters. Resetting at construction instead
+                # was tried and reverted — it also discarded whatever was
+                # already queued *before* a writer's first build, which
+                # `test_a_camera_state_queue_depth_shows_up_in_pressure_
+                # stats` — which predates this reset — legitimately
+                # expects to count. Ending each session by zeroing what it leaves
+                # behind gets the same "a new session starts from zero"
+                # guarantee without that cost.
+                self._ros.samples.drain_high_water()
+                self._ros.camera_states.drain_high_water()
+            # Before the writer is cancelled, so nothing can be answered
+            # onto a socket this session has already given up on.
+            self._session_open = False
+            self._detach_wake()
+            await self._cancel_pump(pressure_task, "pressure")
+            await self._cancel_pump(control_task, "control")
+            await self._cancel_pump(writer_task, "writer")
+
+    async def _pump_pressure(self, writer: PrioritizedWriter) -> None:
+        """Every `PRESSURE_INTERVAL_S` while this session is open: one
+        `bridge_pressure` datapoint, tier 2 — the same tier every other
+        piece of telemetry rides. Started by `_converse` at `hello_ok` and
+        cancelled, unconditionally, in
+        its `finally` — see the `pressure_task` comment there for why that
+        is this pump's whole gate, with no `_GatedSource` wrapper needed.
+
+        `writer` is the closure over this specific session's
+        `PrioritizedWriter`, not `self._last_writer` — the latter is
+        reassigned by `_build_writer` the moment the *next* session
+        starts, and a pump that read it instead would go on enqueuing
+        onto a writer whose session already ended, or — worse — onto the
+        next one's, defeating the very gate this method exists to
+        respect.
+
+        Paced by `self._pressure_sleep`, not `self._sleep` — see the
+        constructor's own comment on why the two must not be the same
+        injectable.
+
+        Sleeps *before* the first send, not after: tier 2 outranks tier 3
+        (`_next_ready`'s push-wins-ties rule), so a frame enqueued the
+        instant `hello_ok` lands would race ahead of whatever the session's
+        own first response is — `config_applied`, `assets_available`, the
+        first `camera_state` — and every test built around "the next frame
+        is X" has no reason to expect a pressure reading to have cut in
+        line ahead of it. Waiting out one interval first costs nothing real
+        (the session already reports zeros until something has happened
+        anyway) and means a fast-finishing exchange — every one of them,
+        at the default real `PRESSURE_INTERVAL_S` — never sees a pressure
+        frame with `self._pressure_sleep` left at its default."""
+        while True:
+            await self._pressure_sleep(PRESSURE_INTERVAL_S)
+            writer.enqueue(
+                _TIER_TELEMETRY,
+                datapoint_message(
+                    PRESSURE_SLUG,
+                    pressure_wire_value(self.pressure_stats()),
+                    sampling.capture_timestamp_ms(),
+                ),
+            )
+
+    async def _cancel_pump(self, task: Optional["asyncio.Task"], label: str) -> None:
+        """Ends one of the session's pumps and reports how it ended.
+
+        `CancelledError` stays silent: that is this method's own cancel
+        arriving, the ordinary way every session ends. Any other exception
+        is the pump having *died on its own* some time earlier, and the
+        await here is the first and only place that ever surfaces it — a
+        pump that raised is simply gone, and the session goes on without
+        it. For the pressure pump that is exactly the state the console
+        reads as "no pressure feed", i.e. as a bridge too old to have the
+        feature; on this robot's own logs it was a `debug` line nobody has
+        their level set low enough to see. Warning, with the label, so a
+        dead pump can be told from a missing feature by reading the log
+        the operator already has."""
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 - the session is ending anyway
+            log.warning(
+                "The %s pump died with an error; this session ran without it",
+                label,
+                exc_info=True,
+            )
+
+    def _active_jobs(self) -> List[Tuple[str, str, str]]:
+        if self._ros is None:
+            return []
+        return self._ros.jobs.active_jobs()
+
+    def _dispatch_invoke(self, message: CloudInvoke) -> None:
+        """Kicks the job off and returns immediately — completion arrives
+        later as a `job_update` frame via the writer's `_JobSource`, not as
+        a reply to this frame. Without a ROS runtime (tests, or a misconfigured launch)
+        there is nothing to run and nothing to report; the cloud's own
+        offline/timeout handling is what notices, same as it would for any
+        other silence from this robot."""
+        if self._ros is not None:
+            asyncio.ensure_future(
+                self._ros.invoke(
+                    message.job_id, message.slug, message.params, message.patience_ms
+                )
+            )
+
+    def _dispatch_cancel(self, message: CloudCancel) -> None:
+        if self._ros is not None:
+            asyncio.ensure_future(self._ros.cancel_job(message.slug, message.job_id))
+
+    def _dispatch_publish(self, message: CloudPublish) -> None:
+        """No reply is expected on the wire (a publish has no id,
+        no job) — this is fire-and-forget the same way `_dispatch_invoke`
+        kicks a job off, just with nothing to report back later either."""
+        if self._ros is not None:
+            asyncio.ensure_future(self._ros.publish(message.slug, message.message))
+
+    def _dispatch_camera_start(self, message: CloudCameraStart) -> None:
+        """Fire-and-forget, same shape as every other dispatch here — what
+        `start_live` made of it (publishing or a reported failure) arrives
+        later as a `bridgeCameraState` frame via the writer's
+        `_CameraStateSource`, not as a reply to this frame."""
+        if self._ros is not None:
+            asyncio.ensure_future(
+                self._ros.start_live(
+                    message.slug, message.url, message.room, message.token, message.request_id
+                )
+            )
+
+    def _dispatch_camera_stop(self, message: CloudCameraStop) -> None:
+        if self._ros is not None:
+            asyncio.ensure_future(
+                self._ros.stop_live(message.slug, request_id=message.request_id)
+            )
+
+    def _dispatch_asset_request(self, message: CloudAssetRequest) -> None:
+        """Fire-and-forget, same shape as every other dispatch here: what
+        `sync_assets` makes of it arrives later as a stream of
+        `bridgeAssetProgress` frames via the writer's `_AssetSource`, not
+        as a reply to this frame."""
+        if self._ros is not None:
+            asyncio.ensure_future(
+                self._ros.sync_assets(
+                    message.sync_id, message.upload_url, message.token, message.meshes
+                )
+            )
+
+    def _log_dropped_samples(self) -> None:
+        """Once per reconnect, not once per drop: this only has to be
+        honest that samples were lost while disconnected."""
+        dropped = self._ros.samples.drain_drop_count()
+        if dropped:
+            log.warning(
+                "%d datapoint sample(s) were dropped while disconnected "
+                "(sample queue overflow)",
+                dropped,
+            )
+
+    def _attach_wake(self, writer: PrioritizedWriter) -> None:
+        """Points the ROS-side queues' `on_put` hooks at this session's
+        writer, so a sample, job update or camera state that arrives while
+        the writer is idle is scanned for immediately instead of waiting
+        out its idle tick.
+
+        A callback rather than an import: ros_runtime.py and jobs.py know
+        nothing about `PrioritizedWriter`, which is what keeps the ROS side
+        testable without one (their own docstrings say so).
+
+        The two asset queues are plain `asyncio.Queue`s with no such hook,
+        so an asset frame waits at most one writer tick (0.25 s) to *start*
+        — after which the writer drains the rest without ticking at all,
+        since a scan that finds work never waits. On-demand, developer-
+        initiated frames on a robot's uplink: worth a quarter second, not
+        worth a third queue class."""
+        if self._ros is None:
+            return
+        self._ros.samples.on_put = writer.wake
+        self._ros.jobs.updates.on_put = writer.wake
+        self._ros.camera_states.on_put = writer.wake
+
+    def _detach_wake(self) -> None:
+        """Unhooks them again when the session ends. Waking a writer that
+        has stopped would be harmless (it only sets an `Event` nobody
+        waits on), but a `RosRuntime` outlives many sessions and must not
+        accumulate references to the writers of dead ones."""
+        if self._ros is None:
+            return
+        self._ros.samples.on_put = None
+        self._ros.jobs.updates.on_put = None
+        self._ros.camera_states.on_put = None
+
+    async def _pump_control(
+        self, ws, queue: "asyncio.Queue", writer: PrioritizedWriter
+    ) -> None:
+        """Applies configs and answers introspection out of the receive
+        loop's way.
+
+        These three frames are the only ones whose work the bridge has to
+        finish before it can answer them, and all three used to be awaited
+        inline in `_converse`'s loop. An apply that takes longer than the
+        cloud's pong deadline therefore cost the whole session: the `ping`
+        waiting behind it was never read, so no `pong` was sent and the
+        cloud closed the socket. Since the cloud re-sends the config on
+        every connect, the next session died the same way — a loop a robot
+        could not leave with one camera configured on a topic carrying
+        9.44 MB frames at 2 Hz.
+
+        One worker draining one FIFO queue, rather than an `ensure_future`
+        per frame like the fire-and-forget dispatches above: these three
+        carry a reply and a version, and applying config 2 before config 1
+        would leave the robot in whichever state won the race.
+
+        Nothing bounds the queue. A bound would have to choose between
+        dropping a config — leaving the robot running a stale one, with the
+        cloud told otherwise — and blocking the receive loop, which is the
+        defect this exists to fix. The cloud sends one config per connect
+        and one per change, so depth is a symptom of an apply that never
+        finishes, not of ordinary traffic.
+
+        Nothing here sends: the three replies are handed to the session's
+        `PrioritizedWriter` (`config_applied` at tier 1, `introspect` and
+        `type_definitions` at tier 3), which is the only caller of
+        `ws.send()`. That changes where a *delivery* failure appears, not
+        what it costs: it used to end this worker and nothing else, leaving
+        `_converse`'s own `recv` to turn a gone socket into the end of the
+        session; now it ends the writer, which closes the socket, which
+        that same `recv` turns into the end of the session. The `ws`
+        handle stays because the unexpected-error path below still needs
+        it — see the next paragraph, which is the 2.0.1 fix itself.
+
+        One behaviour genuinely changes: a session can now end while an
+        apply is still running, which was impossible when the receive loop
+        was the thing blocked on it. That costs the `config_applied` ack and
+        nothing else. The apply itself is already on the executor thread by
+        then (`RosRuntime._submit_async`), so cancelling the coroutine
+        waiting on it does not abandon it half-done, and the cloud re-sends
+        the config on the next connect regardless."""
+        while True:
+            message = await queue.get()
+            try:
+                if isinstance(message, Config):
+                    await self._handle_config(writer, message)
+                elif isinstance(message, IntrospectRequest):
+                    await self._handle_introspect_request(writer, message)
+                elif isinstance(message, TypeRequest):
+                    await self._handle_type_request(writer, message)
+                else:
+                    # Unreachable: `_converse` queues exactly the three
+                    # types above. Named rather than folded into the last
+                    # branch so that adding a fourth to the queue without
+                    # adding it here is a log line, not a frame silently
+                    # answered as if it were a type request.
+                    log.error(
+                        "The control queue was handed a %s, which it cannot "
+                        "answer", type(message).__name__,
+                    )
+            except Exception:  # noqa: BLE001
+                # Inline, an unexpected error here ended the session by
+                # propagating out of the receive loop. Off it, the same
+                # error would only end this worker and leave a connected
+                # bridge that silently stops applying configs — strictly
+                # worse. Close the socket and let `_converse` see it.
+                log.exception(
+                    "Unexpected error handling a %s frame", type(message).__name__
+                )
+                await self._close(ws)
+                return
+
+    async def _handle_config(self, writer: PrioritizedWriter, message: Config) -> None:
+        """Applies a published config and acks it. Tier 1: the ack belongs
+        with job outcomes, above telemetry — a cloud that has not been told
+        the config landed keeps re-sending it, which is a session-level
+        cost, not a telemetry one."""
+        errors: List[ApplyError] = []
+        if self._ros is not None:
+            errors.extend(await self._apply_or_report(
+                APPLY_ERROR_KIND_DATAPOINT, message.version,
+                lambda: self._ros.apply_config(message.datapoints),
+            ))
+            # The three kinds that build a ROS message from a template also
+            # need `doc.messages` — the shared templates a `message: ${name}`
+            # refers to. Datapoints and cameras build nothing and take none.
+            errors.extend(await self._apply_or_report(
+                APPLY_ERROR_KIND_ACTION, message.version,
+                lambda: self._ros.apply_actions(message.actions, message.messages),
+            ))
+            errors.extend(await self._apply_or_report(
+                APPLY_ERROR_KIND_SERVICE, message.version,
+                lambda: self._ros.apply_services(message.services, message.messages),
+            ))
+            errors.extend(await self._apply_or_report(
+                APPLY_ERROR_KIND_PUBLISHER, message.version,
+                lambda: self._ros.apply_publishers(message.publishers, message.messages),
+            ))
+            errors.extend(await self._apply_or_report(
+                APPLY_ERROR_KIND_CAMERA, message.version,
+                lambda: self._ros.apply_cameras(message.cameras),
+            ))
+            for error in errors:
+                log.warning(
+                    "Config version %d: kind %s slug %r: %s",
+                    message.version, error.kind, error.slug, error.message,
+                )
+            if self._first_config_since_hello:
+                # exactly once per connection, on the first config this
+                # session applies — not on every later one, which would
+                # defeat the transition-only dedup that already handles the
+                # steady state correctly. See RosRuntime.
+                # report_current_camera_health's own docstring for the
+                # defect this closes (a cloud restart erases its own health
+                # store; this hands it back).
+                self._first_config_since_hello = False
+                try:
+                    await self._ros.report_current_camera_health()
+                except Exception:  # noqa: BLE001 - additive; must not cost the session
+                    log.exception("Unexpected error reporting current camera health")
+                # settle the active truth first — a robot with no
+                # `/robot_description` publisher at all must not wait out
+                # the periodic timer to be told `false` — before the
+                # cache-replay below, so a genuine true→false transition
+                # this check makes is what the replay then (correctly)
+                # finds nothing left to restate for.
+                try:
+                    await self._ros.check_urdf_availability_now()
+                except Exception:  # noqa: BLE001 - additive; must not cost the session
+                    log.exception("Unexpected error checking current URDF availability")
+                # Same call site, same reasoning: a reconnect with
+                # no ROS-side URDF change must still tell a cloud that may
+                # not remember what a previous session already reported.
+                try:
+                    await self._ros.report_current_urdf_availability()
+                except Exception:  # noqa: BLE001 - additive; must not cost the session
+                    log.exception("Unexpected error reporting current URDF availability")
+        writer.enqueue(
+            _TIER_OUTCOME, config_applied_message(message.version, not errors, errors)
+        )
+
+    async def _apply_or_report(self, kind: str, version: int, apply) -> List[ApplyError]:
+        """Runs one `apply_*` call, turning an unexpected exception into a
+        whole-kind `config_applied` error instead of crashing the session —
+        one kind's bug must not cost the others their result, same principle
+        as a single bad slug not blocking the rest within one kind.
+
+        `kind` is one of the `APPLY_ERROR_KIND_*` constants — the actual
+        exposure kind, not the human log label ("the configuration", "the
+        actions", ...) this used to take, which was never the kind (`"the
+        configuration"` was the datapoint pass)."""
+        try:
+            return await apply()
+        except Exception:  # noqa: BLE001 - report as a whole-kind failure, don't crash the session
+            log.exception("Unexpected error applying %s for config version %d", kind, version)
+            return [ApplyError(
+                slug="*", kind=kind, code=APPLY_ERROR_CODE_WHOLE_KIND_FAILED,
+                message="internal error applying {}".format(kind),
+            )]
+
+    async def _handle_introspect_request(
+        self, writer: PrioritizedWriter, message: IntrospectRequest
+    ) -> None:
+        """Tier 3, developer tooling: answered promptly on a healthy link
+        and behind live telemetry on a weak one. A `type_definitions`
+        answer can be hundreds of kilobytes — the design's own example of a
+        must-deliver frame that projects past the occupancy budget and is
+        sent anyway, because refusing it would break introspection on
+        exactly the links this ordering exists for."""
+        if self._ros is not None:
+            graph = await self._ros.graph_snapshot()
+        else:
+            graph = {"topics": [], "services": [], "actions": [], "captured_at_ms": 0}
+        writer.enqueue(_TIER_TOOLING, introspect_message(message.request_id, graph))
+
+    async def _handle_type_request(
+        self, writer: PrioritizedWriter, message: TypeRequest
+    ) -> None:
+        if self._ros is not None:
+            definitions, unresolved = await self._ros.resolve_types(message.type_names)
+        else:
+            definitions, unresolved = [], list(message.type_names)
+        writer.enqueue(
+            _TIER_TOOLING,
+            type_definitions_message(message.request_id, definitions, unresolved),
+        )
+
+    def _reason_for_close(self, code: Optional[int]) -> Optional[StopReason]:
+        if code == CLOSE_CODE_SUPERSEDED:
+            log.error(
+                "Another bridge took over this robot. Stopping, so the two do "
+                "not keep kicking each other off."
+            )
+            return StopReason.REJECTED
+        if code == CLOSE_CODE_ROBOT_DELETED:
+            log.error(
+                "This robot was deleted from the Fleetless console. Stopping "
+                "— it will not reconnect."
+            )
+            return StopReason.REJECTED
+        log.info("The cloud closed the connection (code %s)", code)
+        return None
+
+    async def _open(self, url: str):
+        """Open a connection, but stay interruptible by `stop()`.
+
+        An unreachable cloud can hold a connect attempt for the whole handshake
+        timeout. Without this race, a shutdown would have to wait that out —
+        long enough for `docker stop` to give up and SIGKILL the container
+        instead of letting it close its socket.
+        """
+        connector = asyncio.ensure_future(self._connect(url))
+        stopper = asyncio.ensure_future(self._stop.wait())
+        done, _ = await asyncio.wait(
+            {connector, stopper},
+            timeout=self._handshake_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stopper in done:
+            await self._discard(connector)
+            return _STOPPED
+        await _cancel(stopper)
+        if connector in done:
+            return connector.result()
+        await _cancel(connector)
+        raise asyncio.TimeoutError
+
+    async def _discard(self, connector: "asyncio.Future") -> None:
+        """Give up on a connection attempt, closing it if it already succeeded."""
+        connector.cancel()
+        try:
+            ws = await connector
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - we are abandoning this attempt anyway
+            return
+        await self._close(ws)
+
+    async def _recv(self, ws, timeout: float):
+        """Receive one frame, but stay interruptible by `stop()`."""
+        receiver = asyncio.ensure_future(ws.recv())
+        stopper = asyncio.ensure_future(self._stop.wait())
+        done, _ = await asyncio.wait(
+            {receiver, stopper},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stopper in done:
+            await _cancel(receiver)
+            return _STOPPED
+        await _cancel(stopper)
+        if receiver in done:
+            return receiver.result()
+        await _cancel(receiver)
+        return _TIMED_OUT
+
+    async def _sleep_or_stop(self, delay: float) -> bool:
+        """Wait out the backoff. Returns True if we were told to stop instead."""
+        sleeper = asyncio.ensure_future(self._sleep(delay))
+        stopper = asyncio.ensure_future(self._stop.wait())
+        done, _ = await asyncio.wait(
+            {sleeper, stopper}, return_when=asyncio.FIRST_COMPLETED
+        )
+        stopped = stopper in done
+        await _cancel(sleeper)
+        await _cancel(stopper)
+        return stopped
+
+    async def _close(self, ws) -> None:
+        try:
+            await asyncio.wait_for(ws.close(), timeout=CLOSE_TIMEOUT_S)
+        except (asyncio.TimeoutError, OSError, aiohttp.ClientError):
+            log.debug("Closing the connection did not finish cleanly", exc_info=True)
+
+
+async def _cancel(task: "asyncio.Future") -> None:
+    """Cancel a helper task and absorb whatever it was about to raise."""
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 - the result is deliberately discarded
+        pass

@@ -1,0 +1,55 @@
+# The suites apt.fleetless.dev serves: one per ROS 2 distribution this package
+# is built for, named after that distribution.
+#
+# **The suite name is the guarantee.** A robot's sources.list line names one
+# suite, and each suite carries only its own distribution's package, so a Humble
+# robot never sees `ros-jazzy-fleetless-bridge` at all -- apt answers `Unable to
+# locate package` rather than offering it. That is not a convention somebody
+# remembers at publish time: `apt/publish-deb.sh` derives the suite from the
+# .deb's own `Package:` field and refuses a mismatch, and
+# `apt/verify-suites.sh` builds a throwaway repository from this exact file and
+# proves the refusal by running `apt-get install` for the other two packages in
+# each distribution's own container.
+#
+# **These stanzas must be exactly the distributions in `tools/distros.sh`** --
+# no more, no fewer. `test/test_apt_suites.py` asserts that against the table,
+# because a suite here with no table entry can never be built for, and a table
+# entry with no suite here builds a .deb that has nowhere to go. Adding a
+# distribution is: one entry in `tools/distros.sh`, one stanza here, one row in
+# `README.md`'s support table.
+#
+# `Architectures: amd64 arm64` with an `Architecture: all` package is
+# deliberate: reprepro files an arch-all .deb into every architecture listed
+# here, so one build serves both. Dropping an architecture from a stanza does
+# not fail a publish -- it silently stops serving that architecture from that
+# suite, which is why the three stanzas are asserted identical apart from the
+# codename and the description.
+#
+# `SignWith:` names the key by FINGERPRINT and not by uid. A uid-shaped lookup
+# can match more than one key -- a retired key left in the same keyring carries
+# a byte-identical uid -- and then signing picks one for you, silently and
+# successfully. Forty hex digits cannot do that.
+
+Origin: Fleetless
+Label: Fleetless
+Codename: humble
+Architectures: amd64 arm64
+Components: main
+Description: Fleetless bridge apt repository (ROS 2 Humble, Ubuntu 22.04 jammy)
+SignWith: 32F15BD259A7D8305B76FCA72AFF9E943B12B7DB
+
+Origin: Fleetless
+Label: Fleetless
+Codename: jazzy
+Architectures: amd64 arm64
+Components: main
+Description: Fleetless bridge apt repository (ROS 2 Jazzy, Ubuntu 24.04 noble)
+SignWith: 32F15BD259A7D8305B76FCA72AFF9E943B12B7DB
+
+Origin: Fleetless
+Label: Fleetless
+Codename: lyrical
+Architectures: amd64 arm64
+Components: main
+Description: Fleetless bridge apt repository (ROS 2 Lyrical, Ubuntu 26.04 resolute)
+SignWith: 32F15BD259A7D8305B76FCA72AFF9E943B12B7DB

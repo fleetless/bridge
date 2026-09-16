@@ -1,0 +1,97 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fleetless_bridge</name>
+  <version>3.1.0</version>
+  <description>Fleetless Bridge: connects a ROS2 robot to the Fleetless cloud.</description>
+  <maintainer email="andre@dehne-robotik.de">Andre Dehne</maintainer>
+  <license>Apache-2.0</license>
+  <!-- The manifest is what a ROS user reads on the robot itself
+       (`ros2 pkg xml fleetless_bridge`, or
+       /opt/ros/$ROS_DISTRO/share/fleetless_bridge/package.xml from an
+       installed .deb — this one manifest ships in every distribution's
+       package, so it names no distribution of its own). Without these it
+       names no source, no website and nowhere to report a bug, so somebody
+       holding the installed package has no way from the robot to reach the
+       source the licence entitles them to.
+       `<maintainer>` stays a named person: Debian and REP-140 both want a
+       human to address, and `debian/control` and every changelog entry
+       name the same one. `<author>` is where the copyright holder goes. -->
+  <url type="repository">https://github.com/fleetless/bridge</url>
+  <url type="bugtracker">https://github.com/fleetless/bridge/issues</url>
+  <url type="website">https://docs.fleetless.dev</url>
+  <author email="hello@fleetless.dev">Dehne Robotik GmbH</author>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rosidl_runtime_py</exec_depend>
+  <!-- cv2/cv_bridge (cameras: the format) — snapshot/live frame encoding,
+       and fake_robot.py's own webcam capture. Apt-resolvable; see
+       Dockerfile.dev for why this must stay apt's build of OpenCV, not
+       pip's opencv-python (ABI). -->
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <!-- Parses `/robot_description`: ROS graph input, not
+       necessarily first-party, so stdlib xml.etree's XXE/billion-laughs
+       surface is not acceptable here. Apt-resolvable. -->
+  <exec_depend>python3-defusedxml</exec_depend>
+  <!-- numpy: cv2 and aiortc's own frame handling both use it, and the
+       bridge imports it directly. -->
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- sensor_msgs: ros_runtime.py and camera.py both
+       import CompressedImage/Image at module load. Declared test_depend
+       only until now — worked by accident of the distribution's own
+       cv_bridge package pulling it in transitively, exactly the class of
+       gap an explicit dependency list exists to close. See rosdep/README.md. -->
+  <exec_depend>sensor_msgs</exec_depend>
+  <!-- aiohttp: the WebSocket the whole conversation with the cloud runs
+       over (client.py). A public rosdep key resolves it to an apt package on
+       every distribution this is built for, so it is declared here like any
+       other dependency and needs nothing from this package's own rosdep
+       source. -->
+  <exec_depend>python3-aiohttp</exec_depend>
+  <!-- aiortc: the WebRTC stack the cameras publish live video with
+       (live.py). A public rosdep key resolves it to an apt package on every
+       distribution this is built for.
+
+       **live.py also imports `av` directly**, and `python3-av` has no rosdep
+       key in the public database yet, so it cannot be named here. It is not
+       an undeclared dependency in practice: `python3-aiortc`'s own apt
+       `Depends:` installs it, so the import is satisfied wherever the line
+       above is. It is still a gap between what the manifest says and what the
+       process imports, written down here rather than left to be discovered:
+       the key is filed with the public database as part of the release work,
+       and this comment goes when the line `<exec_depend>python3-av</exec_depend>`
+       arrives. -->
+  <exec_depend>python3-aiortc</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <!-- jsonschema is a TEST dependency and has never been anything else: no
+       module the process loads imports it, only the two test files that check
+       messages against the vendored contract schemas. Declared as an
+       `exec_depend` until now, which put a package on every robot to satisfy
+       an import that never happens. `python3-jsonschema` IS a public rosdep
+       key resolving to apt on every distribution this bridge is built for
+       (no repo-local rosdep source needed, unlike `python3-av` above); it
+       just carries no `Draft202012Validator` on Humble's apt version
+       (3.2.0 — Jazzy's 4.10.3 and Lyrical's 4.19.2 both have it), which
+       `test/schemas.py` falls back from, to `Draft7Validator`, and a
+       computed test there guards that the fallback stays correct for every
+       vendored schema. -->
+  <test_depend>python3-jsonschema</test_depend>
+  <!-- test/test_ci_workflows.py reads .github/workflows/*.yml to hold the
+       test matrix against tools/distros.sh and to check every run block with
+       `bash -n`. Every ROS image happens to carry PyYAML for ros2cli; this
+       package says out loud that its suite needs it. -->
+  <test_depend>python3-yaml</test_depend>
+  <!-- Fibonacci, the action the introspection and RosRuntime suites
+       exercise a real ActionServer with, comes from example_interfaces.
+       It used to come from action_tutorials_interfaces, which does NOT
+       exist on Lyrical: upstream dropped that package there, and
+       ros-lyrical-action-tutorials-py now depends on example_interfaces
+       instead. example_interfaces ships Fibonacci.action on humble,
+       jazzy and lyrical alike, with the same three field sets, so this
+       is one package fewer rather than a different test. -->
+  <test_depend>example_interfaces</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

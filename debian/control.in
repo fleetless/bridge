@@ -1,0 +1,31 @@
+Source: ros-@ROS_DISTRO@-fleetless-bridge
+Section: misc
+Priority: optional
+Maintainer: Andre Dehne <andre@dehne-robotik.de>
+Build-Depends: debhelper-compat (= 13), dh-python, python3-setuptools, python3-all
+Standards-Version: 4.6.2
+Homepage: https://docs.fleetless.dev
+
+Package: ros-@ROS_DISTRO@-fleetless-bridge
+Architecture: all
+Depends: ${misc:Depends},
+ python3,
+@ROS_DEPS@
+ python3-opencv,
+ python3-defusedxml,
+ python3-numpy,
+ python3-aiohttp,
+ python3-aiortc
+Description: Fleetless Bridge: connects a ROS2 robot to the Fleetless cloud
+ Runs on a robot alongside its ROS2 graph, exposes configured datapoints,
+ cameras and remote invocations to the Fleetless cloud, and carries the
+ robot's job and asset-sync traffic. See https://docs.fleetless.dev.
+ .
+ Every dependency above is an ordinary apt package. `apt install` needs
+ nothing beyond what this Depends: line already asks for, and installing it
+ needs no network access beyond whatever the package's own mirror requires
+ — it does not reach PyPI, and no maintainer script installs anything at
+ configure time (see debian/postinst, which does nothing). This package
+ used to run a PyPI install for three dependencies apt could not resolve;
+ the last of those (python3-aiortc, replacing the LiveKit SDK) is why it
+ no longer needs to.
