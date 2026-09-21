@@ -39,9 +39,11 @@ def test_settings_refuse_a_bad_value_and_name_it():
 
 
 def test_settings_refuse_an_exit_threshold_above_the_enter_threshold():
-    # Contracts refuses this in the YAML; a `ros2 param set` reaches the same
-    # dataclass without passing through it, and the two thresholds crossed
-    # would enter and exit on the same reading forever.
+    # Crossed, the two thresholds enter and exit on the same reading forever.
+    # Contracts compares the pair only when the YAML carries both keys, so the
+    # lone-key YAML below is published and valid and is caught here or nowhere.
+    with pytest.raises(ValueError, match="exit_lag_ms must be at or below enter_lag_ms"):
+        LowBandwidthSettings.resolve({}, {"exit_lag_ms": 3000})
     with pytest.raises(ValueError, match="exit_lag_ms must be at or below enter_lag_ms"):
         LowBandwidthSettings.resolve({"exit_lag_ms": 3000}, {})
     assert LowBandwidthSettings.resolve({"exit_lag_ms": 2000}, {}).exit_lag_ms == 2000

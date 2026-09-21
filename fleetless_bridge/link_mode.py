@@ -54,10 +54,12 @@ class LowBandwidthSettings:
         _check(_is_int(merged["enter_after_s"]) and merged["enter_after_s"] >= 1, "enter_after_s", "an integer >= 1")
         _check(_is_int(merged["exit_lag_ms"]) and merged["exit_lag_ms"] >= 0, "exit_lag_ms", "an integer >= 0")
         _check(_is_int(merged["exit_after_s"]) and merged["exit_after_s"] >= 1, "exit_after_s", "an integer >= 1")
-        # Crossed thresholds have no hysteresis left: the same reading would
-        # satisfy the enter rule and the exit rule, and the mode would flip on
-        # every tick. Contracts refuses it in the YAML; a `ros2 param set`
-        # reaches this dataclass without passing through contracts.
+        # Crossed thresholds leave no hysteresis: one reading satisfies the
+        # enter rule and the exit rule, and the mode flips on every tick.
+        # Contracts compares the pair only when the YAML carries both keys, so
+        # a lone `exit_lag_ms` above the default is published and valid and
+        # arrives here crossed. This check is the only one that sees that, from
+        # the YAML apply as much as from `ros2 param set`.
         _check(merged["exit_lag_ms"] <= merged["enter_lag_ms"], "exit_lag_ms", "at or below enter_lag_ms")
         _check(
             _is_num(merged["datapoint_max_hz"]) and 0 < merged["datapoint_max_hz"] <= 20,
