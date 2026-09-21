@@ -9,6 +9,7 @@ stays unset, and that a capped sample lands in the backlog rather than
 nowhere.
 """
 import asyncio
+import time
 
 import pytest
 import rclpy
@@ -211,6 +212,110 @@ def test_the_cap_applies_unless_the_datapoint_says_keep():
     # nothing after it.
     assert len(per_slug.get("capped", [])) == 1
     assert len(per_slug.get("kept", [])) == 6
+
+
+class _RefusesEverything:
+    """A `RatePolicy` that never admits a sample. Substituted for a
+    subscription's configured policy to prove the live decision does not
+    consult it while the cap holds."""
+
+    def should_send(self, value, now):
+        return False
+
+
+def _publish_for(seconds, interval=0.02):
+    """Publish as steadily as the loop allows for `seconds`, and return how
+    long it actually took — a rate asserted against the nominal duration
+    would be asserting the machine's timer."""
+    node = rclpy.create_node("test_lb_rate_publisher")
+    try:
+        pub = node.create_publisher(BatteryState, "/battery", 10)
+        started = time.monotonic()
+        i = 0
+        while time.monotonic() - started < seconds:
+            pub.publish(_battery(0.001 * (i % 100)))
+            i += 1
+            time.sleep(interval)
+        return time.monotonic() - started
+    finally:
+        node.destroy_node()
+
+
+def test_the_cap_replaces_the_configured_rate_rather_than_chaining_with_it():
+    """While the cap holds it is the only policy the live decision asks.
+
+    Two policies in series beat against each other: an arrival the
+    configured rate admitted, falling just short of the cap's own threshold,
+    is dropped without advancing the cap, so the next admission slips a
+    whole source interval and the effective rate lands well under the
+    ceiling. Pinned structurally rather than by measurement — the configured
+    policy is replaced with one that refuses everything, so a live path that
+    still consulted it would deliver nothing at all."""
+
+    async def body(rt):
+        await rt.apply_config(by_slug([_dp("capped", rate_throttle_hz=6)]))
+        await asyncio.sleep(0.3)
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=5))
+        rt._subscriptions["capped"].rate = _RefusesEverything()
+        _publish(6)
+        return await _drain_samples(rt)
+
+    samples = run(body)
+    # Six publishes inside 200 ms: the 5 Hz cap admits the first and no more.
+    assert len(samples) == 1
+
+
+def test_the_effective_live_rate_lands_on_the_ceiling_not_below_it():
+    """The measured half of the claim above, at the ratio that beats worst:
+    a datapoint configured just above the ceiling.
+
+    6 Hz configured under a 5 Hz ceiling, fed at 50 Hz. Chained, the two
+    policies settle at roughly 2.8 Hz — a datapoint losing far more than the
+    mode asked for, in a direction no assertion of the form `<= 5 Hz` can
+    see. The floor below is what separates the two implementations; the
+    ceiling is there so a cap that stopped applying at all is caught too."""
+
+    async def body(rt):
+        await rt.apply_config(by_slug([_dp("capped", rate_throttle_hz=6)]))
+        await asyncio.sleep(0.3)
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=5))
+        elapsed = _publish_for(2.0)
+        return len(await _drain_samples(rt)), elapsed
+
+    count, elapsed = run(body)
+    rate = count / elapsed
+    assert 4.0 <= rate <= 6.0, "effective live rate was {:.2f} Hz".format(rate)
+
+
+def test_the_configured_rate_still_decides_what_the_backlog_keeps():
+    """The cap spares the link, so the ceiling is the live rate — but the
+    history is still the datapoint's own rate, not the raw topic. The two
+    policies see every arrival independently; neither gates the other."""
+
+    async def body(rt):
+        await rt.apply_config(by_slug([
+            _dp("capped", rate_throttle_hz=6,
+                retention=RetentionConfig(enabled=True, max_buffer_values=50)),
+        ]))
+        await asyncio.sleep(0.3)
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=5))
+        # The cap admits nothing, so every arrival the configured rate
+        # admits is the backlog's business alone.
+        rt._subscriptions["capped"].cap = _RefusesEverything()
+        elapsed = _publish_for(2.0)
+        live = await _drain_samples(rt)
+        held = []
+        while True:
+            sample = rt.backlog.pop_any()
+            if sample is None:
+                break
+            held.append(sample)
+        return len(live), len(held), elapsed
+
+    live, held, elapsed = run(body)
+    assert live == 0
+    rate = held / elapsed
+    assert 5.0 <= rate <= 7.0, "backlog rate was {:.2f} Hz".format(rate)
 
 
 def test_a_datapoint_already_slower_than_the_cap_is_left_alone():

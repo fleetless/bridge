@@ -97,7 +97,11 @@ ros2 param set /fleetless_bridge low_bandwidth.datapoint_max_hz 0.5
 ```
 
 A value the bridge cannot use is refused by the set, with the rule it broke,
-and the parameter keeps what it had.
+and the parameter keeps what it had. One rule spans two keys: `exit_lag_ms`
+must stay at or below `enter_lag_ms`. Crossed, the same reading satisfies
+both thresholds and the mode leaves as it arrives, so the bridge refuses the
+pair — including when only one of the two is published and it crosses the
+parameter or the default it lands on.
 
 The published `fleetless.yaml` overrides all of them, so a fleet's settings
 live in the console rather than on each robot:
@@ -120,6 +124,11 @@ datapoints:
     field: data
     low_bandwidth: keep
 ```
+
+A `camera_start` that arrives while the mode holds is refused, under
+`reduce` as much as under `stop`: a new stream is new uplink, and the mode
+exists because there is none to spare. The camera says so for itself —
+`low_bandwidth`, with the sentence — rather than failing silently.
 
 Nothing is lost in the mode, only delayed: a capped datapoint with
 `retention` still buffers every sample it held back, and the history fills in

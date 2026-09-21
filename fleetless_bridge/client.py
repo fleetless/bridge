@@ -1283,6 +1283,10 @@ class BridgeClient:
         # the link, and a reconnect does not make a narrow uplink wide.
         self._link_mode = LinkMode(self._lb_settings, self._now())
         self._link_mode_task: Optional["asyncio.Task"] = None
+        # When this session opened, in the same wall clock a sample's
+        # `timestamp_ms` uses — see `_observe_dwell`. Set here too, not only
+        # per session, so the attribute exists before the first connection.
+        self._session_started_ms = capture_timestamp_ms()
         if self._ros is not None:
             self._ros.on_low_bandwidth_params(self._on_low_bandwidth_params)
 
@@ -1383,17 +1387,33 @@ class BridgeClient:
         except Exception:  # noqa: BLE001 - nobody awaits this job; say so here or nowhere
             log.exception("Unexpected error applying a low-bandwidth parameter change")
 
-    async def _apply_low_bandwidth_settings(self, now: float) -> None:
+    async def _apply_low_bandwidth_settings(self, now: float) -> bool:
         """Re-resolve both layers, hand the result to the controller, pull the
-        levers. Raises `ValueError` — with the sentence naming the key and the
-        rule — without having changed anything, so a caller can report it and
-        carry on."""
+        levers. Returns whether a transition was reported.
+
+        Raises `ValueError` — with the sentence naming the key and the rule —
+        without having changed anything, so a caller can report it and carry
+        on.
+
+        **`update_settings` is called only when the settings actually moved**,
+        because it resets both of the controller's timers by contract, and
+        this runs at every `hello_ok`. A link narrow enough to matter is one
+        the cloud closes after three unanswered pings, about six seconds; a
+        bridge that restarted `enter_after_s` on every greeting would need ten
+        seconds inside one session and so would never enter the mode on
+        precisely the link it exists for. `LowBandwidthSettings` is a frozen
+        dataclass, so `!=` is exact and this costs one comparison."""
         settings = LowBandwidthSettings.resolve(
             self._param_low_bandwidth, self._yaml_low_bandwidth
         )
-        transition = self._link_mode.update_settings(settings, now)
+        transition = (
+            self._link_mode.update_settings(settings, now)
+            if settings != self._lb_settings
+            else None
+        )
         self._lb_settings = settings
         await self._on_transition(transition)
+        return transition is not None
 
     async def _on_transition(self, transition: Optional[Transition]) -> None:
         """Say a crossing once, then pull the levers.
@@ -1448,25 +1468,40 @@ class BridgeClient:
         Two clocks on purpose: the dwell is the distance between two wall-clock
         stamps (the capture time the wire carries and now), while the window it
         lands in is monotonic, because a stepped system clock must not be able
-        to empty or fill the tracker."""
+        to empty or fill the tracker.
+
+        A sample captured before this session opened is sent but not measured.
+        `SampleQueue` survives a disconnect, so the first sends of a new
+        session can carry stamps from before the outage, and their "dwell"
+        would be the length of the outage — which says nothing about the link
+        that is up now. At the default `enter_after_s` of 10 s the five-second
+        window ages them out first; at 1 s every reconnect would enter the
+        mode."""
+        if captured_ms < self._session_started_ms:
+            return
         self._link_mode.observe_dwell(
             capture_timestamp_ms() - captured_ms, self._now()
         )
 
-    async def _start_link_mode(self, writer: PrioritizedWriter) -> None:
+    async def _start_link_mode(self) -> None:
         """At `hello_ok`: read the parameter layer, state the mode once, start
         the tick.
 
         The parameters only exist once `ros.start()` has run, which is after
         this client was constructed — so this is the first moment they can be
-        read at all. The report goes out whether or not anything changed: the
+        read at all. The state goes out whether or not anything changed: the
         cloud's `bridge_state` should be right from the first second of a
         session rather than from the first transition, which on a healthy link
-        never comes."""
+        never comes.
+
+        Once, though, not twice. A parameter layer that forces the mode makes
+        the resolve above return a `forced` transition, which has already been
+        reported by the time the greeting below would state the same thing."""
+        reported = False
         try:
             if self._ros is not None:
                 self._param_low_bandwidth = dict(self._ros.low_bandwidth_params())
-            await self._apply_low_bandwidth_settings(self._now())
+            reported = await self._apply_low_bandwidth_settings(self._now())
         except ValueError as exc:
             log.error(
                 "The low-bandwidth settings do not resolve: %s. The bridge keeps "
@@ -1474,17 +1509,19 @@ class BridgeClient:
             )
         except Exception:  # noqa: BLE001 - a mode that will not engage beats a handshake that dies
             log.exception("Unexpected error starting low-bandwidth mode for this session")
-        if self._lb_settings.mode != "auto":
-            reason = "forced"
-        elif self._link_mode.active:
-            # Under `auto`, a mode still on from the previous session. `lag` is
-            # the enum's word for "the link is the reason"; which of the two
-            # measures entered it did not survive the reconnect, and inventing
-            # `recovered` here would say the opposite of what is true.
-            reason = "lag"
-        else:
-            reason = "recovered"
-        self._report_link_mode(self._link_mode.active, reason)
+        if not reported:
+            if self._lb_settings.mode != "auto":
+                reason = "forced"
+            elif self._link_mode.active:
+                # Under `auto`, a mode still on from the previous session.
+                # `lag` is the enum's word for "the link is the reason"; which
+                # of the two measures entered it did not survive the
+                # reconnect, and inventing `recovered` here would say the
+                # opposite of what is true.
+                reason = "lag"
+            else:
+                reason = "recovered"
+            self._report_link_mode(self._link_mode.active, reason)
         self._link_mode_task = asyncio.ensure_future(self._pump_link_mode())
 
     async def _pump_link_mode(self) -> None:
@@ -1577,6 +1614,7 @@ class BridgeClient:
         # Started at `hello_ok`, cancelled in `finally` — one per session, the
         # same lifecycle the control pump has.
         self._link_mode_task = None
+        self._session_started_ms = capture_timestamp_ms()
         # The handshake gets one deadline for the whole of it, not one per
         # frame, so a cloud that keeps sending other traffic without ever
         # answering the hello still times out.
@@ -1669,7 +1707,7 @@ class BridgeClient:
                     # the runtime still believes nobody is connected for.
                     self._session_open = True
                     writer.wake()
-                    await self._start_link_mode(writer)
+                    await self._start_link_mode()
                 elif isinstance(message, HelloError):
                     if message.terminal:
                         log.error(

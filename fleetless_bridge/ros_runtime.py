@@ -115,7 +115,6 @@ from fleetless_bridge import camera, camera_sources, introspection, live, params
 from fleetless_bridge.jobs import JobManager, JobUpdate
 from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.protocol import (
-    LOW_BANDWIDTH_DEFAULTS,
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
     APPLY_ERROR_CODE_UNKNOWN,
     APPLY_ERROR_KIND_ACTION,
@@ -130,6 +129,7 @@ from fleetless_bridge.protocol import (
     CAMERA_STATE_CAUSE_CONFIG_CHANGE,
     CAMERA_STATE_CAUSE_LIVE_LOST,
     CAMERA_STATE_CAUSE_SOURCE,
+    LOW_BANDWIDTH_DEFAULTS,
     ActionConfig,
     ApplyError,
     CameraConfig,
@@ -681,9 +681,10 @@ class _Subscription:
     configured_hz: Optional[float] = None
     #: `low_bandwidth: keep` — this datapoint is exempt from the mode's cap.
     keep: bool = False
-    #: The mode's ceiling for this slug while it bites, else `None`. A second
-    #: policy rather than a replacement for `rate`, so leaving the mode
-    #: restores the configured rate without rebuilding it.
+    #: The mode's ceiling for this slug while it bites, else `None`. Held
+    #: beside `rate` rather than overwriting it, so leaving the mode restores
+    #: the configured rate with one assignment and no rebuild — but the two
+    #: are never chained; see `_on_message`.
     cap: Optional[sampling.RatePolicy] = None
     handle: object = None  # the rclpy Subscription, set once created
 
@@ -1531,6 +1532,11 @@ class RosRuntime:
         bite: the mode is off, the datapoint says `keep`, or its own
         configured rate is already at or below the ceiling.
 
+        Returning `None` whenever the configured rate is the smaller of the
+        two is what makes the policy this does return equal to
+        `min(rate_throttle_hz, datapoint_max_hz)`, which is the rate the mode
+        promises — `_on_message` then needs no second opinion and takes none.
+
         A falsy `configured_hz` is "no ceiling configured" (sampling.py reads
         `None` and `0` the same way), so it never counts as slower than the
         cap — `0 <= 1.0` is arithmetically true and exactly backwards."""
@@ -2132,21 +2138,37 @@ class RosRuntime:
             log.exception("Could not convert a sample for slug %r", slug)
             return
 
-        if not entry.rate.should_send(value, time.monotonic()):
+        now = time.monotonic()
+        sample = sampling.Sample(slug, value, timestamp_ms)
+
+        if self._connected and entry.cap is not None:
+            # Low-bandwidth mode. The live rate is `min(rate_throttle_hz,
+            # datapoint_max_hz)` and the cap alone decides it — `_cap_policy`
+            # returns `None` in every case where the configured rate is the
+            # smaller of the two, so the cap IS that minimum.
+            #
+            # **Not chained with `entry.rate`, and that is the whole point.**
+            # Two `MaxHzPolicy` instances in series beat against each other:
+            # an arrival the configured rate admits, falling just short of the
+            # cap's own threshold, is dropped without advancing the cap, so
+            # the next admission slips a whole source interval. With a 10 Hz
+            # source, 6 Hz configured and a 5 Hz ceiling the pair settles
+            # near 3 Hz — a datapoint losing far more than the mode asked
+            # for, in the one direction no "at most the ceiling" check can
+            # see.
+            #
+            # So both policies see every arrival and neither gates the other:
+            # the cap decides what goes live, the configured rate decides what
+            # the history keeps. The mode spares the link, not the record.
+            live = entry.cap.should_send(value, now)
+            keep_for_history = entry.rate.should_send(value, now)
+            if live:
+                self.samples.put_threadsafe(self._loop, sample)
+            elif keep_for_history and entry.buffer_enabled:
+                self.backlog.push(slug, sample)
             return
 
-        sample = sampling.Sample(slug, value, timestamp_ms)
-        if self._connected and entry.cap is not None and not entry.cap.should_send(
-            value, time.monotonic()
-        ):
-            # Low-bandwidth mode: the configured rate said yes, the cap says
-            # not now. Kept for backfill where the datapoint buffers, so the
-            # history fills in once the link recovers — the mode spares the
-            # link, not the record. Only while connected: disconnected, the
-            # branches below already decide, and capping a sample nothing is
-            # sending would only thin the backlog.
-            if entry.buffer_enabled:
-                self.backlog.push(slug, sample)
+        if not entry.rate.should_send(value, now):
             return
         if self._connected:
             # Live: someone is actually connected to receive it right now.

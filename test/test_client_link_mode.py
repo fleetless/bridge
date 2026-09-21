@@ -16,11 +16,11 @@ seconds apiece.
 """
 import asyncio
 
-from fake_cloud import FakeCloud, accepts
+from fake_cloud import FakeCloud, accepts, sequence
 from helpers import make_client, run_until
 from test_client_datapoints import FakeRos
 
-from fleetless_bridge.sampling import Sample
+from fleetless_bridge.sampling import Sample, capture_timestamp_ms
 
 
 class Clock:
@@ -69,7 +69,10 @@ def test_after_hello_the_bridge_reports_its_mode_once_and_pings_feed_the_control
             # lag — moving the clock before that would start the enter timer
             # from the later time and the mode would never arrive.
             await session.recv_pong()
-            await clock.advance(1.0)
+            # Half of `enter_after_s`, so the tick has run hundreds of times
+            # against a lag over the threshold and must still say nothing.
+            await clock.advance(0.5)
+            box["early"] = list(cloud.link_modes)
             await clock.advance(5.0)
             box["second"] = await session.recv_link_mode()
             await session.drain()
@@ -77,11 +80,20 @@ def test_after_hello_the_bridge_reports_its_mode_once_and_pings_feed_the_control
         async with FakeCloud(behavior) as cloud:
             client = _client(cloud, clock, ros)
             await run_until(client, lambda: "second" in box)
-        return box["first"], box["second"]
+            box["all"] = list(cloud.link_modes)
+        return box
 
-    first, second = asyncio.run(scenario())
+    box = asyncio.run(scenario())
+    first, second = box["first"], box["second"]
     assert first["low_bandwidth"] is False and first["reason"] == "recovered"
     assert second["low_bandwidth"] is True and second["reason"] == "lag"
+    # Nothing before the threshold: the crossing tick is pinned in
+    # test_link_mode.py, and this is the wired path saying the same.
+    assert len(box["early"]) == 1
+    # Two frames for the whole session and no more. The tick runs hundreds of
+    # times here, so a frame per evaluation — the heartbeat `link_mode_message`
+    # exists not to be — would be unmissable.
+    assert len(box["all"]) == 2
     # The lever was pulled with the same answer the wire carries.
     assert ros.low_bandwidth_calls[-1][0] is True
 
@@ -249,7 +261,11 @@ def test_a_sent_sample_feeds_the_dwell_tracker():
             await session.accept()
             await session.recv_link_mode()
             loop = asyncio.get_event_loop()
-            ros.samples.put_threadsafe(loop, Sample(slug="speed", value=1, timestamp_ms=0))
+            # Stamped now: a sample older than the session is deliberately
+            # sent but not measured, which the reconnect test below covers.
+            ros.samples.put_threadsafe(
+                loop, Sample(slug="speed", value=1, timestamp_ms=capture_timestamp_ms())
+            )
             box["sample"] = await session.recv_datapoint()
             await session.drain()
 
@@ -266,9 +282,10 @@ def test_a_sent_sample_feeds_the_dwell_tracker():
         return box
 
     asyncio.run(scenario())
-    # `timestamp_ms=0` is the epoch, so the dwell is "now" in milliseconds —
-    # a number this test can only bound, not pin.
-    assert len(seen) == 1 and seen[0] > 1_600_000_000_000
+    # The wire is the only thing between capture and the measurement here,
+    # so the number is small; how small is the machine's business, not this
+    # test's.
+    assert len(seen) == 1 and 0 <= seen[0] < 60_000
 
 
 def test_a_parameter_set_re_resolves_and_pulls_the_levers_again():
@@ -363,3 +380,180 @@ def test_a_client_with_no_runtime_still_resolves_and_reports():
 
     frame = asyncio.run(scenario())
     assert frame["low_bandwidth"] is False and frame["reason"] == "recovered"
+
+
+def test_a_reconnect_does_not_rewind_the_enter_timer():
+    """The link this mode exists for is the one that drops the session.
+
+    The cloud closes a socket after three unanswered pings, about six
+    seconds; a bridge that restarted `enter_after_s` on every `hello_ok`
+    would need ten seconds inside one session and so would never engage on
+    a link that cannot hold one for ten. The controller therefore lives for
+    the client, not the session, and its timers are only reset by settings
+    that actually resolved differently.
+
+    Six seconds of lag, a dropped session, six more: twelve against a
+    threshold of ten, so the mode enters in the second session."""
+    clock = Clock()
+    ros = FakeRos()
+
+    async def scenario():
+        box = {}
+
+        async def first(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            await session.ping(1, latency_ms=50, lag_ms=5000)
+            await session.recv_pong()
+            await clock.advance(6.0)
+            box["first_done"] = True
+            await session.close()
+
+        async def second(session):
+            await session.recv_hello()
+            await session.accept()
+            box["greeting"] = await session.recv_link_mode()
+            await session.ping(2, latency_ms=50, lag_ms=5000)
+            await session.recv_pong()
+            await clock.advance(6.0)
+            box["entered"] = await session.recv_link_mode()
+            await session.drain()
+
+        async with FakeCloud(sequence(first, second)) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: "entered" in box)
+        return box
+
+    box = asyncio.run(scenario())
+    # The second session opens by restating the mode it is still in: off.
+    assert box["greeting"]["low_bandwidth"] is False
+    assert box["entered"]["low_bandwidth"] is True
+    assert box["entered"]["reason"] == "lag"
+
+
+def test_a_forced_parameter_layer_states_the_mode_once_after_hello():
+    """A parameter layer that forces the mode makes `update_settings` return
+    a `forced` transition at the very moment the session opens, and the
+    greeting states the mode too. One frame, not both."""
+    clock = Clock()
+    ros = FakeRos()
+    ros.low_bandwidth_params_value["mode"] = "on"
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            box["frame"] = await session.recv_link_mode()
+            await session.ping(1, latency_ms=10, lag_ms=0)
+            await session.recv_pong()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: "frame" in box)
+            box["all"] = list(cloud.link_modes)
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["frame"]["low_bandwidth"] is True
+    assert box["frame"]["reason"] == "forced"
+    assert len(box["all"]) == 1
+
+
+def test_a_sample_captured_before_this_session_is_not_measured_as_dwell():
+    """A sample queued just before a session died keeps its capture stamp and
+    is sent by the next one, so its dwell is the length of the outage rather
+    than anything about the link that is up now. At the default
+    `enter_after_s` of 10 s the five-second window ages it out first; at 1 s
+    it would put every reconnect straight into the mode."""
+    clock = Clock()
+    ros = FakeRos()
+    seen = []
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            loop = asyncio.get_event_loop()
+            # An hour old: captured long before this session opened.
+            ros.samples.put_threadsafe(
+                loop, Sample(slug="stale", value=1, timestamp_ms=capture_timestamp_ms() - 3_600_000)
+            )
+            ros.samples.put_threadsafe(
+                loop, Sample(slug="fresh", value=2, timestamp_ms=capture_timestamp_ms())
+            )
+            box["one"] = await session.recv_datapoint()
+            box["two"] = await session.recv_datapoint()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            original = client._link_mode.observe_dwell
+
+            def record(dwell_ms, now):
+                seen.append(dwell_ms)
+                return original(dwell_ms, now)
+
+            client._link_mode.observe_dwell = record
+            await run_until(client, lambda: "two" in box)
+        return box
+
+    box = asyncio.run(scenario())
+    # Both samples went out — the guard drops the measurement, not the frame.
+    assert {box["one"]["slug"], box["two"]["slug"]} == {"stale", "fresh"}
+    assert len(seen) == 1 and seen[0] < 60_000
+
+
+def test_a_parameter_set_the_published_section_crosses_is_survived():
+    """The parameter callback validates the parameters alone, so a set that
+    only crosses a threshold once the published section is laid over it
+    reaches the client as a `ValueError` on a path the config apply does not
+    cover. It has to keep the settings it had and keep running."""
+    clock = Clock()
+    ros = FakeRos()
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            # Valid on its own and valid over the defaults.
+            await session.send_config(1, {}, low_bandwidth={"enter_lag_ms": 600})
+            box["applied"] = await session.recv_config_applied()
+            box["greeted"] = True
+            # `exit_lag_ms: 1000` clears the default `enter_lag_ms` of 2000,
+            # so the runtime's own callback accepts it; laid under the
+            # published `enter_lag_ms: 600` it is crossed.
+            await session.ping(1, latency_ms=10, lag_ms=0)
+            await session.recv_pong()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            task = asyncio.ensure_future(client.run())
+            while "greeted" not in box:
+                await asyncio.sleep(0.005)
+            before = client._lb_settings
+            values = dict(ros.low_bandwidth_params_value)
+            values["exit_lag_ms"] = 1000
+            ros.low_bandwidth_callback(values)
+            await asyncio.sleep(0.05)
+            box["before"], box["after"] = before, client._lb_settings
+            box["still_running"] = not task.done()
+            client.stop()
+            await asyncio.wait_for(task, timeout=10.0)
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["applied"]["ok"] is True
+    assert box["after"] == box["before"]
+    assert box["after"].enter_lag_ms == 600
+    assert box["still_running"] is True

@@ -742,10 +742,11 @@ def pong_message(ts_ms: int) -> str:
 def link_mode_message(low_bandwidth: bool, reason: str, at_ms: int) -> str:
     """Announce that low-bandwidth mode just turned on or off.
 
-    Sent on every transition and nothing else: the cloud shows the state and
-    the console explains why a robot went quiet, so a heartbeat repeating an
-    unchanged answer would be paying for the mode on the link the mode exists
-    to spare.
+    Sent on every transition, and once more at the start of each session so a
+    cloud that has just restarted knows what this robot is doing rather than
+    waiting for a crossing that never comes on a healthy link. Nothing else:
+    a heartbeat repeating an unchanged answer would be paying for the mode on
+    the link the mode exists to spare.
 
     `reason` is a closed enum on the wire (`lag`, `dwell`, `forced`,
     `recovered`) — the strict outgoing copy of the schema is what enforces
