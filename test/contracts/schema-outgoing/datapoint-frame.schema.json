@@ -17,6 +17,10 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 9007199254740991
+    },
+    "backfill": {
+      "description": "true when the sample was captured while the bridge was disconnected and is being replayed after the reconnect. The cloud keeps such a sample out of its lag measure; absent means live.",
+      "type": "boolean"
     }
   },
   "required": [

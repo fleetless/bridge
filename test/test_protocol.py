@@ -18,7 +18,6 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_WHOLE_KIND_FAILED,
     APPLY_ERROR_KIND_DATAPOINT,
     ASSET_FAILURE_KIND_REFUSED,
-    ASSET_FAILURE_KIND_TOO_LARGE,
     ASSET_FAILURE_KIND_UNRESOLVABLE,
     ASSET_FAILURE_KIND_UPLOAD_FAILED,
     ActionConfig,
@@ -1681,9 +1680,8 @@ def test_snapshot_frame_is_self_contained_with_no_image_bytes():
 def test_asset_progress_message_carries_structured_failed_entries():
     """`failed` on the wire is `{reference, kind, details}[]`, not
     `string[]` — validated against the vendored `bridge-asset-progress`
-    schema (re-vendored at contracts 764a1eb, adding `too_large`/`details`),
-    not just a hand-built dict, so a producer/schema disagreement shows up
-    here, not only in a real sync."""
+    schema, not just a hand-built dict, so a producer/schema disagreement
+    shows up here, not only in a real sync."""
     payload = json.loads(
         bridge_asset_progress_message(
             "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", 2, 3,
@@ -1708,19 +1706,25 @@ def test_asset_progress_message_carries_structured_failed_entries():
     }
 
 
-def test_asset_progress_message_carries_too_large_details():
-    """`too_large` is the one kind whose `details` is non-null —
-    validated against the vendored schema, which requires the shape
-    `superRefine` names in the contract (JSON Schema export can't encode
-    the cross-field pairing rule itself, only the shape of a populated
-    `details`)."""
+def test_asset_progress_message_carries_the_store_numbers_on_a_refusal():
+    """A `refused` entry the robot's store had no room for carries the
+    cloud's own three numbers, passed through as they arrived — the bridge
+    has no ceiling of its own to compare them against any more, so
+    inventing or recomputing any of them here would be inventing a fact.
+
+    Validated against the vendored schema, which requires all three
+    together once `details` is present at all."""
     payload = json.loads(
         bridge_asset_progress_message(
             "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", 1, 2,
             [
                 (
-                    "package://pkg/huge.dae", "too_large",
-                    {"limit_bytes": 67108864, "size_bytes": 193886766},
+                    "package://pkg/huge.dae", "refused",
+                    {
+                        "store_bytes": 1000000000,
+                        "used_bytes": 900000000,
+                        "size_bytes": 193886766,
+                    },
                 ),
             ],
             "running",
@@ -1730,8 +1734,12 @@ def test_asset_progress_message_carries_too_large_details():
     assert payload["failed"] == [
         {
             "reference": "package://pkg/huge.dae",
-            "kind": "too_large",
-            "details": {"limit_bytes": 67108864, "size_bytes": 193886766},
+            "kind": "refused",
+            "details": {
+                "store_bytes": 1000000000,
+                "used_bytes": 900000000,
+                "size_bytes": 193886766,
+            },
         }
     ]
 
@@ -1741,7 +1749,7 @@ def test_asset_failure_kind_constants_match_the_vendored_enum_exactly():
     TS/Python line as hand-typed Python literals with nothing checking
     them against the contract, and it took a review to notice.
     `ASSET_KINDS` now loads straight off `contracts_constants.json` (so it
-    can't drift structurally), but the four `ASSET_FAILURE_KIND_*`
+    can't drift structurally), but the three `ASSET_FAILURE_KIND_*`
     constants in `protocol.py` are still hand-typed — same shape, not yet
     the same guard.
 
@@ -1758,7 +1766,6 @@ def test_asset_failure_kind_constants_match_the_vendored_enum_exactly():
         ASSET_FAILURE_KIND_UNRESOLVABLE,
         ASSET_FAILURE_KIND_UPLOAD_FAILED,
         ASSET_FAILURE_KIND_REFUSED,
-        ASSET_FAILURE_KIND_TOO_LARGE,
     }
     assert bridge_kinds == vendored_kinds, (
         "protocol.py's ASSET_FAILURE_KIND_* constants and the vendored "
@@ -1783,3 +1790,20 @@ def test_asset_progress_message_rejects_the_old_bare_string_shape():
     }
     with pytest.raises(Exception):
         validate_frame("bridge-asset-progress", payload)
+
+
+def test_a_datapoint_frame_says_backfill_only_when_it_is_one():
+    """The flag is how the cloud keeps a replayed sample out of its lag
+    measure, so it has to be absent — not `false` — on a live one: the
+    contract reads an absent key as live, and a bridge that sent `false`
+    on every sample would put a key on the wire a hundred times a second
+    to say nothing."""
+    live = json.loads(datapoint_message("speed", 1.5, 1754800000000))
+    assert "backfill" not in live
+    validate_frame("datapoint-frame", live)
+
+    replayed = json.loads(
+        datapoint_message("speed", 1.5, 1754800000000, backfill=True)
+    )
+    assert replayed["backfill"] is True
+    validate_frame("datapoint-frame", replayed)

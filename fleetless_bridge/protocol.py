@@ -136,16 +136,13 @@ CAMERA_STATE_CAUSE_LIVE_LOST = "live_lost"  # publishing ended unexpectedly afte
 # why.
 ASSET_FAILURE_KIND_UNRESOLVABLE = "unresolvable"  # names nothing this bridge can find, or escapes its package
 ASSET_FAILURE_KIND_UPLOAD_FAILED = "upload_failed"  # the bytes exist; the transfer did not succeed
-ASSET_FAILURE_KIND_REFUSED = "refused"  # never attempted — a producer-side ceiling, or an aborted sync
-# A fourth kind, and deliberately not a `refused` variant: `refused`
-# already carries the array's own collective-overflow sentinel, and a
-# too-large file under that same key would repeat the `failed: string[]`
-# defect one key over —
-# two facts sharing one value, either capable of overwriting the other. Only
-# `too_large` ever pairs with a non-null `details`: the two
-# numbers a developer needs to decide whether to shrink the mesh or ask for
-# the ceiling to move.
-ASSET_FAILURE_KIND_TOO_LARGE = "too_large"  # never attempted — its size on disk already exceeds ASSET_UPLOAD_MAX_BYTES
+# `refused` covers both "never attempted": the array's own
+# collective-overflow sentinel, which has no numbers behind it, and an
+# upload the robot's asset store had no room for, which carries the
+# cloud's three. There was a fourth kind, `too_large`, for a per-file
+# ceiling the bridge enforced itself; the store replaced it, and the
+# bridge no longer knows a limit to compare anything against.
+ASSET_FAILURE_KIND_REFUSED = "refused"  # never attempted — the store was full, or a producer-side ceiling
 
 # Which kind of exposure a `config_applied` error belongs to (contracts
 # `applyErrorKind`) — a closed enum, unlike `ApplyError.code` below. Known at
@@ -186,6 +183,23 @@ CLOSE_CODE_SUPERSEDED = 4000
 # closed". Terminal, the same way CLOSE_CODE_SUPERSEDED is: nothing about
 # this process starting over will change the answer.
 CLOSE_CODE_ROBOT_DELETED = 4004
+
+# The cloud closes with this when this robot's token was rotated in the
+# console: the credential this process holds will be refused from now on,
+# and no amount of reconnecting produces the new one. Its own code rather
+# than `CLOSE_CODE_ROBOT_DELETED` because the two need different sentences
+# on the robot's own logs — a deleted robot is somebody's decision to undo
+# in the console, a rotated token is a restart with the new value, and an
+# operator reading "this robot was deleted" would go looking for the wrong
+# thing. Terminal for the same reason both the others are.
+#
+# **A literal, not read from the vendored constants**, because contracts
+# does not export the close codes: `exportedConstants` carries only what a
+# non-TypeScript consumer has to vendor, and these three have always been
+# hand-kept on both sides with a test pinning each number
+# (test_client_reconnect.py). Same arrangement as 4000 and 4004 above, not
+# a new exception.
+CLOSE_CODE_TOKEN_ROTATED = 4005
 
 
 class ApplyError(NamedTuple):
@@ -784,11 +798,27 @@ def type_definitions_message(
     )
 
 
-def datapoint_message(slug: str, value: Any, timestamp_ms: int) -> str:
-    """One sample. `timestamp_ms` is the bridge capture time."""
-    return json.dumps(
-        {"type": "datapoint", "slug": slug, "value": value, "timestamp_ms": timestamp_ms}
-    )
+def datapoint_message(
+    slug: str, value: Any, timestamp_ms: int, backfill: bool = False
+) -> str:
+    """One sample. `timestamp_ms` is the bridge capture time.
+
+    `backfill` says this sample was captured while the bridge was
+    disconnected and is being replayed now, so the cloud can keep it out of
+    the datapoint lag it measures — without it, a reconnect after an hour
+    offline reads as an hour of lag and would put the link straight into
+    low-bandwidth mode for a connection that is perfectly healthy.
+
+    **The key is emitted only when it is `true`.** The contract reads an
+    absent `backfill` as live, so a `false` on every live sample would put
+    a key on the wire at the datapoint rate to say what its absence
+    already says."""
+    payload = {
+        "type": "datapoint", "slug": slug, "value": value, "timestamp_ms": timestamp_ms
+    }
+    if backfill:
+        payload["backfill"] = True
+    return json.dumps(payload)
 
 
 def job_update_message(
@@ -952,18 +982,22 @@ def bridge_asset_progress_message(
     reports success moves the failure into somebody else's renderer, where it
     shows up as a robot with missing limbs and no cause — and *why* it wasn't
     delivered matters
-    as much as *that* it wasn't, because only one of the four `kind`s
+    as much as *that* it wasn't, because only one of the three `kind`s
     (`ASSET_FAILURE_KIND_*` above) may ever be treated as "this reference is
     gone for good" by a reconciliation.
 
-    `details`: `{"limit_bytes":..., "size_bytes":...}` on
-    `too_large`, `None` on every other kind — and always sent as the literal
-    JSON key with value `null` in that case, never omitted. The contract's
-    `superRefine` (`assets.ts`) checks `details !== null` on the parsed
-    value, not "was the key present" — a JSON `undefined` has no wire
-    representation, so leaving the key out on a non-`too_large` entry is not
-    the same claim as sending `null`, and only one of the two is guaranteed
-    to satisfy the pairing rule on the receiving end.
+    `details`: `{"store_bytes":..., "used_bytes":..., "size_bytes":...}` on
+    a `refused` entry the robot's asset store had no room for, `None`
+    everywhere else — and always sent as the literal JSON key with value
+    `null` in that case, never omitted. A JSON `undefined` has no wire
+    representation, so leaving the key out is not the same claim as sending
+    `null`, and only one of the two is guaranteed to read the same way on
+    the receiving end.
+
+    The three numbers are the cloud's, passed through exactly as they
+    arrived. This bridge cannot derive any of them — it does not know what
+    the robot's other assets already cost — so a refusal it could not read
+    reports `refused` with no details rather than a number it made up.
 
     `state` is `'running' | 'finished' | 'refused_busy'` — three values
     because a plain `finished: bool` had nowhere to put a refusal. A second

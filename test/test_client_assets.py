@@ -175,8 +175,8 @@ def test_asset_progress_is_pumped_out_once_connected():
 def test_asset_progress_carries_the_failed_list_and_finished_state():
     """`failed` entries are `(reference, kind, details)`
     triples on the wire, `{"reference": ..., "kind": ..., "details": ...}`
-    — not bare strings, and `details` is always sent, `null` when
-    the kind is not `too_large`."""
+    — not bare strings, and `details` is always sent, `null` when there
+    are no numbers behind the entry."""
     fake_ros = FakeRos()
 
     async def send_and_recv(session):
@@ -198,9 +198,11 @@ def test_asset_progress_carries_the_failed_list_and_finished_state():
     assert payload["state"] == "finished"
 
 
-def test_asset_progress_carries_too_large_details():
-    """A `too_large` entry carries the two numbers a developer needs to act on
-    it — `limit_bytes`/`size_bytes` — and nothing else does."""
+def test_asset_progress_carries_the_store_numbers_of_a_refusal():
+    """A `refused` entry the robot's store had no room for carries the
+    cloud's three numbers all the way to the wire, unchanged — this is the
+    only path they travel, and a developer reading "refused" with nothing
+    beside it cannot tell a full store from a producer that declined."""
     fake_ros = FakeRos()
 
     async def send_and_recv(session):
@@ -212,8 +214,12 @@ def test_asset_progress_carries_too_large_details():
                 failed=(
                     (
                         "package://foo/huge.dae",
-                        "too_large",
-                        {"limit_bytes": 67108864, "size_bytes": 193886766},
+                        "refused",
+                        {
+                            "store_bytes": 1000000000,
+                            "used_bytes": 900000000,
+                            "size_bytes": 193886766,
+                        },
                     ),
                 ),
                 state="running",
@@ -225,7 +231,11 @@ def test_asset_progress_carries_too_large_details():
     assert payload["failed"] == [
         {
             "reference": "package://foo/huge.dae",
-            "kind": "too_large",
-            "details": {"limit_bytes": 67108864, "size_bytes": 193886766},
+            "kind": "refused",
+            "details": {
+                "store_bytes": 1000000000,
+                "used_bytes": 900000000,
+                "size_bytes": 193886766,
+            },
         }
     ]

@@ -32,6 +32,13 @@ hand-typed under a comment naming the TypeScript constant they came from — the
 exact drift these constants exist to prevent, surviving in the one place that
 could not import them.
 
+`ASSET_UPLOAD_MAX_BYTES` is gone from it: there is no per-file cap any
+more, so the bridge no longer pre-checks a size and the cloud refuses on a
+per-robot store instead. `ROBOT_ASSET_STORE_BYTES` is that store, exported
+for the same reason the header names are — a limit one side cannot read is
+two limits again — and the bridge reads it only to report it, never to
+decide.
+
 Since protocol 3 it also carries `LOW_BANDWIDTH_DEFAULTS`, the defaults the
 low-bandwidth ROS parameters fall back to, read by `protocol.py` the same way
 and for the same reason: a default typed twice is a default that disagrees
@@ -88,8 +95,8 @@ than what this bridge's own serializer produces (`strict=False`).
 
 **This pin is provisional and currently names a version these bytes did not
 come from.** They were vendored from the contracts checkout that carries
-protocol 3, while its `package.json` still said `1.3.0` — the 2.0.0 release
-chore lands after the bridge work. The sync test compares against whatever
+protocol 3 and the per-robot asset store, while its `package.json` still
+said `1.3.0` — the 2.0.0 release chore lands after the bridge work. The sync test compares against whatever
 `$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version
 against this line, so a pre-release checkout agrees with it and a published
 1.3.0 tarball would not. **Set this to `2.0.0` when contracts releases it**,

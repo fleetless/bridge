@@ -118,8 +118,9 @@ package, which the running process could never load.
 - **[fleetless.yaml](https://docs.fleetless.dev/reference/fleetless-yaml/)**
   — every section of the exposure document.
 - **[When the link drops](https://docs.fleetless.dev/concepts/exposure/#when-the-link-drops)**
-  and **[link pressure](https://docs.fleetless.dev/concepts/exposure/#link-pressure)** —
-  what the bridge does when the network does not cooperate.
+  and **[low-bandwidth mode](https://docs.fleetless.dev/reference/fleetless-yaml/low-bandwidth/)** —
+  what the bridge does when the network does not cooperate, and what it
+  stops doing so the rest keeps arriving.
 
 Questions: hello@fleetless.dev.
 

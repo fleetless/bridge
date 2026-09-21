@@ -62,4 +62,26 @@ def test_with_no_live_traffic_at_all_backfill_still_drains_eventually():
         return await session.recv_datapoint()
 
     payload = _run_one_exchange(send_and_recv, ros=fake_ros)
-    assert payload == {"type": "datapoint", "slug": "old", "value": 1, "timestamp_ms": 1}
+    assert payload == {
+        "type": "datapoint", "slug": "old", "value": 1, "timestamp_ms": 1,
+        "backfill": True,
+    }
+
+
+def test_a_backfill_datapoint_says_so_and_a_live_one_does_not():
+    """The cloud measures its datapoint lag from what arrives live, so a
+    replay of an hour-old buffer must not read as an hour of lag. The flag
+    is the only thing that tells the two apart on the wire — the timestamp
+    cannot, because a genuinely late live sample looks identical."""
+    fake_ros = FakeRos()
+
+    async def send_and_recv(session):
+        loop = asyncio.get_event_loop()
+        fake_ros.backlog.configure("old", True, 10)
+        fake_ros.backlog.push("old", Sample(slug="old", value=1, timestamp_ms=1))
+        fake_ros.samples.put_threadsafe(loop, Sample(slug="new", value=2, timestamp_ms=2))
+        return await session.recv_datapoint(), await session.recv_datapoint()
+
+    live, replayed = _run_one_exchange(send_and_recv, ros=fake_ros)
+    assert live["slug"] == "new" and "backfill" not in live
+    assert replayed["slug"] == "old" and replayed["backfill"] is True

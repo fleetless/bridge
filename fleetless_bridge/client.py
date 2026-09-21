@@ -67,7 +67,7 @@ from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 
-from fleetless_bridge import __version__, sampling
+from fleetless_bridge import __version__
 from fleetless_bridge.camera import SNAPSHOT_MAX_BYTES
 from fleetless_bridge.config import BridgeConfig
 from fleetless_bridge.protocol import (
@@ -79,6 +79,7 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_KIND_SERVICE,
     CLOSE_CODE_ROBOT_DELETED,
     CLOSE_CODE_SUPERSEDED,
+    CLOSE_CODE_TOKEN_ROTATED,
     PROTOCOL_VERSION,
     VERSION_REFUSED_CODE,
     ApplyError,
@@ -1118,7 +1119,14 @@ class _BackfillSource:
         sample = self._ros.backlog.pop_any()
         if sample is None:
             return None
-        return datapoint_message(sample.slug, sample.value, sample.timestamp_ms)
+        # `backfill=True` is this tier's whole distinguishing fact on the
+        # wire: the cloud measures its datapoint lag from what arrives
+        # live, and a replayed buffer carries capture timestamps from
+        # before the outage. Without the flag a reconnect after an hour
+        # offline reads as an hour of lag — on a link that is fine.
+        return datapoint_message(
+            sample.slug, sample.value, sample.timestamp_ms, backfill=True
+        )
 
     def on_sent(self, payload) -> None:
         pass
@@ -1849,6 +1857,15 @@ class BridgeClient:
             log.error(
                 "This robot was deleted from the Fleetless console. Stopping "
                 "— it will not reconnect."
+            )
+            return StopReason.REJECTED
+        if code == CLOSE_CODE_TOKEN_ROTATED:
+            # Its own sentence, not the deleted one: the robot still
+            # exists and there is something the operator can do, which is
+            # the whole reason the cloud spends a second close code on it.
+            log.error(
+                "The robot's token was rotated in the console; start the "
+                "bridge with the new token."
             )
             return StopReason.REJECTED
         log.info("The cloud closed the connection (code %s)", code)

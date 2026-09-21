@@ -3,6 +3,19 @@ ros-@ROS_DISTRO@-fleetless-bridge (4.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgenc
   * **Protocol 3.** The uplink budget, the `/fleetless/uplink_kbps` override
     topic and the `bridge_pressure` datapoint are gone; a cloud speaking
     protocol 2 will refuse this package, and this package will refuse it.
+  * **No upload size cap of the bridge's own.** A robot's assets are charged
+    against a one-gigabyte store the cloud alone can evaluate — it knows what
+    the robot's other files already occupy and this process does not. So every
+    mesh and texture is attempted, and an upload the store has no room for is
+    reported as `refused`, carrying the cloud's own three numbers. Nothing is
+    read into memory to find this out: the upload streams, as it already did.
+  * **A backfilled datapoint says so.** A sample replayed after a
+    disconnect carries `backfill`, so an hour of buffered history arriving at
+    once no longer reads to the cloud as an hour of lag on a link that is fine.
+  * **A rotated token stops the bridge instead of reconnecting forever.** The
+    cloud closes the socket with its own code when a token is rotated in the
+    console; the log says to start the bridge with the new one, and the exit
+    code is 2, so the launch file does not respawn into the same wall.
 
  -- Andre Dehne <andre@dehne-robotik.de>  Mon, 21 Sep 2026 18:00:00 +0200
 

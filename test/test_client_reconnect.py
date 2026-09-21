@@ -15,7 +15,11 @@ from fake_cloud import (
 )
 from fleetless_bridge.client import BridgeClient, ExponentialBackoff, StopReason
 from fleetless_bridge.config import BridgeConfig
-from fleetless_bridge.protocol import CLOSE_CODE_ROBOT_DELETED, CLOSE_CODE_SUPERSEDED
+from fleetless_bridge.protocol import (
+    CLOSE_CODE_ROBOT_DELETED,
+    CLOSE_CODE_SUPERSEDED,
+    CLOSE_CODE_TOKEN_ROTATED,
+)
 from helpers import RecordingSleep, make_client, run_until
 
 
@@ -155,6 +159,32 @@ def test_a_deleted_robot_stops_the_bridge_and_does_not_reconnect():
     # A token valid a second ago looks identical to a revoked one unless the
     # cloud says which — without this, a deleted robot reconnects forever
     # against one that never comes back.
+    assert reason is StopReason.REJECTED
+    assert connections == 1
+
+
+def test_the_token_rotated_close_code_is_the_one_the_cloud_sends():
+    # Frozen with the cloud: 4005, and its own code rather than 4004 —
+    # a rotated token and a deleted robot need different sentences on the
+    # robot's own logs, because only one of them has a fix the operator
+    # can carry out.
+    assert CLOSE_CODE_TOKEN_ROTATED == 4005
+
+
+def test_a_rotated_token_stops_the_bridge_and_does_not_reconnect():
+    """The console handed out a new token and closed this socket. The one
+    in this process will be refused from now on, so reconnecting is a loop
+    with no exit — the fix is a restart with the new token, which is a
+    person's job, and exit 2 is how the launch file is told not to
+    respawn into the same wall."""
+
+    async def scenario():
+        async with FakeCloud(accepts_then_closes(4005)) as cloud:
+            client = make_client(cloud)
+            reason = await asyncio.wait_for(client.run(), timeout=10)
+            return reason, cloud.connections
+
+    reason, connections = asyncio.run(scenario())
     assert reason is StopReason.REJECTED
     assert connections == 1
 

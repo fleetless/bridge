@@ -67,6 +67,7 @@ from fleetless_bridge.ros_runtime import (
     CameraStateQueue,
     CameraStateUpdate,
     RosRuntime,
+    UploadResult,
 )
 from schemas import validate_frame
 
@@ -4878,10 +4879,20 @@ class _AssetUploadHandler(http.server.BaseHTTPRequestHandler):
             "body": body,
         }
         self.server.received.append(record)
-        status = self.server.status_for(record)
+        answer = self.server.status_for(record)
+        # A plain status, or `(status, body)` for a refusal that has
+        # something to say — the cloud's store refusal carries its three
+        # numbers in the body, and a test of that cannot state them in a
+        # status code.
+        status, body = answer if isinstance(answer, tuple) else (answer, None)
         self.send_response(status)
+        if body is not None:
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        if status < 300:
+        if body is not None:
+            self.wfile.write(body)
+        elif status < 300:
             self.wfile.write(b'{"id": "fake-asset-id"}')
 
     def log_message(self, format, *args):  # noqa: A002 - stdlib's own signature
@@ -5115,27 +5126,31 @@ def test_sync_assets_applies_the_same_containment_check_to_a_texture():
     assert not any(b"root:" in r["body"] for r in received)
 
 
-# --- a size ceiling checked before a byte is read --
+# --- no ceiling of the bridge's own ---
 #
-# On a real robot, `base.dae` at 193,886,766 bytes — 2.9x the ceiling —
-# produced no `413`, no log line and no progress, because
-# `_upload_mesh_file`'s `handle.read()` buffered the whole file before the
-# cloud ever got a chance to refuse it. `ASSET_UPLOAD_MAX_BYTES` is patched
-# down to a few hundred bytes here rather than using a real oversized
-# fixture — the point under test is the *comparison*, not the number, and a
-# real multi-hundred-MB file has no business living in this package's fixtures.
+# There was one until the per-robot store replaced it: the bridge stated
+# every file and refused anything over `ASSET_UPLOAD_MAX_BYTES` before
+# `open()`. That constant is gone from the contracts, and a robot's assets
+# are now charged against a 1 GB store the cloud alone can see — it knows
+# what the other files already cost, and this process does not. So the
+# bridge attempts every file and reports what comes back.
 
 
-def test_an_oversized_mesh_is_refused_before_a_single_byte_is_read():
-    """The core claim: `_upload_mesh_file` — the one function that calls
-    `open()` — is never invoked for a file whose size on disk already
-    exceeds the ceiling. Not "the upload failed", which a mock could satisfy
-    by other means: this asserts the read itself never happened."""
-    with mock.patch("fleetless_bridge.ros_runtime.ASSET_UPLOAD_MAX_BYTES", 100):
+def test_a_mesh_far_over_the_old_ceiling_is_uploaded_rather_than_refused():
+    """The inverse of the check that used to live here. The old ceiling was
+    67,108,864 bytes; this states the mesh at nearly three times that — the
+    size of the real `base.dae` that started the whole story — and the
+    upload must still be attempted, with nothing in `failed`.
+
+    The size is mocked rather than written: the claim is about the
+    comparison that no longer happens, and a 194 MB fixture has no business
+    in this package. `_upload_mesh_file` is mocked with it, so the lied-about
+    size never reaches a real `Content-Length`."""
+    with mock.patch.object(
+        RosRuntime, "_file_size_or_none", return_value=193_886_766
+    ):
         with mock.patch.object(
-            RosRuntime, "_upload_mesh_file", side_effect=AssertionError(
-                "_upload_mesh_file must not be called for an over-ceiling file"
-            )
+            RosRuntime, "_upload_mesh_file", return_value=UploadResult(True)
         ) as upload_mock:
 
             async def body(rt):
@@ -5149,132 +5164,138 @@ def test_an_oversized_mesh_is_refused_before_a_single_byte_is_read():
                     stop()
 
             received, updates = run(body)
-            upload_mock.assert_not_called()
+            upload_mock.assert_called_once()
 
     assert updates[-1].state == "finished"
     assert updates[-1].done == updates[-1].total == 2
-    assert updates[-1].failed == (
-        # The real file's length, not a literal: `example_interfaces`'
-        # package.xml is 953 bytes on humble and 987 on jazzy, so a number
-        # here asserts which ROS distribution the suite is running on rather
-        # than what the size guard reported.
-        (_RESOLVABLE_MESH_URI, "too_large",
-         {"limit_bytes": 100, "size_bytes": len(_RESOLVABLE_MESH_BYTES)}),
-    )
-    # Only the URDF itself reached the wire — the mesh was refused locally,
-    # never attempted over HTTP at all.
-    assert {r["headers"]["X-Fleetless-Asset-Name"] for r in received} == {URDF_ASSET_NAME}
+    assert updates[-1].failed == ()
 
 
-def test_an_oversized_dae_internal_texture_is_refused_the_same_way():
-    """The upload path (a `.dae`-internal texture, uploaded through the
-    same `_upload_mesh_file`) gets the identical pre-read check — real
-    temp files on disk (a tiny `.dae`, an over-ceiling "texture"), only
-    `_resolve_package_uri` and `_extract_dae_texture_references` mocked, so
-    the size comparison itself runs unmocked, against real `os.path.
-    getsize` results, the same as production. Proven with the mesh itself
-    left under the ceiling so only the internal texture's own size drives
-    the outcome, and the sync still completes with the mesh delivered."""
-    dae_uri = "package://robot_description_fixture/base.dae"
-    texture_uri = "package://robot_description_fixture/huge_texture.png"
-    urdf = """<?xml version="1.0"?>
-<robot name="test_robot">
-  <link name="base_link">
-    <visual><geometry><mesh filename="{}"/></geometry></visual>
-  </link>
-</robot>""".format(dae_uri)
-
-    with tempfile.NamedTemporaryFile(suffix=".dae") as dae_file, \
-         tempfile.NamedTemporaryFile(suffix=".png") as texture_file:
-        dae_file.write(b"x" * 10)  # well under the 100-byte test ceiling
-        dae_file.flush()
-        texture_file.write(b"x" * 200)  # well over it
-        texture_file.flush()
-
-        def fake_resolve(uri):
-            return dae_file.name if uri == dae_uri else None
-
-        async def body(rt):
-            await _publish_urdf_and_wait(rt, text=urdf)
-            server, url, stop = _start_asset_upload_server()
-            try:
-                with mock.patch(
-                    "fleetless_bridge.ros_runtime.ASSET_UPLOAD_MAX_BYTES", 100
-                ), mock.patch.object(
-                    RosRuntime, "_resolve_package_uri", side_effect=fake_resolve
-                ), mock.patch.object(
-                    RosRuntime, "_extract_dae_texture_references",
-                    return_value=[(texture_uri, texture_file.name)],
-                ):
-                    await rt.sync_assets("sync-1", url, "upload-tok", (dae_uri,))
-                    updates = await _drain_asset_progress_until(rt, {"finished"})
-                return server.received, updates
-            finally:
-                stop()
-
-        received, updates = run(body)
-
-    assert updates[-1].state == "finished"
-    assert updates[-1].failed == (
-        (texture_uri, "too_large", {"limit_bytes": 100, "size_bytes": 200}),
-    )
-    # The mesh itself uploaded fine — only its internal texture reference
-    # was over the ceiling.
-    assert {r["headers"]["X-Fleetless-Asset-Name"] for r in received} == {URDF_ASSET_NAME, dae_uri}
-
-
-def test_an_oversized_dae_never_has_its_internal_references_scanned():
-    """The defect real bytes exposed: `_extract_dae_texture_references`
-    used to run unconditionally on every resolved `.dae`, `open()`ing and
-    `.read()`ing the whole file to search for `<init_from>` tags, *before* the
-    ceiling check in the
-    upload loop ever ran. A 194 MB `.dae` therefore still landed fully in
-    memory even after the upload path was closed, one function earlier
-    than before. Proven the same way as the top-level-mesh case:
-    `_extract_dae_texture_references` must never be called at all for an
-    over-ceiling `.dae`, and the sync
-    reports exactly one `too_large` entry for it — not two, and not a
-    second entry inventing a fact about internal references this sync
-    never examined."""
-    dae_uri = "package://robot_description_fixture/huge.dae"
+def test_a_dae_over_the_old_ceiling_still_has_its_references_scanned():
+    """The other half: `_extract_dae_texture_references` used to be skipped
+    for an over-ceiling `.dae`, because reading it was the expensive thing
+    the ceiling existed to prevent. With no ceiling there is nothing to
+    skip on, and a large `.dae` whose textures went unscanned would sync a
+    mesh the cloud then cannot render."""
+    dae_uri = "package://robot_description_fixture/big.dae"
     with tempfile.NamedTemporaryFile(suffix=".dae") as dae_file:
-        dae_file.write(b"x" * 200)  # over the 100-byte test ceiling below
+        dae_file.write(b"x" * 200)
         dae_file.flush()
 
-        with mock.patch("fleetless_bridge.ros_runtime.ASSET_UPLOAD_MAX_BYTES", 100):
+        with mock.patch.object(
+            RosRuntime, "_file_size_or_none", return_value=193_886_766
+        ):
             with mock.patch.object(
-                RosRuntime, "_extract_dae_texture_references", side_effect=AssertionError(
-                    "_extract_dae_texture_references must not be called for an over-ceiling .dae"
-                )
+                RosRuntime, "_extract_dae_texture_references", return_value=[]
             ) as extract_mock:
+                with mock.patch.object(
+                    RosRuntime, "_upload_mesh_file", return_value=UploadResult(True)
+                ):
 
-                async def body(rt):
-                    await _publish_urdf_and_wait(rt)
-                    server, url, stop = _start_asset_upload_server()
-                    try:
-                        with mock.patch.object(
-                            RosRuntime, "_resolve_package_uri", return_value=dae_file.name,
-                        ):
-                            await rt.sync_assets("sync-1", url, "upload-tok", (dae_uri,))
-                            updates = await _drain_asset_progress_until(rt, {"finished"})
-                        return server.received, updates
-                    finally:
-                        stop()
+                    async def body(rt):
+                        await _publish_urdf_and_wait(rt)
+                        server, url, stop = _start_asset_upload_server()
+                        try:
+                            with mock.patch.object(
+                                RosRuntime, "_resolve_package_uri", return_value=dae_file.name,
+                            ):
+                                await rt.sync_assets("sync-1", url, "upload-tok", (dae_uri,))
+                                updates = await _drain_asset_progress_until(rt, {"finished"})
+                            return updates
+                        finally:
+                            stop()
 
-                received, updates = run(body)
-                extract_mock.assert_not_called()
+                    updates = run(body)
+                    extract_mock.assert_called_once()
 
     assert updates[-1].state == "finished"
+    assert updates[-1].failed == ()
+
+
+# --- the cloud refuses: the store's three numbers survive the frame ---
+
+
+_STORE_REFUSAL_BODY = json.dumps({
+    "code": "quota_exceeded",
+    "message": "the robot's asset store is full",
+    "details": {
+        "store_bytes": 1_000_000_000,
+        "used_bytes": 999_999_000,
+        "size_bytes": 193_886_766,
+    },
+}).encode("utf-8")
+
+
+def test_a_store_refusal_becomes_a_refused_entry_carrying_the_three_numbers():
+    """The bridge cannot compute any of these — it does not know what the
+    robot's other assets cost — so it passes the cloud's own answer
+    through untouched. A `refused` entry with no numbers beside it would
+    leave a developer unable to tell a full store from a producer that
+    declined, which is the distinction the details exist to draw.
+
+    The URDF still uploads and the sync still reaches `finished`: one
+    refused mesh is not a failed sync, and stopping would lose the meshes
+    that do fit."""
+
+    def status_for(record):
+        if record["headers"]["X-Fleetless-Asset-Name"] == URDF_ASSET_NAME:
+            return 201
+        return 409, _STORE_REFUSAL_BODY
+
+    async def body(rt):
+        await _publish_urdf_and_wait(rt)
+        server, url, stop = _start_asset_upload_server()
+        server.status_for = status_for
+        try:
+            await rt.sync_assets("sync-1", url, "upload-tok", (_RESOLVABLE_MESH_URI,))
+            updates = await _drain_asset_progress_until(rt, {"finished"})
+            return server.received, updates
+        finally:
+            stop()
+
+    received, updates = run(body)
+    assert updates[-1].state == "finished"
     assert updates[-1].failed == (
-        (dae_uri, "too_large", {"limit_bytes": 100, "size_bytes": 200}),
+        (_RESOLVABLE_MESH_URI, "refused", {
+            "store_bytes": 1_000_000_000,
+            "used_bytes": 999_999_000,
+            "size_bytes": 193_886_766,
+        }),
     )
-    # Exactly one wire entry for this URI — no second, invented entry about
-    # internal references that were never scanned.
-    assert len(updates[-1].failed) == 1
-    assert {r["headers"]["X-Fleetless-Asset-Name"] for r in received} == {URDF_ASSET_NAME}
+    # It was attempted, unlike under the old ceiling: both names reached
+    # the wire, and only the cloud decided which one it had room for.
+    assert {r["headers"]["X-Fleetless-Asset-Name"] for r in received} == {
+        URDF_ASSET_NAME, _RESOLVABLE_MESH_URI,
+    }
 
 
-# --- a mesh under the ceiling is streamed, not buffered whole ---
+def test_a_refusal_the_bridge_cannot_read_is_still_a_refusal():
+    """A 409 whose body is not the shape this bridge expects — an older
+    cloud, a proxy's own error page — still means "never stored", which is
+    `refused`. Inventing numbers to fill `details` would be worse than
+    admitting there are none, and the contract allows a bare `refused`
+    for exactly the case where no store number describes it."""
+
+    def status_for(record):
+        if record["headers"]["X-Fleetless-Asset-Name"] == URDF_ASSET_NAME:
+            return 201
+        return 409, b"<html>nope</html>"
+
+    async def body(rt):
+        await _publish_urdf_and_wait(rt)
+        server, url, stop = _start_asset_upload_server()
+        server.status_for = status_for
+        try:
+            await rt.sync_assets("sync-1", url, "upload-tok", (_RESOLVABLE_MESH_URI,))
+            return await _drain_asset_progress_until(rt, {"finished"})
+        finally:
+            stop()
+
+    updates = run(body)
+    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None),)
+
+
+# --- a mesh is streamed, not buffered whole ---
 #
 # A 60 MB file read whole into memory before upload cost 76.8 MB of peak
 # RSS; handed to urllib as a file object with an explicit Content-Length,
@@ -5284,7 +5305,7 @@ def test_an_oversized_dae_never_has_its_internal_references_scanned():
 # container on every run.
 
 
-def test_an_under_ceiling_mesh_is_streamed_in_chunks_not_one_read():
+def test_a_mesh_is_streamed_in_chunks_not_one_read():
     """Wraps the real file `_upload_asset_stream` opens (not a fake) so its
     `read()` calls are recorded, then asserts none of them asked for
     anywhere near the whole file — proving `http.client`'s own chunked
@@ -5445,11 +5466,11 @@ def test_a_connection_failure_is_not_retried_as_a_rate_limit():
         "fleetless_bridge.ros_runtime.urllib.request.urlopen",
         side_effect=urllib.error.URLError("connection refused"),
     ) as mocked:
-        ok = RosRuntime._upload_asset_bytes(
+        result = RosRuntime._upload_asset_bytes(
             "http://127.0.0.1:1/api/bridge/assets", "tok", "sync-1", "mesh",
             _RESOLVABLE_MESH_URI, "application/octet-stream", b"data",
         )
-    assert ok is False
+    assert result.ok is False
     assert mocked.call_count == 1  # exactly one attempt — no retry on this path
 
 
@@ -5465,13 +5486,13 @@ def test_upload_asset_bytes_sends_both_headers_and_a_cjk_name_now_succeeds():
     def body():
         server, url, stop = _start_asset_upload_server()
         try:
-            ok = RosRuntime._upload_asset_bytes(url, "tok", "sync-1", "texture", name, "image/png", b"data")
-            return ok, server.received
+            result = RosRuntime._upload_asset_bytes(url, "tok", "sync-1", "texture", name, "image/png", b"data")
+            return result, server.received
         finally:
             stop()
 
-    ok, received = body()
-    assert ok is True
+    result, received = body()
+    assert result.ok is True
     assert len(received) == 1
     record = received[0]
 
@@ -5502,13 +5523,13 @@ def test_upload_asset_bytes_sends_the_original_name_verbatim_when_it_is_latin1_s
     def body():
         server, url, stop = _start_asset_upload_server()
         try:
-            ok = RosRuntime._upload_asset_bytes(url, "tok", "sync-1", "texture", name, "image/png", b"data")
-            return ok, server.received
+            result = RosRuntime._upload_asset_bytes(url, "tok", "sync-1", "texture", name, "image/png", b"data")
+            return result, server.received
         finally:
             stop()
 
-    ok, received = body()
-    assert ok is True
+    result, received = body()
+    assert result.ok is True
     record = received[0]
     assert record["headers"]["X-Fleetless-Asset-Name-Raw"] == name
     assert record["headers"]["X-Fleetless-Asset-Name"] == name
@@ -5526,11 +5547,11 @@ def test_upload_asset_bytes_unicode_error_guard_still_returns_false_not_raise():
         "fleetless_bridge.ros_runtime.urllib.request.urlopen",
         side_effect=UnicodeEncodeError("latin-1", "x", 0, 1, "ordinal not in range(256)"),
     ) as mocked:
-        ok = RosRuntime._upload_asset_bytes(
+        result = RosRuntime._upload_asset_bytes(
             "http://127.0.0.1:1/api/bridge/assets", "tok", "sync-1", "texture",
             "textures/skin.png", "image/png", b"data",
         )
-    assert ok is False
+    assert result.ok is False
     assert mocked.call_count == 1  # not retried — the same name fails the same way every time
 
 
