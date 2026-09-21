@@ -150,14 +150,19 @@ class LinkMode:
         self._dwell = DwellTracker()
         self._over_since: Optional[float] = None
         self._calm_since: Optional[float] = None
-        self._last_reason = "lag"
+        # Not `lag`: nothing has entered on lag yet, and a mode forced on
+        # from construction is on because somebody said so.
+        self._last_reason = "forced" if self.active else "recovered"
 
     @property
     def reason(self) -> str:
-        """Which measure the mode is on for, for a caller holding no
-        transition — the report after a reconnect into a mode that was
-        already on. `lag` or `dwell`; it says nothing while `active` is
-        False, and a forced mode names itself."""
+        """Why the mode is what it is, for a caller holding no transition —
+        the report after a reconnect into a mode that was already on.
+
+        `lag` or `dwell` once one of the two entered it, `forced` while it is
+        on because the settings said so — including after `on` -> `auto`,
+        where the mode stays on and nothing has entered it — and `recovered`
+        before anything has happened at all."""
         return self._last_reason
 
     def update_settings(self, settings: LowBandwidthSettings, now: float) -> Optional[Transition]:
@@ -167,9 +172,11 @@ class LinkMode:
         self._over_since = self._calm_since = None
         if settings.mode == "on" and not self.active:
             self.active = True
+            self._last_reason = "forced"
             return Transition(True, "forced")
         if settings.mode == "off" and self.active:
             self.active = False
+            self._last_reason = "forced"
             return Transition(False, "forced")
         return None
 

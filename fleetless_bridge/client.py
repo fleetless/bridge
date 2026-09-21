@@ -1290,12 +1290,12 @@ class BridgeClient:
         # the link, and a reconnect does not make a narrow uplink wide.
         self._link_mode = LinkMode(self._lb_settings, self._now())
         self._link_mode_task: Optional["asyncio.Task"] = None
-        # The last two readings handed to the controller, kept here only so
-        # a transition can be logged with the numbers that caused it. The
-        # controller decides on a window and a p95 and keeps neither, and
-        # asking it to would be asking it to carry state for a log line.
+        # The last lag the cloud reported, kept here only so a transition can
+        # be logged with the number that caused it. The controller treats a
+        # ping reading as a level and does not keep it, and asking it to would
+        # be asking it to carry state for a log line. There is deliberately no
+        # counterpart for the dwell — see `_log_transition`.
         self._last_lag_ms: Optional[int] = None
-        self._last_dwell_ms: Optional[float] = None
         # When this session opened, in the same wall clock a sample's
         # `timestamp_ms` uses — see `_observe_dwell`. Set here too, not only
         # per session, so the attribute exists before the first connection.
@@ -1449,25 +1449,29 @@ class BridgeClient:
         the threshold they crossed, and what the robot is now doing about
         it. A `forced` transition names no reading, because none was
         consulted."""
+        # The lag and the threshold, and deliberately not the queue dwell.
+        # The dwell that decides anything is a p95 over five seconds, which
+        # the controller keeps to itself; printing the last raw sample beside
+        # a threshold would read as the number that crossed it, and one slow
+        # send is exactly what the p95 exists to ignore. `reason` already
+        # says when the dwell was the measure that entered the mode.
         if transition.low_bandwidth:
             log.info(
-                "Low-bandwidth mode on (%s): lag %s, queue dwell %s, against "
-                "%d ms. Datapoints are capped to %g Hz, live video is set to "
-                "%s and backfill waits.",
+                "Low-bandwidth mode on (%s): lag %s against %d ms. Datapoints "
+                "are capped to %g Hz, live video is set to %s and backfill "
+                "waits.",
                 transition.reason,
                 _ms(self._last_lag_ms),
-                _ms(self._last_dwell_ms),
                 self._lb_settings.enter_lag_ms,
                 self._lb_settings.datapoint_max_hz,
                 self._lb_settings.camera,
             )
         else:
             log.info(
-                "Low-bandwidth mode off (%s): lag %s, queue dwell %s, against "
-                "%d ms. Configured rates, live video and backfill are back.",
+                "Low-bandwidth mode off (%s): lag %s against %d ms. Configured "
+                "rates, live video and backfill are back.",
                 transition.reason,
                 _ms(self._last_lag_ms),
-                _ms(self._last_dwell_ms),
                 self._lb_settings.exit_lag_ms,
             )
 
@@ -1504,9 +1508,9 @@ class BridgeClient:
         mode."""
         if captured_ms < self._session_started_ms:
             return
-        dwell_ms = capture_timestamp_ms() - captured_ms
-        self._last_dwell_ms = dwell_ms
-        self._link_mode.observe_dwell(dwell_ms, self._now())
+        self._link_mode.observe_dwell(
+            capture_timestamp_ms() - captured_ms, self._now()
+        )
 
     async def _start_link_mode(self) -> None:
         """At `hello_ok`: read the parameter layer, state the mode once, start

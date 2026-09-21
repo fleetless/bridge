@@ -255,6 +255,18 @@ def test_reason_names_the_measure_that_entered_the_mode():
     assert dwelling.reason == "dwell"
 
 
+def test_reason_starts_from_no_transition_and_a_forced_mode_names_itself():
+    """`lag` as the starting value is a claim nothing has made yet, and it
+    survives `on` -> `auto`: the mode is then on because somebody forced it,
+    not because the link was slow, and the greeting after a reconnect would
+    have told the cloud otherwise."""
+    assert LinkMode(DEFAULTS, now=0.0).reason == "recovered"
+    forced = LinkMode(LowBandwidthSettings.resolve({"mode": "on"}, {}), now=0.0)
+    assert forced.reason == "forced"
+    forced.update_settings(DEFAULTS, now=1.0)
+    assert forced.active and forced.reason == "forced"
+
+
 def test_a_settings_change_within_auto_reports_nothing():
     m = LinkMode(DEFAULTS, now=0.0)
     tighter = LowBandwidthSettings.resolve({"enter_lag_ms": 300, "exit_lag_ms": 100}, {})

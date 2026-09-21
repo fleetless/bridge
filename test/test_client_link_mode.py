@@ -622,6 +622,10 @@ def test_the_transition_log_line_carries_the_numbers_that_caused_it():
     assert len(on) == 1
     # The reading the cloud sent, and the threshold it crossed.
     assert "5000 ms" in on[0] and "2000 ms" in on[0]
+    # Not the raw dwell sample. The decision is made on a p95 over five
+    # seconds, and one sample beside a threshold reads as the number that
+    # crossed it.
+    assert "dwell" not in on[0]
 
 
 def test_the_greeting_after_a_reconnect_names_the_measure_that_entered_the_mode():
