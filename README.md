@@ -119,8 +119,8 @@ forever. Everything else is retried with a jittered exponential backoff from
   documentation, from first connection to the API your app calls.
 - **[fleetless.yaml](https://docs.fleetless.dev/reference/fleetless-yaml/)**
   — every section of the exposure document.
-- **[Disconnect behaviour](https://docs.fleetless.dev/concepts/disconnect/)**
-  and **[link pressure](https://docs.fleetless.dev/concepts/pressure/)** —
+- **[When the link drops](https://docs.fleetless.dev/concepts/exposure/#when-the-link-drops)**
+  and **[link pressure](https://docs.fleetless.dev/concepts/exposure/#link-pressure)** —
   what the bridge does when the network does not cooperate.
 
 Questions: hello@fleetless.dev.
