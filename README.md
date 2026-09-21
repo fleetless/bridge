@@ -65,15 +65,8 @@ the console decides what it exposes; the bridge only follows.
 |---|---|---|---|
 | `FLEETLESS_TOKEN` | yes | — | The robot's token, created once in the console. It binds this bridge to exactly one robot. |
 | `FLEETLESS_CLOUD_URL` | no | `wss://api.fleetless.dev/bridge` | The cloud endpoint. |
-| `FLEETLESS_UPLINK_KBPS` | no | — | The robot's total uplink budget in kbps. Unset means live video is admitted without a bandwidth check. |
-| `FLEETLESS_UPLINK_RESERVE_PCT` | no | `20` | Percentage of the budget held back for the control socket, so telemetry and commands are never crowded out by video. |
-| `FLEETLESS_UPLINK_RESERVE_MIN_KBPS` | no | `128` | Absolute floor for that reserve, because a percentage shrinks with the budget, and a small budget is when the control channel needs protecting most. |
 
-Set them in the launch file or in the environment. Live video may use what is
-left after the reserve, and a camera start that would exceed it is refused
-with a `camera_state` naming `uplink_budget` rather than left to fight for
-bandwidth. The budget can also be changed while the bridge runs by publishing
-a `std_msgs/msg/UInt32` on `/fleetless/uplink_kbps`; `0` stops every stream.
+Set them in the launch file or in the environment.
 
 ## 📄 What the robot exposes
 

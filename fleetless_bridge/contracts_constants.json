@@ -1,15 +1,20 @@
 {
   "AUDIT_RETENTION_DAYS": 90,
-  "PROTOCOL_VERSION": 2,
+  "PROTOCOL_VERSION": 3,
   "PROTOCOL_VERSIONS": [
     {
       "version": 2,
       "bridge_from": "3.0.0",
+      "deprecated_at": "2026-09-21"
+    },
+    {
+      "version": 3,
+      "bridge_from": "4.0.0",
       "deprecated_at": null
     }
   ],
   "PROTOCOL_SUNSET_DAYS": 90,
-  "LATEST_BRIDGE_VERSION": "3.2.0",
+  "LATEST_BRIDGE_VERSION": "4.0.0",
   "ASSET_UPLOAD_HEADERS": {
     "kind": "x-fleetless-asset-kind",
     "name": "x-fleetless-asset-name",
@@ -30,5 +35,15 @@
     "mesh",
     "texture",
     "other"
-  ]
+  ],
+  "LOW_BANDWIDTH_DEFAULTS": {
+    "mode": "auto",
+    "enter_lag_ms": 2000,
+    "enter_after_s": 10,
+    "exit_lag_ms": 500,
+    "exit_after_s": 60,
+    "datapoint_max_hz": 1,
+    "camera": "reduce",
+    "camera_bitrate_kbps": 300
+  }
 }

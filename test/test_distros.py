@@ -305,6 +305,9 @@ INSTALLED_DISTRO_EXEMPTIONS = {
         "explains why the test dependency changed, which is a fact about Lyrical",
     ("fleetless_bridge/client.py", "OLDEST distribution this one source is built for"):
         "names Humble as the oldest supported interpreter and says what the newer two do",
+    ("fleetless_bridge/client.py", "bpo-37658"):
+        "names the interpreter whose asyncio drops the cancellation, and says which "
+        "version fixed it -- the newer two are past it, which is the point",
     ("fleetless_bridge/ros_runtime.py", "established against Humble's rclpy 3"):
         "names the distribution the executor race was observed in, and says the newer "
         "two carry no such observation",

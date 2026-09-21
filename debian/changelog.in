@@ -1,3 +1,11 @@
+ros-@ROS_DISTRO@-fleetless-bridge (4.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * **Protocol 3.** The uplink budget, the `/fleetless/uplink_kbps` override
+    topic and the `bridge_pressure` datapoint are gone; a cloud speaking
+    protocol 2 will refuse this package, and this package will refuse it.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Mon, 21 Sep 2026 18:00:00 +0200
+
 ros-@ROS_DISTRO@-fleetless-bridge (3.2.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * **The protocol version comes from the vendored contracts now**, together

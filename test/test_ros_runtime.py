@@ -3400,8 +3400,8 @@ def test_a_camera_throttles_incoming_frames_to_its_configured_fps():
 
 # --- snapshots: the pulled binary frame -------------------------
 #
-# Pulled, not queued, since the pressure work: snapshots are pulled and
-# fitted rather than queued and dropped, so `SnapshotQueue` and the
+# Pulled, not queued, since the prioritized writer: snapshots are pulled
+# and fitted rather than queued and dropped, so `SnapshotQueue` and the
 # watchdog's encode-and-push are gone, and `next_snapshot(max_bytes)` runs
 # the same dueness walk on demand, with the byte budget the caller can
 # actually afford. Every claim below is the one the watchdog version made;

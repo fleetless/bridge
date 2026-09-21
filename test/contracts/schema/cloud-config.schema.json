@@ -117,6 +117,11 @@
                   0.5
                 ]
               },
+              "low_bandwidth": {
+                "description": "`keep` exempts this datapoint from the low-bandwidth rate cap; its backfill still pauses.",
+                "type": "string",
+                "const": "keep"
+              },
               "description": {
                 "description": "Prose about what this value is, for whoever meets it in the console. It changes nothing the robot does, so a publish that touches only it pushes no configuration at all — but it is carried verbatim into `robot_describe`, where a model that has never seen this robot reads it. The datapoint is offered whenever the role grants it; without one it is offered with `description: null` and the model has less to go on, as for actions, services, publishers and cameras. Omission is the only way to say nothing; an empty string is refused, here and on all five.",
                 "examples": [
@@ -437,7 +442,7 @@
               }
             ]
           },
-          "description": "Values the robot publishes, each one field of one topic or a whole topic, and **never several topics**. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "description": "Values the robot publishes, each one field of one topic or a whole topic, and **never several topics**. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a datapoint",
@@ -685,7 +690,7 @@
               }
             ]
           },
-          "description": "Things the robot does on request that take time, each reported as a job with progress. **At most one job runs per action slug**: a second call is refused `busy`, and every observer of that slug watches the same job. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "description": "Things the robot does on request that take time, each reported as a job with progress. **At most one job runs per action slug**: a second call is refused `busy`, and every observer of that slug watches the same job. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "an action",
@@ -906,7 +911,7 @@
               }
             ]
           },
-          "description": "ROS service calls the robot answers — one request, one reply. Unlike an action a service reports **no progress** and the call returns with its result already on the job, so there is nothing left to observe; a second concurrent call is still refused `busy`, exactly as for an action. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "description": "ROS service calls the robot answers — one request, one reply. Unlike an action a service reports **no progress** and the call returns with its result already on the job, so there is nothing left to observe; a second concurrent call is still refused `busy`, exactly as for an action. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a service",
@@ -1214,7 +1219,7 @@
               }
             ]
           },
-          "description": "Topics clients may send to, and where the format's whole safety story lives. The `message` template fixes every value a caller cannot change, and **`failsafe` is required**: once a client falls silent the bridge sends the failsafe message itself, so an operator whose window closed does not leave a robot driving. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "description": "Topics clients may send to, and where the format's whole safety story lives. The `message` template fixes every value a caller cannot change, and **`failsafe` is required**: once a client falls silent the bridge sends the failsafe message itself, so an operator whose window closed does not leave a robot driving. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a publisher, with its parameters and its failsafe",
@@ -1598,7 +1603,7 @@
               }
             ]
           },
-          "description": "Video the robot streams, and the still frames the cloud serves from it. `width`, `height`, `fps` and `bitrate_kbps` are what **the bridge produces before sending**, not what the camera captures — they live in the configuration rather than in a viewer's request precisely so that no viewer can make a robot send more. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state`, `robot_details` and `bridge_pressure` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all four are refused when the document is validated.",
+          "description": "Video the robot streams, and the still frames the cloud serves from it. `width`, `height`, `fps` and `bitrate_kbps` are what **the bridge produces before sending**, not what the camera captures — they live in the configuration rather than in a viewer's request precisely so that no viewer can make a robot send more. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a camera",
@@ -1619,6 +1624,86 @@
               }
             }
           ]
+        },
+        "low_bandwidth": {
+          "description": "Overrides for the bridge's low-bandwidth mode; see the section schema.",
+          "defaultSnippets": [
+            {
+              "label": "low-bandwidth mode, tuned",
+              "description": "Enters after ten seconds above two seconds of lag, caps every datapoint to 1 Hz and lets running streams continue at a reduced bitrate.",
+              "body": {
+                "enter_lag_ms": 2000,
+                "datapoint_max_hz": 1,
+                "camera": "reduce"
+              }
+            }
+          ],
+          "type": "object",
+          "properties": {
+            "mode": {
+              "description": "`auto` decides from the measured lag; `on` and `off` force the mode, for tests and for an operator who knows the link.",
+              "enumDescriptions": [
+                "The bridge enters and leaves the mode on its own, from the lag the cloud reports and the dwell it measures in its own send queue. The setting to leave alone.",
+                "The mode is held on, whatever the link is doing. For a robot on a link known to be poor, and for a test that would otherwise have to wait for a real one.",
+                "The mode never engages, whatever the link is doing. The robot then sends at its configured rates over a link that cannot carry them, which is a choice and not a default."
+              ],
+              "type": "string",
+              "enum": [
+                "auto",
+                "on",
+                "off"
+              ]
+            },
+            "enter_lag_ms": {
+              "description": "Lag or queue dwell above this enters the mode.",
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 9007199254740991
+            },
+            "enter_after_s": {
+              "description": "The entry condition must hold this long.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "exit_lag_ms": {
+              "description": "Lag and dwell both at or below this leave the mode.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "exit_after_s": {
+              "description": "The exit condition must hold this long.",
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "datapoint_max_hz": {
+              "description": "Ceiling for every datapoint in the mode, unless the datapoint says `low_bandwidth: keep`.",
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 20
+            },
+            "camera": {
+              "description": "What happens to a running stream in the mode. New streams are refused either way.",
+              "enumDescriptions": [
+                "A running stream is re-encoded at `camera_bitrate_kbps` and keeps running. A viewer sees a worse picture rather than none.",
+                "A running stream ends and the viewer is told why. The uplink is then free for datapoints, which is the right trade where video is the nice-to-have."
+              ],
+              "type": "string",
+              "enum": [
+                "reduce",
+                "stop"
+              ]
+            },
+            "camera_bitrate_kbps": {
+              "description": "Bitrate applied to running streams under `reduce`.",
+              "type": "integer",
+              "minimum": 50,
+              "maximum": 20000
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": [

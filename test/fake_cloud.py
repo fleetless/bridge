@@ -182,8 +182,26 @@ class Session:
             {"type": "hello_error", "code": code, "message": message},
         )
 
-    async def ping(self, ts_ms: int) -> None:
-        await self._send("cloud-ping", {"type": "ping", "ts_ms": ts_ms})
+    async def ping(
+        self,
+        ts_ms: int,
+        *,
+        latency_ms: Optional[int] = None,
+        lag_ms: Optional[int] = None,
+    ) -> None:
+        """Both measurements are required on the wire and nullable there, so
+        both keys always go out — `None` is what a real cloud sends before it
+        has a round trip or a datapoint to measure, and a fake that simply
+        omitted them would be testing a frame no cloud sends."""
+        await self._send(
+            "cloud-ping",
+            {
+                "type": "ping",
+                "ts_ms": ts_ms,
+                "latency_ms": latency_ms,
+                "lag_ms": lag_ms,
+            },
+        )
 
     async def send_config(
         self,

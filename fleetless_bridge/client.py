@@ -184,27 +184,6 @@ MAX_SEND_OCCUPANCY_S = 2.0
 # whose whole content is a rate cannot honestly fire before there is one.
 RATE_SAMPLE_MIN_BYTES = 65536
 
-# How often the pressure pump publishes `bridge_pressure` while the session
-# is open: the bridge's own bandwidth-shaping state, on the same reserved-slug
-# path as `bridge_state`.
-PRESSURE_INTERVAL_S = 10.0
-
-# Not in `contracts_constants.json` — `exportedConstants` in contracts'
-# `scripts/export-schemas.ts` carries only the values a non-TypeScript
-# consumer needs to vendor (asset headers, `URDF_ASSET_NAME`), and this slug
-# is not among them. Hand-typed from the wire contracts' own
-# `PRESSURE_SLUG`, under a comment naming it — the exact drift those
-# constants exist to prevent, same as `URDF_ASSET_NAME` and
-# `ASSET_UPLOAD_HEADERS` vendored them.
-#
-# And it drifted, exactly as that comment predicted: 3.0 changed the slug
-# grammar from dash- to underscore-separated, `RESERVED_SLUGS` moved with it
-# (`config.ts`), and this literal did not. Nothing in the bridge noticed
-# until the re-vendored `datapoint-frame` schema started refusing the frame
-# the pump builds — which is the whole reason the outgoing frames are
-# validated against a vendored copy at all.
-PRESSURE_SLUG = "bridge_pressure"
-
 # What a stalled ROS work queue looks like arriving out of the tier-5 pull.
 # `RosRuntime._submit_async` waits on a `concurrent.futures.Future` through
 # `run_in_executor(None, future.result, timeout)`, so a work queue that did
@@ -254,22 +233,6 @@ _TIER_BACKFILL = 4    # datapoint (backfill)
 # Tier 5: pulled via `snapshot_source.next(max_bytes)`, never pushed through
 # `enqueue()` or a `sources` entry — see `PrioritizedWriter.run`.
 _SNAPSHOT_TIER = 5
-
-# Every tier `BridgeClient.pressure_stats()` reports, whether or not
-# anything has used it yet — `PrioritizedWriter.counters()` only mentions a
-# tier once something has touched it (`enqueue`, a send, or `record_drops`),
-# and the console consumer this feeds must never need a null check per
-# field.
-_ALL_TIERS = (
-    _TIER_SESSION, _TIER_OUTCOME, _TIER_TELEMETRY, _TIER_TOOLING,
-    _TIER_BACKFILL, _SNAPSHOT_TIER,
-)
-_ZERO_TIER_COUNTERS = {"sent": 0, "bytes": 0, "drops": 0, "high_water": 0}
-_ZERO_BUDGET_SNAPSHOT = {
-    "uplink_kbps": None, "override_kbps": None,
-    "video_budget_kbps": None, "reserve_kbps": 0,
-}
-_ZERO_VIDEO_STATS = {"active_streams": 0, "bitrate_sum_kbps": 0}
 
 # How often `PrioritizedWriter.run` re-checks for work when idle. This is
 # what makes a due snapshot observable without busy-polling: without a
@@ -609,15 +572,9 @@ class PrioritizedWriter:
         # times a second. Cleared by the first pull that comes back without
         # timing out; see `_run_once`.
         self._pull_stalled = False
-        self._counters: Dict[int, Dict[str, int]] = {}
         # The one tier-5 pull that may be in flight, or `None`. Never
         # awaited inline; see `_run_once`.
         self._pull: Optional["asyncio.Future"] = None
-
-    def _tier_counters(self, tier: int) -> Dict[str, int]:
-        return self._counters.setdefault(
-            tier, {"sent": 0, "bytes": 0, "drops": 0, "high_water": 0}
-        )
 
     def enqueue(self, tier: int, payload) -> None:
         """Pushes onto tier `tier`'s deque and wakes `run()`. For sources
@@ -626,8 +583,6 @@ class PrioritizedWriter:
         this writer owns outright, with nothing upstream to ask again."""
         dq = self._push.setdefault(tier, deque())
         dq.append(payload)
-        counters = self._tier_counters(tier)
-        counters["high_water"] = max(counters["high_water"], len(dq))
         self._wake.set()
 
     def rate_estimate(self) -> Optional[float]:
@@ -661,53 +616,6 @@ class PrioritizedWriter:
         the source itself via `try_next()`; this only shortens the wait."""
         self._wake.set()
 
-    def record_drops(self, tier: int, count: int) -> None:
-        """Folds drops this writer did not itself perform into `tier`'s
-        counter. A pull source's underlying queue is where a drop is
-        actually decided — `CameraStateQueue` coalescing a superseded
-        state is the one this method exists for — and the source reports
-        it here when it is next asked for work, because that is the only
-        moment this class and that queue are in the same place. Without
-        this the counters would show a tier that never drops anything,
-        which is exactly the
-        instrument-that-cannot-fail shape this package keeps closing.
-
-        Not the same number as `SampleQueue.drain_drop_count()`, which is
-        read once per reconnect for its own log line and is deliberately
-        left alone: two readers read-and-resetting one counter would each
-        see a fraction of the truth."""
-        if count:
-            self._tier_counters(tier)["drops"] += count
-
-    def record_high_water(self, tier: int, value: int) -> None:
-        """Folds a *source-side* queue depth into `tier`'s high-water mark
-        — `record_drops`'s precedent, applied to the other counter only the
-        queue itself can see.
-
-        `enqueue()` is the only other writer of `high_water`, and it can
-        only ever see the writer's own push deques. A tier fed entirely by
-        pull sources therefore had a structurally zero gauge: tier 2 is
-        `SampleQueue` and `CameraStateQueue`, neither of which the writer
-        ever queues anything into, so "queue high-water mark" would have
-        rendered as a flat 0 in the console's indicator no matter
-        how deep the robot's backlog actually got — a dead gauge, which is
-        worse than an absent one.
-
-        `max`, not assignment: the sources report cumulative peaks that
-        never go down, and the writer's own push peak for the same tier
-        must not be lost by a later, smaller source reading (nor the other
-        way round)."""
-        counters = self._tier_counters(tier)
-        counters["high_water"] = max(counters["high_water"], value)
-
-    def counters(self) -> dict:
-        """A snapshot of per-tier `{"sent", "bytes", "drops", "high_water"}`
-        plus the overall `"rate_bps"` — for status/diagnostics, not for any
-        decision this class makes about itself."""
-        result: Dict[Any, Any] = {tier: dict(c) for tier, c in self._counters.items()}
-        result["rate_bps"] = self._rate_bps
-        return result
-
     def _next_ready(self):
         """The next `(tier, payload, source)` in strict tier order across
         both push deques and pull sources, or `None` if nothing is ready
@@ -733,15 +641,11 @@ class PrioritizedWriter:
         actively blocked on, and progress is a level whose next frame
         corrects the gap.
 
-        Tier 2 is the third, since bridge 2.2.0: `_pump_pressure`'s own
-        push always beats `_CameraStateSource`/`_SampleSource`'s pull on a
-        tie, so a `bridge_pressure` datapoint due this tick jumps ahead of
-        whatever live sample or camera state was already waiting in the
-        same tier — the diagnostic overtaking its own tier's backlog,
-        deliberately: the two pulled sources still get their turn the very
-        next scan (the push side is empty again by then), and a gauge that
-        could itself be starved by the traffic it is measuring would be
-        the worse trade."""
+        Tier 2 has no push side of its own today — both its sources are
+        pulled — so the rule costs nothing there. It is stated anyway
+        because `enqueue()` can introduce a push deque on any tier at any
+        time, and whoever adds one to tier 2 should read what it will do
+        to the two sources already there."""
         push_tiers = iter(sorted(self._push.keys()))
         sources = iter(self._sources)
         next_push = next(push_tiers, None)
@@ -860,9 +764,9 @@ class PrioritizedWriter:
                 # instead — and the reconnect then re-applies the whole
                 # configuration, which is *more* executor work queued
                 # behind the same stall, so a ten-second hiccup compounded
-                # into a reconnect loop. Before this branch existed at all
-                # (before the pressure work), a stalled executor only
-                # delayed snapshots. It does again.
+                # into a reconnect loop. Before this branch existed at
+                # all, a stalled executor only delayed snapshots. It does
+                # again.
                 #
                 # Socket-closure stays for every other exception: a source
                 # that raises is broken, and looping back to it would just
@@ -920,10 +824,31 @@ class PrioritizedWriter:
         pull.add_done_callback(lambda task: task.cancelled() or task.exception())
 
     async def _tick(self) -> None:
+        """Wait for `wake()` or `_WRITER_TICK_S`, whichever comes first.
+
+        Deliberately **not** `asyncio.wait_for`, which this was until the
+        pressure pump stopped hiding what it does: on Python 3.10 — ROS
+        Humble's interpreter, the oldest this one source is built for —
+        `wait_for` catches the cancellation, and if its inner future
+        happens to be done already, returns that result and **drops the
+        CancelledError on the floor** (CPython bpo-37658, fixed in 3.12).
+        `_wake` is set by `enqueue()`, so an `Event.wait` completing in the
+        same loop iteration as `_converse`'s `_cancel_pump(writer_task)` is
+        not a rare interleaving — it is what the end of a busy session
+        looks like. The writer then never stopped, `await task` in
+        `_cancel_pump` never returned, and the session hung on teardown
+        with the reconnect that would have delivered its queued frames
+        never starting. The pressure pump's own cancel, one `await`
+        earlier, used to move the phase enough to hide it.
+
+        `asyncio.wait` has no such shortcut: a cancellation arriving here
+        propagates. The inner task is cancelled in `finally` so a tick cut
+        short by either a timeout or a cancel leaves nothing pending."""
+        waiter = asyncio.ensure_future(self._wake.wait())
         try:
-            await asyncio.wait_for(self._wake.wait(), timeout=_WRITER_TICK_S)
-        except asyncio.TimeoutError:
-            pass
+            await asyncio.wait({waiter}, timeout=_WRITER_TICK_S)
+        finally:
+            waiter.cancel()
 
     async def _safe_close(self) -> None:
         """Best-effort — `run` is ending regardless of whether this
@@ -962,9 +887,6 @@ class PrioritizedWriter:
             return False
         elapsed = time.monotonic() - started
         self._record_send(len(payload), elapsed)
-        counters = self._tier_counters(tier)
-        counters["sent"] += 1
-        counters["bytes"] += len(payload)
         if source is not None:
             source.on_sent(payload)
         return True
@@ -1084,28 +1006,13 @@ class _SampleSource:
     on overflow and counts it for the once-per-reconnect log line
     (`_log_dropped_samples`), so there is nothing to track here and nothing
     to put back: a sample that missed the wire has a successor a moment
-    later, which is the whole reason it is allowed to drop at all.
-
-    What it *does* report is the queue's high-water mark, the same way
-    `_CameraStateSource` reports its own — before bridge 2.2.0's pressure
-    pump, this tier had no push deque at all, so without these two the
-    writer's tier-2 `high_water` could only ever be zero; the pump gives
-    tier 2 a push side of its own now, but a source-fed peak deeper than
-    whatever the pump's deque has reached still needs a way to surface,
-    which is what these two calls remain for. Its drop count is
-    deliberately *not* reported here; see
-    `PrioritizedWriter.record_drops` for why that one counter has exactly
-    one reader. `writer` is filled in by `_build_writer`, for the same
-    reason `_CameraStateSource.writer` is."""
+    later, which is the whole reason it is allowed to drop at all."""
 
     def __init__(self, ros, tier: int) -> None:
         self._ros = ros
         self._tier = tier
-        self.writer: Optional[PrioritizedWriter] = None
 
     def try_next(self):
-        if self.writer is not None:
-            self.writer.record_high_water(self._tier, self._ros.samples.high_water())
         sample = self._ros.samples.try_get()
         if sample is None:
             return None
@@ -1131,30 +1038,13 @@ class _CameraStateSource:
     stream, and a robot sampling steadily must not be able to keep a
     camera's state — including the one answering an operator's
     `camera_start` — off the wire indefinitely. The reverse order has no
-    such symmetric cost, since a dropped-oldest sample has a successor.
-
-    Whatever the queue coalesced away since the last ask is reported into
-    the writer's tier-2 drop counter here (see `record_drops`), and the
-    queue's own depth into the tier-2 high-water mark (see
-    `record_high_water` — the pressure pump pushes onto tier 2 too now,
-    but only these two sources can report a *source-side* depth, which is
-    the only thing `record_high_water` folds in). `writer` is
-    filled in by `_build_writer` immediately after the writer is
-    constructed — it cannot be a constructor argument, because this source
-    has to be in the list the writer is built from."""
+    such symmetric cost, since a dropped-oldest sample has a successor."""
 
     def __init__(self, ros, tier: int) -> None:
         self._ros = ros
         self._tier = tier
-        self.writer: Optional[PrioritizedWriter] = None
 
     def try_next(self):
-        dropped = self._ros.camera_states.drain_drop_count()
-        if self.writer is not None:
-            self.writer.record_drops(self._tier, dropped)
-            self.writer.record_high_water(
-                self._tier, self._ros.camera_states.high_water()
-            )
         update = self._ros.camera_states.try_get()
         if update is None:
             return None
@@ -1268,26 +1158,6 @@ def _drain_one(queue: "asyncio.Queue"):
         return None
 
 
-def pressure_wire_value(stats: dict) -> dict:
-    """`pressure_stats()` -> the `bridgePressure` wire shape (vendored at
-    `test/contracts/schema/bridge-pressure.schema.json`): tiers keyed by
-    `str` (JSON has no integer keys), `timestamp_ms` removed (it rides on
-    the datapoint frame itself, not inside the value), `rate_bps` and
-    `snapshot_max_bytes` grouped under `link`. `video` needs nothing done
-    to it — `pressure_stats()` already assembles it in the wire shape.
-
-    Pure function, unit-testable without a client, a writer or a ROS
-    runtime: the schema test is the arbiter of "omit nothing else"."""
-    return {
-        "link": {
-            "rate_bps": stats["rate_bps"],
-            "snapshot_max_bytes": stats["snapshot_max_bytes"],
-        },
-        "tiers": {str(tier): counters for tier, counters in stats["tiers"].items()},
-        "video": stats["video"],
-    }
-
-
 class BridgeClient:
     """Keeps the robot connected to the cloud for as long as that makes sense.
 
@@ -1301,7 +1171,6 @@ class BridgeClient:
         *,
         connect: Optional[Callable[[str], Awaitable]] = None,
         sleep: Optional[Callable[[float], Awaitable[None]]] = None,
-        pressure_sleep: Optional[Callable[[float], Awaitable[None]]] = None,
         backoff: Optional[ExponentialBackoff] = None,
         handshake_timeout: float = HANDSHAKE_TIMEOUT_S,
         idle_timeout: float = IDLE_TIMEOUT_S,
@@ -1313,22 +1182,6 @@ class BridgeClient:
         self._max_send_occupancy_s = max_send_occupancy_s
         self._connect = connect if connect is not None else websocket_connect
         self._sleep = sleep if sleep is not None else asyncio.sleep
-        # Deliberately *not* `self._sleep`, despite `_pump_pressure` pacing
-        # itself the same way the backoff loop does: `helpers.make_client`
-        # (the whole suite's own harness) defaults `sleep=RecordingSleep()`
-        # for every test, real-suite-wide, so that it never has to wait out
-        # backoff's real delays. `RecordingSleep` records and returns
-        # near-instantly — right for a backoff test, wrong for a periodic
-        # pump, which would then re-enqueue onto tier 2 as fast as the loop
-        # can turn. Tier 2 outranks every pull-fed tier below it
-        # (`_next_ready`'s push-wins-ties rule), so a pump that never
-        # really waits starves tier 3/4/5 in *every* pre-existing test that
-        # reaches `hello_ok` with `ros` set — found the hard way, as
-        # `assets_available` frames a dozen tests wait on, never arriving.
-        # A dedicated injectable, real `asyncio.sleep` unless a test asks
-        # otherwise, keeps that default harmless everywhere except the
-        # tests that opt in on purpose (test_client_pressure_pump.py).
-        self._pressure_sleep = pressure_sleep if pressure_sleep is not None else asyncio.sleep
         self._backoff = backoff if backoff is not None else ExponentialBackoff()
         # `ExponentialBackoff` with the cap at the initial value: nothing to
         # grow into, and the equal-jitter arithmetic stays in one place
@@ -1364,129 +1217,16 @@ class BridgeClient:
         # report_current_camera_health's own docstring for why.
         self._first_config_since_hello = True
         # The most recently built session's writer, or `None` before the
-        # first connection attempt (`_build_writer` has not run yet) — read
-        # by `pressure_stats()`. Deliberately *not* reset to `None` when a
-        # session ends: the counters of the last session are more useful
-        # than nothing until the next one starts and `_build_writer`
-        # overwrites this with a fresh, zeroed writer. That overwrite is
-        # also the answer to "does a reconnect reset the numbers?" — yes:
-        # a new `PrioritizedWriter` starts every session, so `pressure_
-        # stats()` reports the *current* session's pressure, never a
-        # lifetime total across reconnects. See `pressure_stats`'s own
-        # docstring.
+        # first connection attempt (`_build_writer` has not run yet).
+        # Deliberately *not* reset to `None` when a session ends: the
+        # rate estimate the last session measured is a better starting
+        # answer than nothing until `_build_writer` overwrites this with a
+        # fresh one.
         self._last_writer: Optional[PrioritizedWriter] = None
 
     def stop(self) -> None:
         """Ask the bridge to shut down; safe to call from a signal handler."""
         self._stop.set()
-
-    def pressure_stats(self) -> dict:
-        """One plain dict of pressure counters, collected now, assembled
-        from three sources — `self._last_writer.counters()`,
-        `self._ros.video_stats()` and
-        `self._ros.uplink_budget.snapshot()`:
-
-            {
-              "timestamp_ms": <capture time>,
-              "tiers": {0: {"sent", "bytes", "drops", "high_water"}, ...},
-              "rate_bps": Optional[float],
-              "snapshot_max_bytes": int,
-              "video": {"active_streams", "bitrate_sum_kbps",
-                        "uplink_kbps", "override_kbps",
-                        "video_budget_kbps", "reserve_kbps"},
-            }
-
-        Always this exact shape, every key present, nothing `None` where a
-        number is expected — the console's indicator must never
-        need a null check per field. That holds in both cases
-        that have nothing behind them: before the first connection
-        (`self._last_writer is None` — `_build_writer` has not run yet) and
-        for a ROS-less client (`self._ros is None`, e.g. every unit test
-        that builds a bare `BridgeClient`, or a bridge process started
-        without ROS wiring at all). Both fall back to an all-zero,
-        `None`-free shape rather than a missing key or a bare `{}`.
-
-        Counters reset with every new session, not just with the process:
-        `_build_writer` constructs a fresh `PrioritizedWriter` on every
-        connection attempt (see `_converse`), and `self._last_writer` always
-        points at the most recent one. So a reconnect zeroes `tiers` and
-        `rate_bps` back to "nothing sent yet" — this reports the *current*
-        session's pressure, not a lifetime total across reconnects. That
-        includes tier 2's `high_water` fed by `SampleQueue` and
-        `CameraStateQueue` (see the bullet below) — both outlive the
-        session, so `_converse`'s `finally` also baselines them at the end
-        of every session — `drain_high_water()` on each, read-and-reset,
-        seeded with whatever is still queued rather than zero (see each
-        method's own docstring) — so neither queue's own peak survives
-        into the next session unless the backlog genuinely does too.
-
-        `timestamp_ms` is bridge capture time
-        (`sampling.capture_timestamp_ms`), taken at collection — never
-        receive time.
-
-        **What the two per-tier gauges actually mean**, because "0" reads
-        as "nothing happened" and for two of these tiers it can only ever
-        mean "there is nothing here to count":
-
-        * `high_water` is the deepest a queue for that tier has been. For
-          tiers 0, 1 and 3 that is the writer's own push deque
-          (`PrioritizedWriter.enqueue`). Tier 2 now has a push side too —
-          `_pump_pressure`'s own `bridge_pressure` datapoint (bridge
-          2.2.0) — so its reading is the `max` of that deque's own depth
-          and the two pulled source queues' peaks — `SampleQueue.
-          high_water()` and `CameraStateQueue.high_water()`, folded in
-          through `record_high_water`. In practice this means an
-          otherwise-idle robot's tier-2 `high_water` reads `0` on the
-          pump's first frame and `>= 1` from its second one on — the pump
-          observing itself, the same way any gauge that shares its own
-          measured channel does. Tiers 1 and 3 *also* carry
-          a pull source each (`_JobSource`, `_AssetSource`) whose queue
-          depth is not folded in, so their reading is the push side only.
-          Tiers 4 and 5 stay 0 by construction and that is not a defect to
-          chase: backfill is pulled item by item straight out of
-          `BacklogStore` and a snapshot is encoded on demand, so neither
-          has a queue whose depth would mean anything.
-        * `drops` moves for exactly one thing today: `CameraStateQueue`
-          coalescing a superseded camera state away, reported by
-          `_CameraStateSource` into tier 2. `SampleQueue`'s own
-          drop-oldest count is deliberately not folded in — it is
-          read-and-reset once per reconnect for its own log line, and two
-          readers read-and-resetting one counter would each see a fraction
-          of the truth (`PrioritizedWriter.record_drops`). So a zero here
-          means "no camera state was coalesced away", never "nothing was
-          dropped anywhere".
-
-        **`tiers` is keyed by `int`.** `json.dumps` stringifies integer
-        keys, so a consumer that serializes this dict receives `"0"` …
-        `"5"`, not `0` … `5`. Left as ints here because that is what every
-        reader inside this process wants; `pressure_wire_value` (bridge
-        2.2.0) is what turns this into the `bridgePressure` wire shape for
-        the `bridge_pressure` datapoint `_pump_pressure` sends."""
-        writer_counters = (
-            self._last_writer.counters() if self._last_writer is not None else {}
-        )
-        rate_bps = writer_counters.get("rate_bps")
-        tiers = {
-            tier: writer_counters.get(tier, dict(_ZERO_TIER_COUNTERS))
-            for tier in _ALL_TIERS
-        }
-        snapshot_max_bytes = (
-            self._last_writer.snapshot_max_bytes()
-            if self._last_writer is not None
-            else SNAPSHOT_MAX_BYTES
-        )
-        budget = self._ros.uplink_budget if self._ros is not None else None
-        video = {
-            **(self._ros.video_stats() if self._ros is not None else _ZERO_VIDEO_STATS),
-            **(budget.snapshot() if budget is not None else _ZERO_BUDGET_SNAPSHOT),
-        }
-        return {
-            "timestamp_ms": sampling.capture_timestamp_ms(),
-            "tiers": tiers,
-            "rate_bps": rate_bps,
-            "snapshot_max_bytes": snapshot_max_bytes,
-            "video": video,
-        }
 
     async def run(self) -> StopReason:
         """Connect, and keep reconnecting, until stopped or refused for good."""
@@ -1567,20 +1307,9 @@ class BridgeClient:
         Tier order is carried by the `_TIER_*` constants, not by the order
         of this list; the one thing the list order decides is which of the
         two tier-2 sources is asked first, which `_CameraStateSource`
-        explains.
-
-        Does **not** baseline `self._ros.samples`/`self._ros.camera_states`
-        here, despite both needing a per-session reset (see `_converse`'s
-        `finally` for where that happens and why): whatever is already
-        queued at the moment this runs belongs to the session about to
-        start, not to the one before it, and resetting the gauge here
-        would discard that depth along with any stale one —
-        `test_a_camera_state_queue_depth_shows_up_in_pressure_stats`
-        queues four camera states and builds a writer around them with no
-        session in between, and expects that depth to count."""
+        explains."""
         sources = []
         snapshot_source = None
-        reporting_sources = []
         if self._ros is not None:
 
             def is_open() -> bool:
@@ -1588,7 +1317,6 @@ class BridgeClient:
 
             camera_states = _CameraStateSource(self._ros, _TIER_TELEMETRY)
             samples = _SampleSource(self._ros, _TIER_TELEMETRY)
-            reporting_sources = [camera_states, samples]
             sources = [
                 (_TIER_OUTCOME, _GatedSource(is_open, _JobSource(self._ros))),
                 (_TIER_TELEMETRY, _GatedSource(is_open, camera_states)),
@@ -1603,14 +1331,6 @@ class BridgeClient:
             snapshot_source=snapshot_source,
             max_occupancy_s=self._max_send_occupancy_s,
         )
-        for source in reporting_sources:
-            # The back-references, closed here because they cannot be
-            # closed at construction: these two sources report their own
-            # queues' drops and depths into the writer's counters, and the
-            # writer does not exist until the line above. Kept to the two
-            # tier-2 sources rather than handed to all of them — no other
-            # tier is fed by a queue the writer cannot see for itself.
-            source.writer = writer
         self._last_writer = writer
         return writer
 
@@ -1652,15 +1372,6 @@ class BridgeClient:
         control_task = asyncio.ensure_future(
             self._pump_control(ws, control_queue, writer)
         )
-        # Unlike `writer_task`/`control_task`, started at `hello_ok` below,
-        # not here: the pumps this design's writer replaced were started at
-        # `hello_ok` (see `_GatedSource`'s own docstring), and the pressure
-        # pump has no `_GatedSource` wrapper to give it that gate any other
-        # way — being started late *is* its gate, so it cannot leave a
-        # frame before the cloud has said which robot this is. `None` until
-        # then, and cancelled unconditionally in `finally` below regardless
-        # of whether it ever started.
-        pressure_task: Optional["asyncio.Task"] = None
         writer.enqueue(
             _TIER_SESSION,
             hello_message(self._config.token, self._bridge_version, self._active_jobs()),
@@ -1738,17 +1449,6 @@ class BridgeClient:
                     # the runtime still believes nobody is connected for.
                     self._session_open = True
                     writer.wake()
-                    # Guarded: a second `hello_ok` in the same session (the
-                    # cloud is not supposed to send one, but nothing here
-                    # gets to assume a well-behaved peer) would otherwise
-                    # overwrite `pressure_task` with a fresh one, leaking
-                    # the first — never cancelled, its `while True` loop
-                    # keeps calling `writer.enqueue()` for the rest of the
-                    # process, growing a deque the writer has stopped
-                    # draining (see `test_a_duplicate_hello_ok_still_runs_
-                    # only_one_pump`).
-                    if pressure_task is None:
-                        pressure_task = asyncio.ensure_future(self._pump_pressure(writer))
                 elif isinstance(message, HelloError):
                     if message.terminal:
                         log.error(
@@ -1810,71 +1510,12 @@ class BridgeClient:
                 # torn down here, in the same breath as set_connected(False),
                 # not left for whoever reconnects to notice and clean up.
                 await self._ros.stop_all_live()
-                # Tier 2's `high_water` baseline is per-session, not merely
-                # documented as such — reset *here*, at this session's
-                # end, not in the next one's `_build_writer`: both queues
-                # outlive every session (they belong to `RosRuntime`, not
-                # to this writer), so without a reset their `high_water()`
-                # would keep reading back this session's own peak into the
-                # next one's counters. Resetting at construction instead
-                # was tried and reverted — it also discarded whatever was
-                # already queued *before* a writer's first build, which
-                # `test_a_camera_state_queue_depth_shows_up_in_pressure_
-                # stats` — which predates this reset — legitimately
-                # expects to count. Ending each session by zeroing what it leaves
-                # behind gets the same "a new session starts from zero"
-                # guarantee without that cost.
-                self._ros.samples.drain_high_water()
-                self._ros.camera_states.drain_high_water()
             # Before the writer is cancelled, so nothing can be answered
             # onto a socket this session has already given up on.
             self._session_open = False
             self._detach_wake()
-            await self._cancel_pump(pressure_task, "pressure")
             await self._cancel_pump(control_task, "control")
             await self._cancel_pump(writer_task, "writer")
-
-    async def _pump_pressure(self, writer: PrioritizedWriter) -> None:
-        """Every `PRESSURE_INTERVAL_S` while this session is open: one
-        `bridge_pressure` datapoint, tier 2 — the same tier every other
-        piece of telemetry rides. Started by `_converse` at `hello_ok` and
-        cancelled, unconditionally, in
-        its `finally` — see the `pressure_task` comment there for why that
-        is this pump's whole gate, with no `_GatedSource` wrapper needed.
-
-        `writer` is the closure over this specific session's
-        `PrioritizedWriter`, not `self._last_writer` — the latter is
-        reassigned by `_build_writer` the moment the *next* session
-        starts, and a pump that read it instead would go on enqueuing
-        onto a writer whose session already ended, or — worse — onto the
-        next one's, defeating the very gate this method exists to
-        respect.
-
-        Paced by `self._pressure_sleep`, not `self._sleep` — see the
-        constructor's own comment on why the two must not be the same
-        injectable.
-
-        Sleeps *before* the first send, not after: tier 2 outranks tier 3
-        (`_next_ready`'s push-wins-ties rule), so a frame enqueued the
-        instant `hello_ok` lands would race ahead of whatever the session's
-        own first response is — `config_applied`, `assets_available`, the
-        first `camera_state` — and every test built around "the next frame
-        is X" has no reason to expect a pressure reading to have cut in
-        line ahead of it. Waiting out one interval first costs nothing real
-        (the session already reports zeros until something has happened
-        anyway) and means a fast-finishing exchange — every one of them,
-        at the default real `PRESSURE_INTERVAL_S` — never sees a pressure
-        frame with `self._pressure_sleep` left at its default."""
-        while True:
-            await self._pressure_sleep(PRESSURE_INTERVAL_S)
-            writer.enqueue(
-                _TIER_TELEMETRY,
-                datapoint_message(
-                    PRESSURE_SLUG,
-                    pressure_wire_value(self.pressure_stats()),
-                    sampling.capture_timestamp_ms(),
-                ),
-            )
 
     async def _cancel_pump(self, task: Optional["asyncio.Task"], label: str) -> None:
         """Ends one of the session's pumps and reports how it ended.
@@ -1884,12 +1525,9 @@ class BridgeClient:
         is the pump having *died on its own* some time earlier, and the
         await here is the first and only place that ever surfaces it — a
         pump that raised is simply gone, and the session goes on without
-        it. For the pressure pump that is exactly the state the console
-        reads as "no pressure feed", i.e. as a bridge too old to have the
-        feature; on this robot's own logs it was a `debug` line nobody has
-        their level set low enough to see. Warning, with the label, so a
-        dead pump can be told from a missing feature by reading the log
-        the operator already has."""
+        it, silently, unless somebody says so here. Warning, with the
+        label, so a dead pump can be read off the log the operator already
+        has rather than inferred from what stopped arriving."""
         if task is None:
             return
         task.cancel()

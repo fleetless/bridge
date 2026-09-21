@@ -5,8 +5,9 @@ The message shapes mirror the contracts artifacts (`bridge-hello`,
 `bridge-pong`, `cloud-ping`, `cloud-hello-ok`, `cloud-hello-error`,
 `cloud-config`, `bridge-config-applied`, `cloud-introspect-request`,
 `bridge-introspect`, `cloud-type-request`, `bridge-type-definitions`,
-`datapoint-frame`, and the `cloud-invoke`, `cloud-cancel`, `cloud-publish`,
-`bridge-job-update`, `bridge-job-lost` — plus `bridge-hello` growing
+`datapoint-frame`, `bridge-link-mode`, and the `cloud-invoke`,
+`cloud-cancel`, `cloud-publish`, `bridge-job-update`, `bridge-job-lost`
+— plus `bridge-hello` growing
 `active_jobs`, `{job_id, slug, state}` per entry (renamed from
 `active_job_ids`, the `cloud-invoke`/`cloud-cancel` gaining
 `patience_ms`/`job_id`, and the `cloud-camera-start`/`-stop` gaining
@@ -82,6 +83,11 @@ PROTOCOL_VERSIONS: List[Dict[str, Any]] = _CONSTANTS["PROTOCOL_VERSIONS"]
 #: The newest bridge release the contracts knew about when they were built —
 #: one release behind after every bridge release, by construction.
 LATEST_BRIDGE_VERSION: str = _CONSTANTS["LATEST_BRIDGE_VERSION"]
+#: The fallbacks for every low-bandwidth setting, read rather than typed for
+#: the reason above: these same eight values are the ROS parameters' defaults
+#: and the console's placeholders, and a default written down twice ends up
+#: disagreeing with itself. `link_mode.py` is what reads them.
+LOW_BANDWIDTH_DEFAULTS: Dict[str, Any] = _CONSTANTS["LOW_BANDWIDTH_DEFAULTS"]
 
 # The `fleetless.yaml` format version — `doc.fleetless`. Still a hand-kept
 # literal on both sides of the wire, which `PROTOCOL_VERSION` above stopped
@@ -237,9 +243,19 @@ class HelloError:
 
 @dataclass(frozen=True)
 class Ping:
-    """The cloud's round-trip probe; `ts_ms` is the cloud's clock, not ours."""
+    """The cloud's round-trip probe; `ts_ms` is the cloud's clock, not ours.
+
+    Since protocol 3 it also carries the cloud's own two measurements of this
+    link: `latency_ms`, the round trip of the last pong, and `lag_ms`, how far
+    behind the datapoints are arriving. Both are the cloud's arithmetic, not
+    the bridge's — only the cloud sees both ends — and both are `None` until
+    it has something to measure, or when a protocol-2 cloud sends neither.
+    `link_mode.py` weighs them against the dwell this side measures.
+    """
 
     ts_ms: int
+    latency_ms: Optional[int] = None
+    lag_ms: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -293,7 +309,13 @@ class DatapointConfig:
     `rate_throttle_hz` is a plain ceiling, `None` meaning no throttling —
     which is also what a wire `0` means. The parser turns the one into the
     other, because `0` is in range on the wire and `MaxHzPolicy` divides by
-    it."""
+    it.
+
+    `low_bandwidth_keep` is the wire's `low_bandwidth: "keep"` as a flag: the
+    field is a one-value enum on the wire, so there is nothing to carry but
+    whether it is there. It exempts this datapoint from the low-bandwidth
+    rate cap — the battery reading a stranded robot is judged by — and
+    nothing else; its backfill still pauses with everyone else's."""
 
     slug: str
     topic: str
@@ -302,6 +324,7 @@ class DatapointConfig:
     rate_throttle_hz: Optional[float]
     numeric: DatapointNumeric
     retention: RetentionConfig
+    low_bandwidth_keep: bool = False
 
 
 @dataclass(frozen=True)
@@ -506,7 +529,14 @@ class Config:
     There is **no `credentials` member**. The wire-only map beside `doc` is
     retired: a camera's username and password live inside its own source
     (`RtspSource`/`MjpegSource`), so there is no second place for them to
-    disagree with."""
+    disagree with.
+
+    `low_bandwidth` is the raw section, `{}` when absent — deliberately not
+    parsed into a dataclass here. Every setting in it is optional and its
+    defaults live in `LOW_BANDWIDTH_DEFAULTS`, so the resolution this parser
+    would have to do is `link_mode.LowBandwidthSettings`'s job, once, where
+    the ROS parameters are resolved against the same defaults. What this
+    parser owes the caller is only that the section is a mapping."""
 
     version: int
     datapoints: Dict[str, DatapointConfig] = field(default_factory=dict)
@@ -515,6 +545,7 @@ class Config:
     publishers: Dict[str, PublisherConfig] = field(default_factory=dict)
     cameras: Dict[str, CameraConfig] = field(default_factory=dict)
     messages: Dict[str, Any] = field(default_factory=dict)
+    low_bandwidth: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -686,6 +717,28 @@ def hello_message(
 def pong_message(ts_ms: int) -> str:
     """Echo a ping's timestamp untouched — the cloud derives latency from it."""
     return json.dumps({"type": "pong", "ts_ms": ts_ms})
+
+
+def link_mode_message(low_bandwidth: bool, reason: str, at_ms: int) -> str:
+    """Announce that low-bandwidth mode just turned on or off.
+
+    Sent on every transition and nothing else: the cloud shows the state and
+    the console explains why a robot went quiet, so a heartbeat repeating an
+    unchanged answer would be paying for the mode on the link the mode exists
+    to spare.
+
+    `reason` is a closed enum on the wire (`lag`, `dwell`, `forced`,
+    `recovered`) — the strict outgoing copy of the schema is what enforces
+    that, not this signature. `at_ms` is bridge capture time, like every other
+    `_ms` the bridge sends."""
+    return json.dumps(
+        {
+            "type": "link_mode",
+            "low_bandwidth": low_bandwidth,
+            "reason": reason,
+            "at_ms": at_ms,
+        }
+    )
 
 
 def config_applied_message(
@@ -965,6 +1018,18 @@ def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _parse_link_measurement(payload: object) -> Optional[int]:
+    """One of the ping's two cloud-measured millisecond gauges, or `None`.
+
+    Milliseconds, so the fractional part of the `number` the schema allows is
+    below anything the mode decides on — rounded rather than refused, because
+    a cloud sending `1200.5` has told this bridge everything it needs. A
+    negative reading is not a duration and reads as nothing measured."""
+    if not _is_number(payload) or payload < 0:
+        return None
+    return int(round(payload))
+
+
 def _parse_message_body(payload: dict, key: str) -> Any:
     """A `message:` position. Returns the template, `{}` when the key is
     absent, or the `_INVALID` sentinel — a template can be any JSON value at
@@ -1089,6 +1154,10 @@ def _parse_datapoint_config(slug: str, payload: object) -> Optional[DatapointCon
         rate_throttle_hz=rate_throttle_hz,
         numeric=numeric,
         retention=retention,
+        # A one-value enum on the wire, so equality is the whole check and
+        # anything else is simply not the exemption — including a `True` some
+        # future YAML author writes by analogy with the other flags.
+        low_bandwidth_keep=payload.get("low_bandwidth") == "keep",
     )
 
 
@@ -1478,7 +1547,16 @@ def parse_cloud_message(raw: object) -> CloudMessage:
     if kind == "ping":
         ts_ms = payload.get("ts_ms")
         if isinstance(ts_ms, int) and not isinstance(ts_ms, bool) and ts_ms >= 0:
-            return Ping(ts_ms=ts_ms)
+            # A measurement this parser cannot read is dropped, not promoted
+            # to `Unknown`: the ping's job is the round trip, and a bridge
+            # that stopped answering because a gauge arrived malformed would
+            # take itself off the air over a diagnostic. `None` then means
+            # what it means everywhere else here — nothing measured.
+            return Ping(
+                ts_ms=ts_ms,
+                latency_ms=_parse_link_measurement(payload.get("latency_ms")),
+                lag_ms=_parse_link_measurement(payload.get("lag_ms")),
+            )
         return Unknown(raw, "ping without a usable ts_ms")
     if kind == "config":
         version = payload.get("version")
@@ -1497,6 +1575,15 @@ def parse_cloud_message(raw: object) -> CloudMessage:
         if messages is None:
             return Unknown(raw, "config with a malformed shared message")
 
+        # Read whole, not field by field: the settings inside are resolved
+        # against `LOW_BANDWIDTH_DEFAULTS` in `link_mode.py`, and a parser
+        # that rejected an unknown key here would take the bridge off the air
+        # over a setting a newer console happened to write. That it is a
+        # mapping at all is the one thing the caller cannot check for itself.
+        low_bandwidth = doc.get("low_bandwidth")
+        if low_bandwidth is not None and not isinstance(low_bandwidth, dict):
+            return Unknown(raw, "config with a malformed low_bandwidth section")
+
         sections = {}
         for key, parser in (
             ("datapoints", _parse_datapoint_config),
@@ -1514,7 +1601,12 @@ def parse_cloud_message(raw: object) -> CloudMessage:
                 return Unknown(raw, "config with a malformed {} entry".format(key[:-1]))
             sections[key] = parsed
 
-        return Config(version=version, messages=messages, **sections)
+        return Config(
+            version=version,
+            messages=messages,
+            low_bandwidth=low_bandwidth or {},
+            **sections,
+        )
     if kind == "invoke":
         job_id = payload.get("job_id")
         slug = payload.get("slug")

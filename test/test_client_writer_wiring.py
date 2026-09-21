@@ -410,7 +410,7 @@ def test_a_snapshot_pull_that_times_out_does_not_close_the_session():
     reached `run()`'s catch-all, which closes the socket. The reconnect
     then re-applies the whole configuration, which is *more* executor work
     queued behind the same stall: a ten-second hiccup compounding into a
-    reconnect loop. Before the pressure work a stalled executor only
+    reconnect loop. Before this branch existed a stalled executor only
     delayed snapshots; it must again.
 
     The exception type is established here rather than assumed, because on
@@ -525,47 +525,6 @@ def test_a_snapshot_pull_stall_is_logged_once_per_streak(monkeypatch):
     assert len(stall_lines) == 2, (
         "{} stall warnings for two streaks over {} pulls".format(len(stall_lines), calls)
     )
-
-
-# --- tier 2's high-water mark comes from the source queues -------------------
-
-
-def test_a_camera_state_queue_depth_shows_up_in_pressure_stats():
-    """Before bridge 2.2.0's pressure pump, tier 2 had no push deque at
-    all — `enqueue()` was never called for it — so the writer's own
-    `high_water` bookkeeping could only ever report 0 there, whatever the
-    robot actually queued. The console would render a dead gauge and
-    nobody could tell it from a calm robot. This test still drives
-    `_build_writer` directly rather than through `_converse`, so no pump
-    ever starts here (that needs a real `hello_ok`) — the source-side
-    reporting this test is about is exactly the half that still matters
-    when the pump's own deque has not reached this depth itself.
-
-    Four uncoalescible camera states (each answering a command, so each
-    takes its own place in the queue — see `CameraStateQueue`) are queued
-    before the writer runs, and tier 2's high-water mark must show that
-    depth."""
-
-    async def scenario():
-        fake_ros = FakeRos()
-        client = _offline_client(fake_ros)
-        client._session_open = True
-        for i in range(4):
-            fake_ros.camera_states.put(
-                CameraStateUpdate(
-                    "front", True, None, cause="command",
-                    observed_at_ms=1786400000000 + i,
-                    request_id="req-{}".format(i),
-                )
-            )
-        assert fake_ros.camera_states.high_water() == 4
-        writer = client._build_writer(TimedWs(0.01))
-        await _run_briefly(writer, 0.3)
-        return client.pressure_stats()
-
-    stats = asyncio.run(scenario())
-    assert stats["tiers"][2]["sent"] == 4, stats["tiers"][2]
-    assert stats["tiers"][2]["high_water"] == 4, stats["tiers"][2]
 
 
 # --- tier 5: pulled, and fitted to the writer's own budget --------------------

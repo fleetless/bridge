@@ -183,16 +183,6 @@ class FakeRos:
     def set_connected(self, connected):
         self.connected_calls.append(connected)
 
-    # `RosRuntime`'s two pressure readers (`BridgeClient.pressure_stats()`
-    # reads both). Zeroed here — no cameras, no `UplinkBudget` — so a
-    # test can drive `pressure_stats()` for the parts this fake does
-    # fake: the writer's own tier counters. Real numbers are covered
-    # against a real `RosRuntime` in test_client_pressure_stats.py.
-    uplink_budget = None
-
-    def video_stats(self):
-        return {"active_streams": 0, "bitrate_sum_kbps": 0}
-
     async def graph_snapshot(self):
         self.introspect_calls += 1
         return self._graph

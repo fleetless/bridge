@@ -5,8 +5,7 @@ due — otherwise the callback keeps just a reference to the newest raw
 message (`entry.raw`, camera.py's `RawFrameHolder`) and never decodes it.
 Reuses `test_ros_runtime.py`'s harness (`run`, `_camera_cfg`,
 `_start_image_publisher`, `_pull_snapshot`, `_fake_live_factory`,
-`_split_snapshot_frame`) rather than duplicating it, as
-`test_ros_runtime_uplink.py` already does.
+`_split_snapshot_frame`) rather than duplicating it.
 
 Every claim is proven by counting real calls to `camera.to_bgr`,
 monkeypatched on the shared module object (`from fleetless_bridge import

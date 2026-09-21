@@ -107,9 +107,9 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rosidl_runtime_py.utilities import get_action, get_message, get_service
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import String as StringMsg, UInt32
+from std_msgs.msg import String as StringMsg
 
-from fleetless_bridge import camera, camera_sources, introspection, live, params, pressure, sampling
+from fleetless_bridge import camera, camera_sources, introspection, live, params, sampling
 from fleetless_bridge.jobs import JobManager, JobUpdate
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
@@ -393,7 +393,6 @@ class SampleQueue:
     ) -> None:
         self._queue: "asyncio.Queue[sampling.Sample]" = asyncio.Queue(maxsize=maxsize)
         self._dropped = 0
-        self._high_water = 0
         self.on_put = on_put
 
     def put_threadsafe(self, loop: asyncio.AbstractEventLoop, sample: sampling.Sample) -> None:
@@ -408,7 +407,6 @@ class SampleQueue:
             else:
                 self._dropped += 1
         self._queue.put_nowait(sample)
-        self._high_water = max(self._high_water, self._queue.qsize())
         if self.on_put is not None:
             self.on_put()
 
@@ -425,48 +423,12 @@ class SampleQueue:
         except asyncio.QueueEmpty:
             return None
 
-    def high_water(self) -> int:
-        """The deepest this queue has ever been, for the pressure counters
-        — the same reading `CameraStateQueue.high_water()`
-        gives, reported into the writer's tier-2 counter by `client.py`'s
-        `_SampleSource`. Not reset by reading — a high-water mark that
-        forgets its own peak is not one — but **`drain_high_water()` below
-        does reset it**, and that is the one the session end calls.
-
-        Saturating rather than unbounded, and the difference matters when
-        reading it: this queue drops oldest instead of growing, so the
-        depth can never exceed `maxsize` and a reading *at* `maxsize` means
-        "it was full at least once" — i.e. samples were dropped — not "it
-        was exactly that deep". How many were dropped is
-        `drain_drop_count()`'s number, not this one."""
-        return self._high_water
-
     def drain_drop_count(self) -> int:
         """Read-and-reset — the client calls this once per reconnect, so a
         long-running drop streak is reported as one number, not a log line
         per sample."""
         count, self._dropped = self._dropped, 0
         return count
-
-    def drain_high_water(self) -> int:
-        """Read-and-reset — same shape as `drain_drop_count`, for the same
-        reason: this queue outlives every session, so its high-water mark
-        would otherwise keep reading back a peak from a connection that
-        already ended. `BridgeClient._converse`'s `finally` calls this once
-        per session, at the end of it, so the pressure counters report
-        *this* session's peak, not one carried over from the
-        last.
-
-        Resets to `self._queue.qsize()`, not to 0: a session can end with
-        items still queued (a disconnect landing mid-drain, or samples
-        piling up while nothing is connected at all), and that backlog
-        belongs to whichever session next drains it, not to a phantom
-        "nothing queued" reading that would otherwise persist until the
-        next `put`. `qsize()` is itself a legitimate high-water mark — the
-        queue has genuinely been at least this deep — so seeding the reset
-        with it costs nothing and loses nothing."""
-        value, self._high_water = self._high_water, self._queue.qsize()
-        return value
 
 
 class CameraStateQueue:
@@ -552,8 +514,6 @@ class CameraStateQueue:
     def __init__(self, on_put: Optional[Callable[[], None]] = None) -> None:
         self._order: Deque[Any] = deque()
         self._pending: Dict[str, "CameraStateUpdate"] = {}
-        self._high_water = 0
-        self._dropped = 0
         self.on_put = on_put
 
     def put_threadsafe(
@@ -573,8 +533,6 @@ class CameraStateQueue:
             # Coalesced, not queued: the position this slug already holds
             # is kept, only the payload it resolves to is replaced.
             self._pending[update.slug] = update
-            self._dropped += 1
-        self._high_water = max(self._high_water, len(self._order))
         if self.on_put is not None:
             self.on_put()
 
@@ -589,44 +547,6 @@ class CameraStateQueue:
         if isinstance(item, str):
             return self._pending.pop(item)
         return item
-
-    def high_water(self) -> int:
-        """The deepest this queue has ever been, for the pressure counters.
-        Not reset by reading — a high-water mark that forgets
-        its own peak is not one — but **`drain_high_water()` below does
-        reset it**, and that is the one the session end calls, same split
-        as `SampleQueue`'s. The sentence describes this accessor, not the
-        mark's whole lifetime."""
-        return self._high_water
-
-    def drain_drop_count(self) -> int:
-        """Read-and-reset count of updates coalesced away — reported into
-        the writer's tier counters by `client.py`'s `_CameraStateSource`,
-        so a bound that is quietly costing transitions is visible rather
-        than inferred. Read-and-reset (not cumulative like `high_water`)
-        because the reader accumulates it itself."""
-        count, self._dropped = self._dropped, 0
-        return count
-
-    def drain_high_water(self) -> int:
-        """Read-and-reset — same shape as `drain_drop_count`, for the same
-        reason: this queue outlives every session, so its high-water mark
-        would otherwise keep reading back a peak from a connection that
-        already ended. `BridgeClient._converse`'s `finally` calls this once
-        per session, at the end of it, so the pressure counters report
-        *this* session's peak, not one carried over from the
-        last.
-
-        Resets to `len(self._order)`, not to 0: a camera-state backlog
-        that piled up while nothing was connected (or a disconnect landing
-        mid-drain) is still real depth, and the *next* session's writer
-        has not had a chance to observe it yet — a reset to 0 would report
-        "nothing queued" over a queue that is, right now, N items deep,
-        until the next `put` happened to refresh it. `len(self._order)` is
-        itself a legitimate high-water mark for the same reason
-        `SampleQueue.drain_high_water`'s `qsize()` is."""
-        value, self._high_water = self._high_water, len(self._order)
-        return value
 
 
 def _backlog_depth(retention: RetentionConfig) -> int:
@@ -1056,7 +976,6 @@ class RosRuntime:
         live_publisher_factory: Optional[Callable[..., object]] = None,
         snapshot_max_bytes: int = camera.SNAPSHOT_MAX_BYTES,
         max_tracked_jobs: int = MAX_TRACKED_JOBS,
-        uplink_budget: Optional[pressure.UplinkBudget] = None,
     ) -> None:
         self._node_name = node_name
         self._max_tracked_jobs = max_tracked_jobs
@@ -1179,52 +1098,11 @@ class RosRuntime:
         # One asyncio.Lock per slug — see _live_lock's docstring
         # for the start_live/stop_live race it closes.
         self._live_locks: Dict[str, asyncio.Lock] = {}
-        # The uplink budget video may use, or `None` for
-        # every RosRuntime that does not opt in (every test that omits this
-        # kwarg, and any process built without one) — `start_live`'s
-        # admission check and `_on_uplink_kbps`'s enforcement both no-op on
-        # `None`, which is what makes "no budget: nothing is enforced,
-        # nothing is logged, today exactly" true without either call site
-        # needing its own separate flag.
-        self._uplink_budget = uplink_budget
-        # slug -> the order it was most recently *started* live in, as a
-        # monotonically increasing counter, not `time.monotonic()`/a
-        # timestamp — a counter can never tie or run backwards across an
-        # NTP step, and "most recently started" only ever needs a total
-        # order among the slugs currently in `_live_publishers`, never the
-        # actual elapsed time. Bounded the
-        # same way `_live_locks` is (by the number of configured cameras);
-        # a slug's entry is simply overwritten on its next start, so a
-        # flapping camera does not grow this dict.
-        self._live_start_counter = 0
-        self._live_start_order: Dict[str, int] = {}
-        # slug -> bitrate_kbps admitted but not yet committed: a slug
-        # lands in `_live_publishers` only after `await
-        # publisher.start(...)` returns, but `camera_start` dispatches are
-        # fire-and-forget (client.py's `_dispatch_camera_start`, `ensure_
-        # future`) and the per-slug lock in `_live_lock` never serializes
-        # *across* slugs. Without this, two concurrent `start_live` calls
-        # for two different slugs could both read the same stale, pre-join
-        # `active_sum` and both admit, jointly exceeding the budget the
-        # second one was supposed to be checked against. `start_live`
-        # writes an entry here in the same synchronous stretch as its own
-        # admission decision (no `await` between reading `active_sum` and
-        # recording the reservation), so a second `start_live` — however
-        # soon it runs — reads a sum that already includes it. Cleared in
-        # `start_live`'s own `finally`, whether the attempt is admitted,
-        # refused, or fails to join: a reservation is only a placeholder
-        # for the in-flight window, and once resolved either the slug is
-        # committed into `_live_publishers` (whose own bitrate now counts)
-        # or nothing is running for it, and either way this entry must not
-        # linger and double-count. `_enforce_uplink_budget` folds this in
-        # too: a budget lowered while a join is still in flight must
-        # weigh that pending stream, not just what has already committed.
-        self._uplink_reservations: Dict[str, int] = {}
         # What start_live/stop_live made of a camera_start/camera_stop —
         # drained by client.py's tier-2 writer source into bridgeCameraState
         # frames. Not a cross-thread queue like SampleQueue: everything that
         # writes to it already runs on the event loop thread. Bounded
-        # latest-per-slug since the pressure work; see CameraStateQueue.
+        # latest-per-slug; see CameraStateQueue.
         self.camera_states = CameraStateQueue()
         # Drained by client.py's own pump into bridgeAssetsAvailable frames
         # — unlike camera_states, written directly from the
@@ -1315,20 +1193,6 @@ class RosRuntime:
         # *sending* something, never one going away.
         self._urdf_availability_timer = self._node.create_timer(
             URDF_AVAILABILITY_CHECK_INTERVAL_S, self._check_urdf_availability
-        )
-        # The live uplink-budget override — under `/fleetless`,
-        # per the namespace rule, `UInt32`, last value wins (a plain
-        # subscription callback already has that semantics: each message
-        # simply replaces whatever `set_live_override` last recorded).
-        # Created unconditionally, same as the URDF subscription above,
-        # whether or not this process was built with an `UplinkBudget` at
-        # all — `_on_uplink_kbps` itself is what no-ops on `self.
-        # _uplink_budget is None`, so an unbudgeted robot still has nothing
-        # to enforce and nothing to log, it just also has a subscription
-        # sitting idle, the same as any other topic nobody happens to
-        # publish to.
-        self._node.create_subscription(
-            UInt32, "/fleetless/uplink_kbps", self._on_uplink_kbps, 10
         )
         self._thread = threading.Thread(
             target=self._executor.spin, name="fleetless-ros-executor", daemon=False
@@ -1485,74 +1349,6 @@ class RosRuntime:
         sample is live; while not, it goes to `self.backlog` if its
         datapoint is buffered, or is simply dropped (an honest gap) if not."""
         self._connected = connected
-
-    @property
-    def uplink_budget(self) -> Optional[pressure.UplinkBudget]:
-        """The configured `UplinkBudget`, or `None` for a robot built
-        without one (see `__init__`'s `uplink_budget` kwarg). Read-only —
-        `client.py`'s `_on_uplink_kbps`/`_enforce_uplink_budget` are the
-        only writers of the object it points at, and they mutate the
-        budget itself (`set_live_override`), never this reference. Exposed
-        for `BridgeClient.pressure_stats()`, which needs `.snapshot()`
-        directly rather than folded into `video_stats()` below: the two are
-        separate sources, and a consumer of one must not have to decode the
-        other."""
-        return self._uplink_budget
-
-    def _active_video_kbps(self) -> int:
-        """Committed + pending live-video bitrate, in kbps — the one
-        `active_sum` all three of its callers need and each used to compute
-        for itself: `start_live`'s admission check,
-        `_enforce_uplink_budget`'s loop, and `video_stats` for the pressure
-        counters.
-
-        One copy on purpose. Three hand-copies of one decision is the "two
-        policies for one decision" shape with a third door, and this
-        particular decision has already been got wrong once that way: a
-        **missing pending half** at the admission site alone, with the
-        other sites' versions perfectly correct — nothing structural
-        stopped the next edit from fixing two of three again.
-
-        Committed = the slugs actually publishing (`_live_publishers`),
-        priced from each one's configured `bitrate_kbps`. Pending =
-        `_uplink_reservations`, admitted by the check below but not yet
-        joined, so not in `_live_publishers` yet. Neither set alone is the
-        right one — see `start_live`'s own comment for why.
-
-        A slug in `_live_publishers` whose camera a concurrent config-apply
-        has already removed prices at 0 rather than raising: `_cameras` is
-        written on the executor thread and read here on the loop thread, so
-        a membership test followed by an index is two reads with a window
-        between them, and `.get()` is one read that cannot lose that race.
-
-        Loop-thread only, like every reader of these three dicts —
-        `_live_publishers`, `_uplink_reservations` and `_cameras` are
-        documented in `__init__` as loop-side and deliberately unlocked.
-        Every caller (`start_live`, `_enforce_uplink_budget`,
-        `video_stats` via `BridgeClient.pressure_stats()`) runs on the
-        loop, so that is asserted by the call sites staying true rather
-        than enforced here."""
-        committed_sum = sum(
-            entry.bitrate_kbps
-            for entry in (self._cameras.get(slug) for slug in self._live_publishers)
-            if entry is not None
-        )
-        return committed_sum + sum(self._uplink_reservations.values())
-
-    def video_stats(self) -> dict:
-        """Active live-stream count and total reserved bitrate, for
-        `BridgeClient.pressure_stats()`. The bitrate is
-        `_active_video_kbps()` — the same number, from the same helper,
-        that `start_live`'s admission check and `_enforce_uplink_budget`
-        decide on, so the counter a developer reads can never disagree with
-        the budget the bridge is actually enforcing.
-
-        Loop-thread only; see `_active_video_kbps` for why that is a call
-        site's obligation here rather than a lock."""
-        return {
-            "active_streams": len(self._live_publishers),
-            "bitrate_sum_kbps": self._active_video_kbps(),
-        }
 
     async def apply_config(
         self, datapoints: Mapping[str, DatapointConfig]
@@ -1815,173 +1611,83 @@ class RosRuntime:
                 )
                 return
 
-            # Uplink admission, before any join attempt: a
-            # `camera_start` whose bitrate would lift the sum of *actually
-            # publishing plus in-flight* streams above the video budget is
-            # refused honestly rather than opened and immediately fought
-            # over bandwidth with everything else already live or already
-            # admitted. `self._uplink_budget is None` is the unbudgeted/
-            # no-opt-in case — `admits` itself would also return `True` for
-            # an `UplinkBudget` built from an unset `FLEETLESS_UPLINK_KBPS`,
-            # but skipping the whole block here is what keeps this truly
-            # zero-cost (no `active_sum` computed, nothing evaluated) for
-            # the common case.
-            #
-            # `active_sum` = committed (slugs in `_live_publishers`, via
-            # their own `bitrate_kbps`) + pending (`_uplink_reservations`,
-            # slugs admitted but not yet joined) — computed by
-            # `_active_video_kbps`, the one copy all three call sites share.
-            # Committed-only is the defect this closes: `_live_publishers`
-            # only gains an
-            # entry after `await publisher.start(...)` returns below, but
-            # `camera_start` dispatches are fire-and-forget (client.py's
-            # `_dispatch_camera_start`, `ensure_future`) and `_live_lock`
-            # only serializes *within* one slug — two concurrent
-            # `start_live` calls for two *different* slugs both reached
-            # this line, both read the same pre-join `active_sum`, and both
-            # admitted, jointly exceeding the budget the second one was
-            # supposed to be checked against. Neither `_cameras` (every
-            # configured camera, live or not) nor `_live_publishers` alone
-            # is the right set — a camera can be configured and never
-            # started, or refused by this very check a moment ago, and
-            # neither should count; a camera mid-join for a concurrent
-            # caller very much should.
-            #
-            # `cause=CAMERA_STATE_CAUSE_COMMAND`, not a bespoke value — the
-            # wire's `bridgeCameraState.cause` is a **closed** enum
-            # (vendored at `test/contracts/
-            # schema*/bridge-camera-state.schema.json`) and the cloud's
-            # `parseBridgeFrame` silently drops any frame that fails
-            # validation. This frame answers *this* `camera_start` and
-            # carries its `request_id` — exactly what `cause: 'command'`
-            # means and requires (the contracts cross-field rule:
-            # `request_id` non-null iff `cause == 'command'`) — so the
-            # refusal itself is free-form, but *why* it happened must live
-            # in `error.code`, the one field the schema leaves as a plain
-            # `z.string().min(1)`.
-            if self._uplink_budget is not None:
-                active_sum = self._active_video_kbps()
-                if not self._uplink_budget.admits(entry.bitrate_kbps, active_sum):
-                    video_budget_kbps = self._uplink_budget.video_budget_kbps() or 0
-                    available_kbps = max(0, video_budget_kbps - active_sum)
-                    message = "{} kbps requested, {} available of a {} kbps budget".format(
-                        entry.bitrate_kbps, available_kbps, video_budget_kbps
-                    )
-                    self.camera_states.put(
-                        CameraStateUpdate(
-                            slug, False, ("uplink_budget", message),
-                            cause=CAMERA_STATE_CAUSE_COMMAND,
-                            observed_at_ms=sampling.capture_timestamp_ms(),
-                            request_id=request_id,
-                        )
-                    )
-                    return
-                # Reserve *immediately*, in the same synchronous stretch as
-                # the read above — asyncio only ever hands control to
-                # another coroutine at an `await` point, and there is none
-                # between computing `active_sum` and this write. So by the
-                # time any other `start_live` call (for any other slug)
-                # next gets a turn, this reservation already exists and its
-                # own `active_sum` already includes it — closing the race
-                # this whole block exists for. Released in the `finally`
-                # below on every path out of the rest of this method:
-                # refused by the budget, join failure, or success (where the slug's
-                # own bitrate is now counted via `_live_publishers`
-                # instead) — a reservation is only a placeholder for the
-                # in-flight window and must not linger.
-                self._uplink_reservations[slug] = entry.bitrate_kbps
-
-            try:
-                # a non-ROS source can be known-broken (auth failed,
-                # unreachable) before anyone ever asked for live — it runs
-                # continuously in the background to keep snapshots warm,
-                # same as a ROS subscription. If it has never delivered a
-                # frame at all, answer *this* join attempt with the
-                # classified error right away instead of opening a LiveKit
-                # publisher for a stream with nothing to publish
-                # (protocol.py's own bridge_camera_state_message docstring:
-                # the cloud must not leave a viewer watching a black
-                # rectangle believing it is live). This is a real answer to
-                # a real camera_start (`cause: 'command'`), not the
-                # unsolicited background reporting `_on_source_error`/
-                # `_on_source_frame` do (`cause: 'source'`) — it only
-                # ever fires in response to this joiner's own request.
-                if entry.latest.get() is None and entry.last_source_error is not None:
-                    code, message, observed_at_ms = entry.last_source_error
-                    self.camera_states.put(
-                        CameraStateUpdate(
-                            slug, False, (code, message),
-                            cause=CAMERA_STATE_CAUSE_COMMAND, observed_at_ms=observed_at_ms,
-                            request_id=request_id,
-                        )
-                    )
-                    return
-
-                publisher = self._live_publisher_factory(
-                    holder=entry.latest,
-                    width=entry.width,
-                    height=entry.height,
-                    fps=entry.fps,
-                    bitrate_kbps=entry.bitrate_kbps,
-                    on_lost=lambda reason, slug=slug: self._on_live_lost(slug, reason),
-                )
-                try:
-                    await publisher.start(url, room, token)
-                except Exception as exc:  # noqa: BLE001 - see docstring: any failure, not only LiveStartError
-                    # Same class as the module-wide rule in
-                    # camera_sources.py: `token` is a LiveKit access token —
-                    # a credential — and `camera_states` becomes
-                    # `bridgeCameraState`, sent to the
-                    # cloud over the wire, not merely logged. A `LiveStartError`
-                    # is safe to surface as-is: live.py now builds its message
-                    # from type names only (same commit), never a raw SDK
-                    # exception, so str(exc) here is exactly what that file
-                    # already decided was safe to say, and dropping it would
-                    # only throw away detail a developer legitimately needs
-                    # ("no route to host" vs. a bare type name). But this
-                    # branch catches "any failure, not only LiveStartError" —
-                    # see the docstring above — and nothing guarantees an
-                    # *unexpected* exception from somewhere else in this call
-                    # chain is similarly pre-redacted, so anything else still
-                    # gets the type-name-only treatment.
-                    message = str(exc) if isinstance(exc, live.LiveStartError) else type(exc).__name__
-                    log.error("Could not start live for camera slug %r: %s", slug, message)
-                    try:
-                        await publisher.stop()
-                    except Exception as cleanup_exc:  # noqa: BLE001 - already failed; nothing to report to
-                        log.error(
-                            "Error cleaning up a live publisher that failed to start for slug %r: %s",
-                            slug, type(cleanup_exc).__name__,
-                        )
-                    self.camera_states.put(
-                        CameraStateUpdate(
-                            slug, False, ("live_unavailable", message),
-                            cause=CAMERA_STATE_CAUSE_COMMAND, observed_at_ms=sampling.capture_timestamp_ms(),
-                            request_id=request_id,
-                        )
-                    )
-                    return
-                self._live_publishers[slug] = publisher
-                # A monotonically increasing counter, not a timestamp —
-                # see this attribute's own comment in __init__ for why. Recorded
-                # only on a *successful* start, so a refused or failed attempt
-                # (both already returned above) never claims a position in the
-                # "most recently started" ordering `_enforce_uplink_budget` reads.
-                self._live_start_counter += 1
-                self._live_start_order[slug] = self._live_start_counter
+            # a non-ROS source can be known-broken (auth failed,
+            # unreachable) before anyone ever asked for live — it runs
+            # continuously in the background to keep snapshots warm,
+            # same as a ROS subscription. If it has never delivered a
+            # frame at all, answer *this* join attempt with the
+            # classified error right away instead of opening a LiveKit
+            # publisher for a stream with nothing to publish
+            # (protocol.py's own bridge_camera_state_message docstring:
+            # the cloud must not leave a viewer watching a black
+            # rectangle believing it is live). This is a real answer to
+            # a real camera_start (`cause: 'command'`), not the
+            # unsolicited background reporting `_on_source_error`/
+            # `_on_source_frame` do (`cause: 'source'`) — it only
+            # ever fires in response to this joiner's own request.
+            if entry.latest.get() is None and entry.last_source_error is not None:
+                code, message, observed_at_ms = entry.last_source_error
                 self.camera_states.put(
                     CameraStateUpdate(
-                        slug, True, None,
+                        slug, False, (code, message),
+                        cause=CAMERA_STATE_CAUSE_COMMAND, observed_at_ms=observed_at_ms,
+                        request_id=request_id,
+                    )
+                )
+                return
+
+            publisher = self._live_publisher_factory(
+                holder=entry.latest,
+                width=entry.width,
+                height=entry.height,
+                fps=entry.fps,
+                bitrate_kbps=entry.bitrate_kbps,
+                on_lost=lambda reason, slug=slug: self._on_live_lost(slug, reason),
+            )
+            try:
+                await publisher.start(url, room, token)
+            except Exception as exc:  # noqa: BLE001 - see docstring: any failure, not only LiveStartError
+                # Same class as the module-wide rule in
+                # camera_sources.py: `token` is a LiveKit access token —
+                # a credential — and `camera_states` becomes
+                # `bridgeCameraState`, sent to the
+                # cloud over the wire, not merely logged. A `LiveStartError`
+                # is safe to surface as-is: live.py now builds its message
+                # from type names only (same commit), never a raw SDK
+                # exception, so str(exc) here is exactly what that file
+                # already decided was safe to say, and dropping it would
+                # only throw away detail a developer legitimately needs
+                # ("no route to host" vs. a bare type name). But this
+                # branch catches "any failure, not only LiveStartError" —
+                # see the docstring above — and nothing guarantees an
+                # *unexpected* exception from somewhere else in this call
+                # chain is similarly pre-redacted, so anything else still
+                # gets the type-name-only treatment.
+                message = str(exc) if isinstance(exc, live.LiveStartError) else type(exc).__name__
+                log.error("Could not start live for camera slug %r: %s", slug, message)
+                try:
+                    await publisher.stop()
+                except Exception as cleanup_exc:  # noqa: BLE001 - already failed; nothing to report to
+                    log.error(
+                        "Error cleaning up a live publisher that failed to start for slug %r: %s",
+                        slug, type(cleanup_exc).__name__,
+                    )
+                self.camera_states.put(
+                    CameraStateUpdate(
+                        slug, False, ("live_unavailable", message),
                         cause=CAMERA_STATE_CAUSE_COMMAND, observed_at_ms=sampling.capture_timestamp_ms(),
                         request_id=request_id,
                     )
                 )
-            finally:
-                # No-op (and safe) when `self._uplink_budget is None`, or
-                # when the admission block above never ran (unknown-slug
-                # return, already above) — `dict.pop(..., None)` never
-                # raises on a key that was never inserted.
-                self._uplink_reservations.pop(slug, None)
+                return
+            self._live_publishers[slug] = publisher
+            self.camera_states.put(
+                CameraStateUpdate(
+                    slug, True, None,
+                    cause=CAMERA_STATE_CAUSE_COMMAND, observed_at_ms=sampling.capture_timestamp_ms(),
+                    request_id=request_id,
+                )
+            )
 
     def _on_live_lost(self, slug: str, reason: str) -> None:
         """Called by a `live.LivePublisher` (its `on_lost`) when it stops
@@ -2025,16 +1731,13 @@ class RosRuntime:
         config-change stop answers no request by definition, so `None` (the
         default) is the only correct value there.
 
-        `error` is `None` for every existing caller —
-        a `camera_stop` answer and a config-change stop both have nothing to
-        report, `{publishing: false, error: None}` being the whole point of
-        `cause` existing at all (see above). `_enforce_uplink_budget` is the
-        one caller that passes one: `cause=CAMERA_STATE_CAUSE_LIVE_LOST`
-        (unsolicited — a budget enforcement stop answers no command, same as
-        any other `live_lost`) with `error=('uplink_budget', ...)`, the free
-        `error.code` channel being where a *reason* belongs now that
-        `cause` itself is the wire's closed enum (see `start_live`'s own
-        admission-check comment for why).
+        `error` is `None` for every caller today — a `camera_stop` answer
+        and a config-change stop both have nothing to report, `{publishing:
+        false, error: None}` being the whole point of `cause` existing at
+        all (see above). It stays in the signature for the caller that
+        stops a stream for a reason of its own: `cause` is the wire's
+        closed enum, so a *reason* has nowhere to go but the free
+        `error.code` channel.
 
         A slug not currently live is a silent no-op — the cloud already
         knows what is live and would not ask otherwise, the same reasoning
@@ -2071,213 +1774,6 @@ class RosRuntime:
                 if publisher is None:
                     continue  # already stopped or lost between the snapshot above and now
                 await publisher.stop()
-
-    def _on_uplink_kbps(self, msg: UInt32) -> None:
-        """Subscription callback for `/fleetless/uplink_kbps` —
-        runs on the executor thread, like every rclpy callback in this
-        file. Schedules `_enforce_uplink_budget` onto the loop thread via
-        `asyncio.run_coroutine_threadsafe` — the executor-to-loop crossing
-        for scheduling a *coroutine*, as opposed to the plain-callable
-        `loop.call_soon_threadsafe` this file already uses for
-        `SampleQueue`/`CameraStateQueue` — and does *nothing else* here.
-
-        `UplinkBudget.set_live_override` used to be called right here,
-        inline, on the executor thread. That reads as
-        harmless (it only assigns a plain field), but it breaks this
-        file's one rule for the uplink budget: mutation *and* enforcement
-        are both loop-side, so neither can interleave with a `start_live`/
-        `_enforce_uplink_budget` call already in flight on the loop
-        without a lock nobody actually holds. Worse, it breaks ordering
-        for two topic messages arriving close together: `set_live_override`
-        would apply on the executor thread the instant each callback ran,
-        but the *enforcement* each triggers only runs later, whenever the
-        loop gets to it — so a fast override-then-override could enforce
-        against the second value before the first override's own
-        enforcement pass has run, or vice versa, depending on scheduling
-        luck. Moving the override *inside* the scheduled coroutine (see
-        `_enforce_uplink_budget`'s own docstring) fixes both: it is now
-        loop-side like everything else, and `run_coroutine_threadsafe`
-        submits onto the loop via `call_soon_threadsafe` under the hood,
-        which runs its callbacks in submission order — so two overrides
-        submitted in the order their messages arrived are also *applied*
-        in that order: the second coroutine's `set_live_override` call
-        cannot run before the first's, because nothing here queues them
-        out of order.
-
-        What that does **not** buy is the stronger reading: that the
-        first coroutine finishes enforcing before the next one's coroutine
-        even starts. That is false as soon as either coroutine reaches an
-        `await` (a `stop_live` call disconnects a real publisher, which
-        suspends), and a second, later-submitted override can start
-        running *while* an earlier enforcement pass is still mid-stop.
-        What holds is narrower, and it is all "last value wins" needs: `set_live_override` itself is applied in
-        submission order, so `UplinkBudget`'s own stored value is never
-        overwritten out of order. `_enforce_uplink_budget` re-reads
-        `video_budget_kbps()` on every loop iteration for exactly this
-        reason (see *the budget is re-read per iteration* below) — an
-        in-flight enforcement pass started under an older override must
-        not keep measuring against a budget a newer, concurrently-applied
-        override has already superseded.
-
-        A no-op when this process has no `UplinkBudget` at all
-        (`uplink_budget=None`, e.g. every test that omits the constructor
-        kwarg) — matches "no budget set: nothing is enforced, nothing is
-        logged, today exactly": an unbudgeted robot still receives
-        this topic's messages (the subscription exists unconditionally, see
-        `start()`), it simply has nothing to do with them. Checked here,
-        not only inside the coroutine, so an unbudgeted robot does not even
-        pay for scheduling a loop callback per message."""
-        if self._uplink_budget is None:
-            return
-        asyncio.run_coroutine_threadsafe(
-            self._enforce_uplink_budget(int(msg.data)), self._loop
-        )
-
-    async def _enforce_uplink_budget(self, override_kbps: int) -> None:
-        """Applies `override_kbps` (the value published on
-        `/fleetless/uplink_kbps`) and then stops the most recently started
-        live stream, repeatedly, until the sum of
-        actually-publishing-plus-pending streams fits the (possibly
-        just-lowered) video budget. Streams stop *newest first* because
-        "whoever started [the oldest ones] acted on older, better
-        information — and deterministic is more debuggable than fair."
-        `_live_start_order` (a counter, not a timestamp; see its own
-        comment in `__init__`) is what "most recently started" means
-        here.
-
-        `set_live_override` runs as this coroutine's first line, not in
-        `_on_uplink_kbps` on the executor thread that scheduled it — see
-        that method's own docstring for the interleaving and ordering
-        hazards that fixes.
-
-        Scheduled onto the loop thread by `_on_uplink_kbps` via `run_
-        coroutine_threadsafe`, so it runs exactly where `start_live`/
-        `stop_live` already assume they run, and can simply `await
-        stop_live` under its normal per-slug lock — no separate locking
-        story of its own. That does **not** mean two overlapping calls to
-        this coroutine (one per topic message) cannot interleave with
-        each other, only that neither races `start_live`/`stop_live`
-        incorrectly — see *the budget is re-read per iteration* below for
-        the interleaving that *is* possible and what it requires.
-
-        `active_sum` = committed (`_live_publishers`) + pending
-        (`_uplink_reservations`), via `_active_video_kbps`: a budget
-        lowered while some other `start_live` call is mid-join must weigh
-        that in-flight stream too, the same reasoning `start_live`'s own
-        admission check uses (see `_uplink_reservations`'s own comment in
-        `__init__`). This coroutine cannot itself stop a merely-*pending*
-        stream — there is no publisher yet to stop, only a reservation —
-        so it can only
-        shrink the committed half; if pending alone already exceeds the
-        budget with nothing committed, this loop simply has nothing to do
-        and exits via the `not self._live_publishers` guard, leaving the
-        in-flight `start_live` to resolve on its own. **Residual, named
-        rather than implied:** if that in-flight stream then commits while
-        an *older*, still-running stream is what this loop is busy
-        stopping, the newest-first intent can end up inverted for one
-        step — an older, already-established stream can be stopped to
-        make room that a newer, merely-admitted-but-not-yet-live stream
-        ends up occupying, because a reservation cannot be evicted the way
-        a committed publisher can. The next iteration (this loop always
-        re-reads both sums fresh) will still converge on a state that fits
-        the budget; it just is not guaranteed to be the *newest-first*
-        state in that one edge case. Nothing outside this file currently
-        depends on strict newest-first ordering surviving a same-instant
-        commit-during-stop.
-
-        Re-reads `active_sum` fresh every iteration rather than bounding
-        the loop by a count snapshotted at entry: the old `for _ in
-        range(len(self._live_publishers))` made a stream that *committed*
-        after the snapshot invisible to this pass, silently leaving the
-        budget violated until the next topic message.
-
-        *The progress guard names a slug, not a count.* It used to be
-        `len(self._live_publishers) >= before_count`, a **count**, not a
-        check that `newest_slug` itself was actually removed. A
-        `start_live` for some
-        *other* slug committing during this loop's `await stop_live(...)`
-        adds one to `_live_publishers` at the same moment `stop_live`
-        removes one — the count is unchanged, so the old guard read that
-        as "no progress" and returned even though `newest_slug` genuinely
-        stopped, leaving the budget violated (reproduced: two 500 kbps
-        streams stayed live against a 560 kbps budget because a third
-        stream's commit exactly cancelled out the first stop in the
-        count). The inverse also failed: if `newest_slug` itself raced
-        away (already gone via `_on_live_lost` or a concurrent `stop_live`)
-        with nothing else changing, the count **drops**, so the old guard
-        —written to catch exactly that case—never fired for it. Both
-        directions are wrong for the same reason: a count conflates two
-        unrelated events. The fix checks the one fact that actually
-        answers "did *this* stop make progress": whether `newest_slug`
-        itself is still present afterward.
-
-        *The budget is re-read per iteration.* `video_budget_kbps` used
-        to be read once, before the loop, and reused across every
-        iteration — including across the `await stop_live(...)` inside it.
-        Two overlapping calls to this coroutine (two topic messages
-        close together) can each be an independent, concurrently running
-        enforcement pass; if a second, later call applies a larger
-        override while the first call is still mid-loop, the first call's
-        stale, pre-read budget kept it stopping streams the *current*
-        budget already allows (reproduced: a stream was stopped against a
-        stale 560 kbps reading after a second call had already applied a
-        4000 kbps budget the running streams already fit under). Reading
-        `self._uplink_budget.video_budget_kbps()` fresh inside the loop
-        closes this the same way `active_sum` already was fresh per
-        iteration — `UplinkBudget` itself has no versioning to detect a
-        stale read, so the only fix is to stop holding one."""
-        self._uplink_budget.set_live_override(override_kbps)
-        while self._live_publishers:
-            # Defensive: a concurrently running `apply_config` or a
-            # second overlapping call to this coroutine could in
-            # principle clear `self._uplink_budget` between iterations in
-            # some future refactor — nothing today does, but this loop
-            # should not assume it forever without saying so. Cheap and
-            # decouples this loop's own invariant from whatever `_on_
-            # uplink_kbps`'s guard currently guarantees.
-            if self._uplink_budget is None:
-                return
-            # Read fresh every iteration, not once before the loop — see
-            # this method's own docstring for the interleaving this closes.
-            video_budget_kbps = self._uplink_budget.video_budget_kbps()
-            if video_budget_kbps is None:
-                return  # unbudgeted — matches "no budget: nothing is enforced"
-            active_sum = self._active_video_kbps()
-            if active_sum <= video_budget_kbps:
-                return
-            newest_slug = max(
-                self._live_publishers, key=lambda s: self._live_start_order.get(s, -1)
-            )
-            # `cause=CAMERA_STATE_CAUSE_LIVE_LOST`: this stop answers no
-            # `camera_stop`, so `cause='command'` (and a request_id) would
-            # be a lie — `live_lost` is the wire's own "publishing ended
-            # unexpectedly after it started" case, which is exactly what
-            # this is from the cloud's point of view. *Why* it ended is the
-            # free `error.code` channel, same as the admission refusal
-            # above (start_live's own comment explains why cause itself
-            # cannot carry that).
-            #
-            # One `.get()`, for the same reason `_active_video_kbps`
-            # prices with one: `newest_slug` came from `_live_publishers`,
-            # but a concurrent config-apply removing this slug's camera
-            # between the selection above and here is not excluded by
-            # anything this loop holds — and a membership test followed by
-            # an index is two reads of an executor-written dict with a
-            # window in between.
-            stopped_entry = self._cameras.get(newest_slug)
-            stopped_bitrate = stopped_entry.bitrate_kbps if stopped_entry is not None else 0
-            message = "{} kbps stopped: {} kbps running exceeds the {} kbps budget".format(
-                stopped_bitrate, active_sum, video_budget_kbps
-            )
-            await self.stop_live(
-                newest_slug,
-                cause=CAMERA_STATE_CAUSE_LIVE_LOST,
-                error=("uplink_budget", message),
-            )
-            # Check that *this* slug was actually removed, not that the
-            # dict's size changed — see this method's own docstring.
-            if newest_slug in self._live_publishers:
-                return  # stop_live was a no-op (raced away) — no progress, stop rather than spin
 
     # --- config apply: runs on the executor thread -------------------------
 

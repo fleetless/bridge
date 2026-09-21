@@ -386,3 +386,36 @@ def test_a_raising_source_closes_the_socket_and_ends_run(monkeypatch):
     ws = asyncio.run(scenario())
     assert ws.closed
     assert len(recording_log.exceptions) == 1
+
+
+def test_cancelling_the_writer_stops_it_even_when_a_wake_just_fired():
+    """A cancel arriving in the same loop iteration as a `wake()` must still
+    end `run()`.
+
+    This is the interleaving `BridgeClient._converse`'s `finally` produces
+    at the end of every busy session — `enqueue()` sets `_wake`, then the
+    teardown cancels the writer — and `_tick` used to lose it. On Python
+    3.10, ROS Humble's interpreter, `asyncio.wait_for` catches the
+    cancellation and, if its inner future is already done, returns that
+    result instead of re-raising (CPython bpo-37658). The writer then ran
+    on forever, `_cancel_pump`'s `await task` never returned, and the
+    session hung on teardown with no reconnect to deliver what was queued.
+
+    `wait_for(..., 2.0)` rather than a bare `await`: the failure mode is a
+    hang, and a test that reproduces a hang by hanging reports nothing."""
+
+    async def scenario():
+        writer = PrioritizedWriter(TimedWs(0.0), sources=[])
+        task = asyncio.ensure_future(writer.run())
+        # Long enough for the writer to be parked in `_tick` with an
+        # `Event.wait` of its own outstanding — the only state in which
+        # anything could be swallowed.
+        await asyncio.sleep(0.05)
+        # Both in one synchronous stretch, so the event resolves and the
+        # cancel is delivered without a loop turn between them.
+        writer.enqueue(0, "x")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(scenario())

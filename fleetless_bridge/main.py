@@ -86,7 +86,6 @@ import signal  # noqa: E402
 from fleetless_bridge import __version__  # noqa: E402
 from fleetless_bridge.client import BridgeClient, StopReason  # noqa: E402
 from fleetless_bridge.config import BridgeConfig  # noqa: E402
-from fleetless_bridge.pressure import UplinkBudget  # noqa: E402
 from fleetless_bridge.protocol import PROTOCOL_VERSION  # noqa: E402
 from fleetless_bridge.ros_runtime import RosRuntime  # noqa: E402
 
@@ -138,17 +137,7 @@ def run() -> int:
     # `shadowed_numpy_warning` above) — by the time this line runs,
     # camera.py's import either succeeded or already crashed the process.
 
-    # Always built, even when FLEETLESS_UPLINK_KBPS is unset —
-    # UplinkBudget itself is what turns "unset" into "unbudgeted" (`uplink_
-    # kbps=None` -> `video_budget_kbps()` returns `None` -> `admits()`
-    # always `True`), so there is no second "did the robot opt in at all"
-    # flag to keep in sync with this one.
-    uplink_budget = UplinkBudget(
-        config.uplink_kbps,
-        reserve_pct=config.uplink_reserve_pct,
-        reserve_min_kbps=config.uplink_reserve_min_kbps,
-    )
-    ros = RosRuntime(uplink_budget=uplink_budget)
+    ros = RosRuntime()
     try:
         reason = asyncio.run(_run_client(BridgeClient(config, ros=ros), ros))
     except Exception:  # noqa: BLE001 - last resort, so the log says why

@@ -4,9 +4,15 @@
 messages the bridge speaks: the handshake (hello, hello_ok, hello_error,
 ping, pong), configuration and introspection (config, config_applied,
 introspect_request, introspect, type_request, type_definitions), telemetry
-(datapoint, pressure), jobs (invoke, cancel, publish, job_update, job_lost),
-cameras (snapshot [binary frame header], camera_start, camera_stop,
-camera_state) and assets (assets_available, asset_request, asset_progress).
+(datapoint), link state (link_mode), jobs (invoke, cancel, publish,
+job_update, job_lost), cameras (snapshot [binary frame header],
+camera_start, camera_stop, camera_state) and assets (assets_available,
+asset_request, asset_progress).
+
+`pressure` was one of these until protocol 3 retired the uplink budget it
+reported on; `link_mode` took its place in the count, which is a
+coincidence of arithmetic and not a replacement — the two say different
+things.
 
 The count and the list are both here on purpose, and they have to agree: the
 list said twenty-four and named twenty-four while twenty-five files sat in the
@@ -25,6 +31,11 @@ carries (`URDF_ASSET_NAME`, `ASSET_UPLOAD_HEADERS`) were Python literals
 hand-typed under a comment naming the TypeScript constant they came from — the
 exact drift these constants exist to prevent, surviving in the one place that
 could not import them.
+
+Since protocol 3 it also carries `LOW_BANDWIDTH_DEFAULTS`, the defaults the
+low-bandwidth ROS parameters fall back to, read by `protocol.py` the same way
+and for the same reason: a default typed twice is a default that disagrees
+with itself eventually.
 
 Since 1.3.0 it also carries the **protocol version window**:
 `PROTOCOL_VERSION`, `PROTOCOL_VERSIONS` (which bridge version first spoke
@@ -55,7 +66,7 @@ embeds the whole `robot-config-doc` tree (and everything nested under it,
 `bridge-type-definitions` embed the graph/field-tree shapes.
 
 **`schema-outgoing/` is a second copy of exactly
-twelve of the twenty-five — the ones `protocol.py` sends, never receives —
+thirteen of the twenty-five — the ones `protocol.py` sends, never receives —
 in zod's *output* mode instead of `schema/`'s input mode.** Input mode is
 the right description of the wire contract (a `.default()`ed field reads
 optional, matching the real cloud's own lenient `zod.parse()`), but every
@@ -66,7 +77,7 @@ keeps `additionalProperties: false`, so `schemas.py`'s `validate_frame`
 checks an outgoing frame (`OUTGOING_FRAME_NAMES`) against this stricter
 copy by default, catching a missing or misspelled field here instead of
 letting it reach the cloud's own parser, which would just silently drop
-it. `schema/`'s copies of the same twelve stay in service too, for the
+it. `schema/`'s copies of the same thirteen stay in service too, for the
 rarer test that deliberately proves what the *contract* tolerates rather
 than what this bridge's own serializer produces (`strict=False`).
 
@@ -74,6 +85,16 @@ than what this bridge's own serializer produces (`strict=False`).
 
     Source: @fleetless/contracts@1.3.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
+
+**This pin is provisional and currently names a version these bytes did not
+come from.** They were vendored from the contracts checkout that carries
+protocol 3, while its `package.json` still said `1.3.0` — the 2.0.0 release
+chore lands after the bridge work. The sync test compares against whatever
+`$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version
+against this line, so a pre-release checkout agrees with it and a published
+1.3.0 tarball would not. **Set this to `2.0.0` when contracts releases it**,
+and re-run the suite against the published package; until then this line
+records where the bytes came from, not a version anyone else can resolve.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a

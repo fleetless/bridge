@@ -8,7 +8,9 @@ import pytest
 from jsonschema import ValidationError
 
 from fleetless_bridge.protocol import (
+    FLEETLESS_FORMAT_VERSION,
     LATEST_BRIDGE_VERSION,
+    LOW_BANDWIDTH_DEFAULTS,
     PROTOCOL_VERSION,
     PROTOCOL_VERSIONS,
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
@@ -51,6 +53,7 @@ from fleetless_bridge.protocol import (
     introspect_message,
     job_lost_message,
     job_update_message,
+    link_mode_message,
     bridge_asset_progress_message,
     bridge_camera_state_message,
     parse_cloud_message,
@@ -128,6 +131,29 @@ def test_pong_echoes_the_timestamp_unchanged():
     assert payload == {"type": "pong", "ts_ms": 1754800000123}
 
 
+def test_the_low_bandwidth_defaults_come_from_the_vendored_constants():
+    """Same reason `PROTOCOL_VERSION` is read rather than typed: these eight
+    numbers are also the ROS parameters' defaults and the console's
+    placeholders, and a default typed twice disagrees with itself
+    eventually."""
+    assert LOW_BANDWIDTH_DEFAULTS["enter_lag_ms"] == 2000
+    assert LOW_BANDWIDTH_DEFAULTS["camera"] == "reduce"
+
+
+def test_link_mode_message_validates_against_the_outgoing_schema():
+    """`reason` is a closed enum on the wire and `at_ms` is bridge time —
+    the strict outgoing copy is what says so, not this function's
+    signature."""
+    frame = json.loads(link_mode_message(True, "lag", 1754800000000))
+    assert frame == {
+        "type": "link_mode",
+        "low_bandwidth": True,
+        "reason": "lag",
+        "at_ms": 1754800000000,
+    }
+    validate_frame("bridge-link-mode", frame)
+
+
 def test_hello_ok_is_read_as_a_robot_binding():
     message = parse_cloud_message('{"type":"hello_ok","robot_id":"r-42"}')
     assert message == HelloOk(robot_id="r-42")
@@ -173,6 +199,37 @@ def test_an_unfamiliar_rejection_is_worth_retrying():
 
 def test_ping_is_read_with_its_timestamp():
     assert parse_cloud_message('{"type":"ping","ts_ms":7}') == Ping(ts_ms=7)
+
+
+def test_ping_reads_latency_and_lag_and_tolerates_their_absence():
+    """Protocol 3 hangs the cloud's own two measurements on the ping. Both
+    are required on the wire and both are nullable there — null before the
+    first pong, null until a datapoint has been seen — and a protocol-2
+    cloud sends neither. All three shapes read as a `Ping`: a bridge that
+    refused the bare one would go deaf to the cloud it is mid-upgrade
+    from."""
+    bare = parse_cloud_message(json.dumps({"type": "ping", "ts_ms": 5}))
+    assert isinstance(bare, Ping) and bare.latency_ms is None and bare.lag_ms is None
+    full = parse_cloud_message(
+        json.dumps({"type": "ping", "ts_ms": 5, "latency_ms": 42, "lag_ms": 1200})
+    )
+    assert full.latency_ms == 42 and full.lag_ms == 1200
+    nulls = parse_cloud_message(
+        json.dumps({"type": "ping", "ts_ms": 5, "latency_ms": None, "lag_ms": None})
+    )
+    assert nulls.lag_ms is None
+
+
+def test_a_ping_with_unusable_measurements_still_pings():
+    """A malformed measurement is dropped, not promoted to `Unknown`: the
+    ping's job is the round trip, and a bridge that stopped answering
+    because a gauge arrived as a string would take itself off the air over
+    a diagnostic."""
+    message = parse_cloud_message(
+        json.dumps({"type": "ping", "ts_ms": 5, "latency_ms": "soon", "lag_ms": True})
+    )
+    assert isinstance(message, Ping) and message.ts_ms == 5
+    assert message.latency_ms is None and message.lag_ms is None
 
 
 def test_text_frames_may_arrive_as_bytes():
@@ -249,6 +306,51 @@ def test_a_config_with_datapoints_is_parsed_field_by_field():
             )
         },
     )
+
+
+def test_config_carries_the_low_bandwidth_section_and_the_keep_flag():
+    """The section rides through as a raw dict — `link_mode.LowBandwidth
+    Settings` is what validates it, and a parser that rejected an unknown
+    key here would take the bridge off the air over a setting a newer
+    console happened to write."""
+    doc = {
+        "fleetless": FLEETLESS_FORMAT_VERSION,
+        "datapoints": {
+            "battery": {
+                "topic": "/b",
+                "type": "std_msgs/msg/Float64",
+                "field": "data",
+                "low_bandwidth": "keep",
+            },
+            "temp": {"topic": "/t", "type": "std_msgs/msg/Float64", "field": "data"},
+        },
+        "low_bandwidth": {"mode": "on", "datapoint_max_hz": 0.5},
+    }
+    frame = {"type": "config", "version": 3, "doc": doc}
+    validate_frame("cloud-config", frame)
+    config = parse_cloud_message(json.dumps(frame))
+    assert isinstance(config, Config)
+    assert config.low_bandwidth == {"mode": "on", "datapoint_max_hz": 0.5}
+    assert config.datapoints["battery"].low_bandwidth_keep is True
+    assert config.datapoints["temp"].low_bandwidth_keep is False
+
+
+def test_a_config_without_a_low_bandwidth_section_gets_an_empty_one():
+    """Absent is not `None`: every caller would then need the same null
+    check before reading a setting out of it, which is one place per caller
+    for the same mistake."""
+    message = _parse_config()
+    assert message.low_bandwidth == {}
+
+
+def test_a_malformed_low_bandwidth_section_taints_the_whole_frame():
+    """Same rule the five sections already follow: a cloud that sends this
+    has a bug, and there is no safe partial read of a settings block at the
+    wire level."""
+    frame = _config_frame()
+    frame["doc"]["low_bandwidth"] = "on"
+    message = parse_cloud_message(json.dumps(frame))
+    assert isinstance(message, Unknown)
 
 
 def test_the_mapping_key_is_the_entrys_slug():
