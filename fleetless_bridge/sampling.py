@@ -185,6 +185,51 @@ class MaxHzPolicy(RatePolicy):
         return False
 
 
+class AverageHzPolicy(RatePolicy):
+    """`hz` sends per second on average, whatever grid the arrivals land on.
+
+    **Why not `MaxHzPolicy`.** A minimum gap is exactly right for a ceiling
+    applied to a raw topic and exactly wrong for one applied to a stream some
+    other policy has already thinned. Low-bandwidth mode is the second case:
+    the configured `rate_throttle_hz` decides what is recorded, and the mode
+    then picks which of those go out now. Ask a 5 Hz minimum interval about a
+    5.56 Hz grid and it is never quite due — 0.18 s against a 0.196 s
+    threshold — so every second arrival is skipped and the result is 2.8 Hz,
+    not 5. The error is invisible to any check of the form "at most the
+    ceiling".
+
+    So this spends a credit rather than measuring a gap: one per send,
+    refilled at `hz` per second. Over any arrival pattern at or above `hz`
+    the long-run rate is `hz`; below it, every arrival passes.
+
+    `_CAPACITY` bounds what a silence can bank. It has to be above one, or the
+    credit left over from a grid slightly faster than `hz` is clamped away on
+    the very next arrival and the policy collapses to the half rate it exists
+    to avoid — which is the same defect in a different costume. Two is the
+    smallest value that cannot: an arrival can never accrue more than one
+    credit while the source is faster than `hz`, and when it is slower every
+    arrival passes anyway. A datapoint quiet for an hour therefore comes back
+    with two samples, not an hour of them.
+    """
+
+    #: Credits, not seconds. See the class docstring for why it is not one.
+    _CAPACITY = 2.0
+
+    def __init__(self, hz: float) -> None:
+        self._hz = hz
+        self._credit = 1.0
+        self._last: Optional[float] = None
+
+    def should_send(self, value: Any, now: float) -> bool:
+        if self._last is not None:
+            self._credit = min(self._CAPACITY, self._credit + (now - self._last) * self._hz)
+        self._last = now
+        if self._credit >= 1.0:
+            self._credit -= 1.0
+            return True
+        return False
+
+
 class SendEveryPolicy(RatePolicy):
     """Every sample goes. What an absent or zero `rate_throttle_hz` means.
 

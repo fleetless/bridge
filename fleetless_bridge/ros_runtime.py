@@ -1535,7 +1535,7 @@ class RosRuntime:
         Returning `None` whenever the configured rate is the smaller of the
         two is what makes the policy this does return equal to
         `min(rate_throttle_hz, datapoint_max_hz)`, which is the rate the mode
-        promises — `_on_message` then needs no second opinion and takes none.
+        promises for what goes live.
 
         A falsy `configured_hz` is "no ceiling configured" (sampling.py reads
         `None` and `0` the same way), so it never counts as slower than the
@@ -1544,7 +1544,11 @@ class RosRuntime:
             return None
         if configured_hz and configured_hz <= self._lb_max_hz:
             return None
-        return sampling.rate_policy(self._lb_max_hz)
+        # An average, not a minimum gap: this ceiling is applied to what
+        # `entry.rate` has already admitted, and a minimum gap asked about a
+        # grid only slightly coarser than itself settles at half the rate it
+        # was given. See `AverageHzPolicy`.
+        return sampling.AverageHzPolicy(self._lb_max_hz)
 
     async def _apply_camera_lever(self) -> None:
         """`stop` ends every running stream and says why; `reduce` re-targets
@@ -2139,38 +2143,32 @@ class RosRuntime:
             return
 
         now = time.monotonic()
-        sample = sampling.Sample(slug, value, timestamp_ms)
-
-        if self._connected and entry.cap is not None:
-            # Low-bandwidth mode. The live rate is `min(rate_throttle_hz,
-            # datapoint_max_hz)` and the cap alone decides it — `_cap_policy`
-            # returns `None` in every case where the configured rate is the
-            # smaller of the two, so the cap IS that minimum.
-            #
-            # **Not chained with `entry.rate`, and that is the whole point.**
-            # Two `MaxHzPolicy` instances in series beat against each other:
-            # an arrival the configured rate admits, falling just short of the
-            # cap's own threshold, is dropped without advancing the cap, so
-            # the next admission slips a whole source interval. With a 10 Hz
-            # source, 6 Hz configured and a 5 Hz ceiling the pair settles
-            # near 3 Hz — a datapoint losing far more than the mode asked
-            # for, in the one direction no "at most the ceiling" check can
-            # see.
-            #
-            # So both policies see every arrival and neither gates the other:
-            # the cap decides what goes live, the configured rate decides what
-            # the history keeps. The mode spares the link, not the record.
-            live = entry.cap.should_send(value, now)
-            keep_for_history = entry.rate.should_send(value, now)
-            if live:
-                self.samples.put_threadsafe(self._loop, sample)
-            elif keep_for_history and entry.buffer_enabled:
-                self.backlog.push(slug, sample)
-            return
-
+        # **`entry.rate` is the one gate on the record, in every mode.** A
+        # live send is part of what the cloud ends up holding, so it spends
+        # the same `rate_throttle_hz` budget the backfill does. Deciding the
+        # two separately makes the sets disjoint rather than nested and their
+        # union larger than the configuration states — with a 50 Hz source,
+        # 6 Hz configured and a 5 Hz ceiling, a 10 Hz record against a 6 Hz
+        # budget. That direction is the expensive one: a bounded
+        # `max_buffer_values` ring evicts real history sooner, and the
+        # backfill after recovery is bigger than the link the mode exists to
+        # spare can carry.
         if not entry.rate.should_send(value, now):
             return
+
+        sample = sampling.Sample(slug, value, timestamp_ms)
         if self._connected:
+            if entry.cap is not None and not entry.cap.should_send(value, now):
+                # Low-bandwidth mode: recorded, but parked rather than sent.
+                # The cap is `min(rate_throttle_hz, datapoint_max_hz)` —
+                # `_cap_policy` returns `None` in every case where the
+                # configured rate is the smaller of the two — and it is an
+                # average rather than a minimum gap, because a minimum gap
+                # asked about the grid `entry.rate` just produced settles at
+                # half the rate it was given.
+                if entry.buffer_enabled:
+                    self.backlog.push(slug, sample)
+                return
             # Live: someone is actually connected to receive it right now.
             self.samples.put_threadsafe(self._loop, sample)
         elif entry.buffer_enabled:

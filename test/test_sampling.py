@@ -11,6 +11,7 @@ from sensor_msgs.msg import BatteryState, CompressedImage, JointState
 
 from fleetless_bridge.sampling import (
     FieldPathError,
+    AverageHzPolicy,
     MaxHzPolicy,
     SendEveryPolicy,
     apply_scale_offset,
@@ -211,3 +212,36 @@ def test_no_ceiling_and_a_zero_ceiling_are_the_same_answer():
     assert isinstance(rate_policy(None), SendEveryPolicy)
     assert isinstance(rate_policy(0), SendEveryPolicy)
     assert isinstance(rate_policy(0.0), SendEveryPolicy)
+
+
+# --- AverageHzPolicy ----------------------------------------------------------
+
+
+def test_average_hz_holds_its_rate_over_a_stream_that_is_already_throttled():
+    """The reason this exists beside `MaxHzPolicy`.
+
+    A minimum gap is exactly right for a ceiling on a raw topic and exactly
+    wrong for one applied to a stream some other policy has already thinned:
+    on a 5.56 Hz grid a 5 Hz minimum interval never falls due at the right
+    moment, so every second sample is skipped and the result is 2.8 Hz, not
+    5. Spending a credit instead makes the long-run rate the one asked for,
+    whatever grid the arrivals land on."""
+    policy = AverageHzPolicy(hz=5.0)
+    grid = 0.18  # 5.56 Hz, what a 6 Hz MaxHzPolicy admits from a fast topic
+    sent = sum(1 for i in range(200) if policy.should_send(i, i * grid))
+    rate = sent / (200 * grid)
+    assert 4.9 <= rate <= 5.1
+
+
+def test_average_hz_lets_a_stream_slower_than_its_rate_through_untouched():
+    policy = AverageHzPolicy(hz=5.0)
+    assert all(policy.should_send(i, i * 0.5) for i in range(20))
+
+
+def test_average_hz_does_not_bank_a_long_silence_into_a_burst():
+    """Credit is capped, so a datapoint quiet for an hour does not come back
+    with an hour of samples the ceiling was supposed to prevent."""
+    policy = AverageHzPolicy(hz=5.0)
+    policy.should_send(0, 0.0)
+    burst = sum(1 for i in range(50) if policy.should_send(i, 3600.0))
+    assert burst <= 2

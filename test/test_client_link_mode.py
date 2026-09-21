@@ -70,7 +70,7 @@ def test_after_hello_the_bridge_reports_its_mode_once_and_pings_feed_the_control
             # lag — moving the clock before that would start the enter timer
             # from the later time and the mode would never arrive.
             await session.recv_pong()
-            # Half of `enter_after_s`, so the tick has run hundreds of times
+            # Half of `enter_after_s`, so the tick has run a dozen times
             # against a lag over the threshold and must still say nothing.
             await clock.advance(0.5)
             box["early"] = list(cloud.link_modes)
@@ -91,9 +91,9 @@ def test_after_hello_the_bridge_reports_its_mode_once_and_pings_feed_the_control
     # Nothing before the threshold: the crossing tick is pinned in
     # test_link_mode.py, and this is the wired path saying the same.
     assert len(box["early"]) == 1
-    # Two frames for the whole session and no more. The tick runs hundreds of
-    # times here, so a frame per evaluation — the heartbeat `link_mode_message`
-    # exists not to be — would be unmissable.
+    # Two frames for the whole session and no more. The tick runs tens of
+    # times here, so a frame per evaluation — the heartbeat
+    # `link_mode_message` exists not to be — would be unmissable.
     assert len(box["all"]) == 2
     # The lever was pulled with the same answer the wire carries.
     assert ros.low_bandwidth_calls[-1][0] is True

@@ -20,6 +20,7 @@ from test_ros_runtime import _battery, _camera_cfg, _drain_camera_states, run
 from helpers import by_slug
 
 from fleetless_bridge.link_mode import LowBandwidthSettings
+from fleetless_bridge.sampling import AverageHzPolicy, MaxHzPolicy, rate_policy
 from fleetless_bridge.protocol import (
     LOW_BANDWIDTH_DEFAULTS,
     DatapointConfig,
@@ -214,15 +215,6 @@ def test_the_cap_applies_unless_the_datapoint_says_keep():
     assert len(per_slug.get("kept", [])) == 6
 
 
-class _RefusesEverything:
-    """A `RatePolicy` that never admits a sample. Substituted for a
-    subscription's configured policy to prove the live decision does not
-    consult it while the cap holds."""
-
-    def should_send(self, value, now):
-        return False
-
-
 def _publish_for(seconds, interval=0.02):
     """Publish as steadily as the loop allows for `seconds`, and return how
     long it actually took — a rate asserted against the nominal duration
@@ -241,28 +233,28 @@ def _publish_for(seconds, interval=0.02):
         node.destroy_node()
 
 
-def test_the_cap_replaces_the_configured_rate_rather_than_chaining_with_it():
-    """While the cap holds it is the only policy the live decision asks.
+def test_the_cap_is_an_average_and_not_a_minimum_gap():
+    """The one decision that keeps the live rate on the ceiling.
 
-    Two policies in series beat against each other: an arrival the
-    configured rate admitted, falling just short of the cap's own threshold,
-    is dropped without advancing the cap, so the next admission slips a
-    whole source interval and the effective rate lands well under the
-    ceiling. Pinned structurally rather than by measurement — the configured
-    policy is replaced with one that refuses everything, so a live path that
-    still consulted it would deliver nothing at all."""
+    The configured rate gates the record, so the cap is applied to a stream
+    that is already thinned — and a minimum gap asked about a grid only
+    slightly coarser than itself is never quite due, so it skips every second
+    arrival and settles at half the rate it was given. An average holds the
+    rate over any grid.
+
+    Pinned here, where the choice is made, because the difference is
+    invisible to any check of the form "at most the ceiling". What the two
+    kinds actually produce is compared in
+    `test_a_minimum_gap_cap_would_settle_at_the_beat_frequency`, and the
+    policy's own arithmetic is `test_sampling.py`'s."""
 
     async def body(rt):
         await rt.apply_config(by_slug([_dp("capped", rate_throttle_hz=6)]))
         await asyncio.sleep(0.3)
         await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=5))
-        rt._subscriptions["capped"].rate = _RefusesEverything()
-        _publish(6)
-        return await _drain_samples(rt)
+        return rt._subscriptions["capped"].cap
 
-    samples = run(body)
-    # Six publishes inside 200 ms: the 5 Hz cap admits the first and no more.
-    assert len(samples) == 1
+    assert isinstance(run(body), AverageHzPolicy)
 
 
 def test_the_effective_live_rate_lands_on_the_ceiling_not_below_it():
@@ -284,38 +276,46 @@ def test_the_effective_live_rate_lands_on_the_ceiling_not_below_it():
 
     count, elapsed = run(body)
     rate = count / elapsed
-    assert 4.0 <= rate <= 6.0, "effective live rate was {:.2f} Hz".format(rate)
+    # The floor sits well clear of the chain's 2.8 Hz and leaves a stalled
+    # executor room to lose several admissions without a false red.
+    assert 3.5 <= rate <= 6.0, "effective live rate was {:.2f} Hz".format(rate)
 
 
-def test_the_configured_rate_still_decides_what_the_backlog_keeps():
-    """The cap spares the link, so the ceiling is the live rate — but the
-    history is still the datapoint's own rate, not the raw topic. The two
-    policies see every arrival independently; neither gates the other."""
+def test_the_record_stays_within_the_configured_rate_while_the_mode_holds():
+    """What the cloud ends up holding — the live sends plus the backfill that
+    follows them — is still `rate_throttle_hz`, not more.
+
+    A live send is part of the record, so the configured rate is the one
+    gate deciding whether a sample is recorded at all; the mode only decides
+    whether a recorded sample goes now or waits. Two independent gates would
+    make the two sets disjoint instead of nested, and their union would
+    exceed the ceiling the configuration states — in the expensive
+    direction, since a bounded `max_buffer_values` ring would then evict
+    real history sooner and the backfill after recovery would be larger than
+    the link the mode exists to spare can afford."""
 
     async def body(rt):
         await rt.apply_config(by_slug([
             _dp("capped", rate_throttle_hz=6,
-                retention=RetentionConfig(enabled=True, max_buffer_values=50)),
+                retention=RetentionConfig(enabled=True, max_buffer_values=500)),
         ]))
         await asyncio.sleep(0.3)
         await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=5))
-        # The cap admits nothing, so every arrival the configured rate
-        # admits is the backlog's business alone.
-        rt._subscriptions["capped"].cap = _RefusesEverything()
-        elapsed = _publish_for(2.0)
+        elapsed = _publish_for(3.0)
         live = await _drain_samples(rt)
-        held = []
-        while True:
-            sample = rt.backlog.pop_any()
-            if sample is None:
-                break
-            held.append(sample)
-        return len(live), len(held), elapsed
+        held = 0
+        while rt.backlog.pop_any() is not None:
+            held += 1
+        return len(live), held, elapsed
 
     live, held, elapsed = run(body)
-    assert live == 0
-    rate = held / elapsed
-    assert 5.0 <= rate <= 7.0, "backlog rate was {:.2f} Hz".format(rate)
+    record = (live + held) / elapsed
+    # `MaxHzPolicy` carries its own 2 % tolerance, so the budget it enforces
+    # is a shade over the nominal 6 Hz; anything near 10 is the two-gate
+    # union this test exists to rule out.
+    assert record <= 7.0, "the record ran at {:.2f} Hz".format(record)
+    # And the live half still sits on the ceiling rather than under it.
+    assert 3.5 <= live / elapsed <= 6.0
 
 
 def test_a_datapoint_already_slower_than_the_cap_is_left_alone():
@@ -507,3 +507,61 @@ def test_setting_the_mode_before_start_is_not_an_error():
     assert rt.low_bandwidth_params() == {}
     asyncio.run(rt.set_low_bandwidth(True, _settings()))
     rt.stop()  # must not raise
+
+
+# --- the composition, simulated ---------------------------------------------
+
+
+def _simulate(source_hz, configured_hz, ceiling_hz, seconds=60.0,
+              cap_policy=AverageHzPolicy):
+    """`_on_message`'s rate decision, driven by a float clock instead of a
+    ROS graph: the real policy objects, the real order, no timing.
+
+    Returns the live rate, the backlog rate and their union — the record,
+    which is what the cloud ends up holding once the backfill has drained."""
+    rate = rate_policy(configured_hz)
+    cap = cap_policy(ceiling_hz)
+    live = held = 0
+    for i in range(int(seconds * source_hz)):
+        now = i / source_hz
+        if not rate.should_send(i, now):
+            continue
+        if cap.should_send(i, now):
+            live += 1
+        else:
+            held += 1
+    return live / seconds, held / seconds, (live + held) / seconds
+
+
+@pytest.mark.parametrize(
+    "source_hz,configured_hz,ceiling_hz",
+    [(50, 6, 5), (50, 3, 1), (10, 1.5, 1)],
+)
+def test_the_record_is_within_the_configured_rate_and_live_lands_on_the_min(
+    source_hz, configured_hz, ceiling_hz
+):
+    """Three ratios, against the arithmetic the bridge actually runs.
+
+    Both halves of the promise at once: the record never exceeds
+    `rate_throttle_hz` — a live send counts against it, because the cloud
+    holds it — and the live rate is `min(rate_throttle_hz,
+    datapoint_max_hz)` rather than the beat frequency two chained minimum
+    gaps settle at."""
+    live, _held, record = _simulate(source_hz, configured_hz, ceiling_hz)
+    # `MaxHzPolicy`'s own 2 % tolerance is the only thing above nominal here.
+    assert record <= configured_hz * 1.03, "record {:.2f} Hz".format(record)
+    expected = min(configured_hz, ceiling_hz)
+    assert abs(live - expected) <= 0.1, "live {:.2f} Hz, wanted {}".format(live, expected)
+
+
+def test_a_minimum_gap_cap_would_settle_at_the_beat_frequency():
+    """Why the cap is not a `MaxHzPolicy`, stated as the number it produces.
+
+    Same source, same configured rate, same ceiling — only the cap's kind
+    differs. A minimum gap lands near 2.8 Hz against a ceiling of 5, and no
+    assertion of the form "at most the ceiling" can tell that apart from
+    working correctly."""
+    average, _, _ = _simulate(50, 6, 5)
+    gapped, _, _ = _simulate(50, 6, 5, cap_policy=MaxHzPolicy)
+    assert abs(average - 5.0) <= 0.1
+    assert gapped < 3.5
