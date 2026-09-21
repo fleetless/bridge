@@ -4848,7 +4848,21 @@ _URDF_FOR_SYNC_WITH_TEXTURE = """<?xml version="1.0"?>
 class _AssetUploadHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length)
+        if self.server.keep_body:
+            body = self.rfile.read(length)
+            body_length = len(body)
+        else:
+            # Drained in chunks and counted, not kept: one test sends a
+            # file larger than anything this process should hold, and
+            # `received` outlives the request. The count is what that test
+            # asserts on anyway.
+            body = b""
+            body_length = 0
+            while body_length < length:
+                chunk = self.rfile.read(min(1 << 20, length - body_length))
+                if not chunk:
+                    break
+                body_length += len(chunk)
         # `self.headers` (an `email.message.Message`) is case-insensitive on
         # `.get()`, same as HTTP itself — `urllib.request.Request` sends
         # `X-fleetless-asset-name` (its own `Key.capitalize()`, not this
@@ -4880,6 +4894,7 @@ class _AssetUploadHandler(http.server.BaseHTTPRequestHandler):
                 "Content-Length": self.headers.get("Content-Length"),
             },
             "body": body,
+            "body_length": body_length,
         }
         self.server.received.append(record)
         answer = self.server.status_for(record)
@@ -4959,14 +4974,17 @@ def _start_rate_limited_upload_server(*, rate_limit_names, retries_needed=2, ret
     return server, url, stop
 
 
-def _start_asset_upload_server(*, status=201, fail_names=(), delay_s=0.0):
+def _start_asset_upload_server(*, status=201, fail_names=(), delay_s=0.0, keep_body=True):
     """A real HTTP server for the upload path (this package's own rule:
     verify the shape a real client sends, not the shape a test builds).
     `fail_names` makes uploads for specific `X-Fleetless-Asset-Name` values
     fail with a 500, everything else succeeds with `status`. `delay_s`
-    stalls every response, for tests that need an upload still in flight."""
+    stalls every response, for tests that need an upload still in flight.
+    `keep_body=False` counts each body instead of retaining it, for the one
+    test whose file is larger than this process has any business holding."""
     server = http.server.HTTPServer(("127.0.0.1", 0), _AssetUploadHandler)
     server.received = []
+    server.keep_body = keep_body
 
     def status_for(record):
         if delay_s:
@@ -5139,43 +5157,60 @@ def test_sync_assets_applies_the_same_containment_check_to_a_texture():
 # bridge attempts every file and reports what comes back.
 
 
-def test_a_mesh_far_over_the_old_ceiling_is_uploaded_rather_than_refused():
-    """The inverse of the check that used to live here. The old ceiling was
-    67,108,864 bytes; this states the mesh at nearly three times that — the
-    size of the real `base.dae` that started the whole story — and the
-    upload must still be attempted, with nothing in `failed`.
+_OVER_OLD_CEILING_BYTES = 64 * 1024 * 1024 + 1
 
-    The size is mocked rather than written: the claim is about the
-    comparison that no longer happens, and a 194 MB fixture has no business
-    in this package. `_upload_mesh_file` is mocked with it, so the lied-about
-    size never reaches a real `Content-Length`.
 
-    A file this size is still not *scanned* if it is a `.dae` — see
-    `DAE_SCAN_MAX_BYTES` and its own tests below. Uploading and reading are
-    two different costs, and only one of them was the cloud's to bound."""
-    with mock.patch.object(
-        RosRuntime, "_file_size_or_none", return_value=193_886_766
-    ):
-        with mock.patch.object(
-            RosRuntime, "_upload_mesh_file", return_value=UploadResult(True)
-        ) as upload_mock:
+def test_a_mesh_far_over_the_old_ceiling_is_uploaded_and_states_its_size():
+    """The inverse of the check that used to live here: one byte over the
+    old 67,108,864-byte ceiling, which would have been refused before a
+    single byte was read, and is now simply uploaded.
 
-            async def body(rt):
-                await _publish_urdf_and_wait(rt)
-                server, url, stop = _start_asset_upload_server()
-                try:
-                    await rt.sync_assets("sync-1", url, "upload-tok", (_RESOLVABLE_MESH_URI,))
+    Nothing in the upload path is mocked, so this also proves the number
+    reaches the wire — the announced size, the `Content-Length` and the
+    bytes the server actually received are asserted to be the same one. A
+    mocked `_upload_mesh_file` could show "it was attempted" and nothing
+    about what was sent, which is the half that decides whether the cloud
+    can weigh it at all.
+
+    The file is sparse (`truncate`, no bytes written), so a fixture this
+    size costs nothing: measured at 0 blocks on disk, 0.05 s on the wire
+    and no change in peak RSS. The server counts the body instead of
+    keeping it, for the same reason.
+
+    `.stl`, not `.dae`: a file this size is deliberately *not* scanned for
+    internal textures — see `DAE_SCAN_MAX_BYTES` below. Uploading and
+    reading are two different costs, and only one of them was ever the
+    cloud's to bound."""
+    mesh_uri = "package://robot_description_fixture/enormous.stl"
+    with tempfile.NamedTemporaryFile(suffix=".stl") as mesh_file:
+        mesh_file.truncate(_OVER_OLD_CEILING_BYTES)
+        mesh_file.flush()
+
+        async def body(rt):
+            await _publish_urdf_and_wait(rt)
+            server, url, stop = _start_asset_upload_server(keep_body=False)
+            try:
+                with mock.patch.object(
+                    RosRuntime, "_resolve_package_uri", return_value=mesh_file.name,
+                ):
+                    await rt.sync_assets("sync-1", url, "upload-tok", (mesh_uri,))
                     updates = await _drain_asset_progress_until(rt, {"finished"})
-                    return server.received, updates
-                finally:
-                    stop()
+                return server.received, updates
+            finally:
+                stop()
 
-            received, updates = run(body)
-            upload_mock.assert_called_once()
+        received, updates = run(body)
 
     assert updates[-1].state == "finished"
     assert updates[-1].done == updates[-1].total == 2
     assert updates[-1].failed == ()
+
+    sent = [r for r in received if r["headers"]["X-Fleetless-Asset-Name"] == mesh_uri]
+    assert len(sent) == 1, [r["headers"]["X-Fleetless-Asset-Name"] for r in received]
+    record = sent[0]
+    assert record["headers"]["X-Fleetless-Asset-Size"] == str(_OVER_OLD_CEILING_BYTES)
+    assert record["headers"]["Content-Length"] == str(_OVER_OLD_CEILING_BYTES)
+    assert record["body_length"] == _OVER_OLD_CEILING_BYTES
 
 
 # --- the cloud refuses: the store's three numbers survive the frame ---

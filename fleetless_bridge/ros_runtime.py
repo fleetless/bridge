@@ -4081,14 +4081,13 @@ class RosRuntime:
         # same pre-scan pass that already resolves every `uri`, before
         # anything reads its bytes — and read again by the upload loop
         # below instead of stated a second time. Closing this gap is the
-        # whole reason it exists: `_extract_dae_texture_references` used to
-        # run unconditionally on every resolved `.dae`, `open()`ing and
-        # `.read()`ing the whole file to search for `<init_from>` tags,
-        # *before* the ceiling check the upload loop performed further
-        # down ever ran. The upload path was closed first and left this one
-        # open — the same 194 MB, one function earlier, confirmed with a
-        # same-bytes `.stl` control run that stayed at baseline while the
-        # `.dae` run added ~305 MB of peak RSS.
+        # whole reason it exists: `_extract_dae_texture_references` reads
+        # the whole file and parses it to search for `<init_from>` tags, so
+        # something has to know how large it is before anything opens it.
+        # `DAE_SCAN_MAX_BYTES` is what reads this number now; a per-file
+        # upload ceiling used to, and the same 194 MB came back the moment
+        # that went — confirmed with a same-bytes `.stl` control run that
+        # stayed at baseline while the `.dae` run added ~305 MB of peak RSS.
         sizes: Dict[str, Optional[int]] = {}
         # the mesh-level half of the same bound already given to the
         # `.dae`-internal half. One shared counter, not one per code path —
@@ -4993,8 +4992,10 @@ class RosRuntime:
            (seeing `Content-Length: 0`) read nothing and closed, producing
            a `BrokenPipeError` on an ordinary loopback round-trip. `size`
            is a parameter rather than re-derived here because the caller
-           (`_upload_mesh_file`) already has it from its own ceiling
-           check — one `stat`, not two.
+           (`_upload_mesh_file`) already holds it for the same
+           `Content-Length` — one `stat`, not two. It is also the announced
+           size (`_asset_upload_headers`), so the header the cloud weighs
+           and the body it then reads cannot disagree.
 
         2. **The file is reopened for every retry attempt, never reused.**
            `_upload_asset_bytes`'s own comment about handing one `Request`
