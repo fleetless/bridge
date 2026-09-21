@@ -46,6 +46,11 @@ class _RecordingLog:
         self._record(fmt, args)
 
 
+def _greetings(recording_log):
+    """How many sessions have reached `hello_ok`, counted from the log."""
+    return len([m for m in recording_log.messages if m.startswith("Connected as robot")])
+
+
 async def _close_now(session):
     """A `then` for `accepts`: hang up right after the handshake, so the
     client reconnects and meets the window a second time."""
@@ -105,7 +110,7 @@ def test_a_protocol_mismatch_waits_long_and_then_exits_so_a_respawn_can_upgrade(
     reason, delays, connections = asyncio.run(scenario())
     assert reason is StopReason.REJECTED
     assert connections == 1, "no second attempt inside this process"
-    assert delays and delays[-1] >= 15, delays  # 30 s scheduled, equal jitter floors at half
+    assert delays and delays[-1] >= 60, delays  # 120 s scheduled, equal jitter floors at half
 
 
 def test_a_deprecated_protocol_is_warned_about_once_per_process(monkeypatch):
@@ -125,7 +130,11 @@ def test_a_deprecated_protocol_is_warned_about_once_per_process(monkeypatch):
     async def scenario():
         async with FakeCloud(sequence(deprecated(then=_close_now), deprecated())) as cloud:
             client = make_client(cloud)
-            await run_until(client, lambda: cloud.connections == 2)
+            # Two completed handshakes, read off the log the assertion also
+            # reads: `cloud.connections` counts sockets, and a socket the
+            # bridge has opened but not yet been greeted on would end the
+            # wait before the second window had been seen at all.
+            await run_until(client, lambda: _greetings(recording_log) == 2)
 
     asyncio.run(scenario())
     warned = [m for m in recording_log.messages if "2026-12-20" in m]

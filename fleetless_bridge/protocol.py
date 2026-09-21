@@ -99,8 +99,13 @@ FLEETLESS_FORMAT_VERSION = 1
 # `protocol_mismatch` left this set with the version window: a cloud that
 # refuses a version today may serve it after its own next deploy is rolled
 # back, and a robot that exits leaves its supervisor respawning it every five
-# seconds. The client waits out a long backoff before that exit instead.
+# seconds. The client waits out a long delay before that exit instead.
 TERMINAL_HELLO_ERROR_CODES = frozenset({"invalid_token"})
+
+#: The one hello-error code the client treats neither as terminal nor as an
+#: ordinary retry: the refusal is about the package on disk, so the wait
+#: before the exit is measured in minutes rather than seconds (`client.py`).
+VERSION_REFUSED_CODE = "protocol_mismatch"
 
 # Why a camera_state frame was sent (`bridgeCameraState.cause` in the wire
 # contracts). Required on every frame, not just the unsolicited ones:

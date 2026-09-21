@@ -226,13 +226,14 @@ def test_the_vendored_constants_still_match_the_contracts():
 
 @pytest.mark.skipif(_protocol_source_file() is None, reason=_NO_CONTRACTS)
 def test_the_bridge_protocol_version_still_matches_the_contracts():
-    """`PROTOCOL_VERSION` is a hand-kept literal on both sides of the wire —
-    `fleetless_bridge/protocol.py` here, the contracts package there —
-    and nothing else checks that they agree. `test_protocol.py`'s own
-    `PROTOCOL_VERSION == 2` catches an edit to *this* file, which is real
-    value, but not the two sides drifting apart, since it never opens the
-    other one. A diff, not a promise, same shape as the schema and constants
-    guards above."""
+    """`protocol.py` reads `PROTOCOL_VERSION` out of the vendored
+    `contracts_constants.json`, and `test_protocol.py`'s
+    `test_the_protocol_version_comes_from_the_vendored_constants` pins it to
+    that file — so the Python side cannot drift from the copy. This is the
+    other half: the copy against the contracts *source*, which is where the
+    number is declared. Without it a stale vendored constants file would
+    satisfy both sides of the wire and agree with neither. A diff, not a
+    promise, same shape as the schema and constants guards above."""
     source_file = _protocol_source_file()
     match = re.search(
         r"export const PROTOCOL_VERSION = (\d+)",

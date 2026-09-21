@@ -6,10 +6,10 @@ ros-@ROS_DISTRO@-fleetless-bridge (3.2.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgenc
     the wire, with one test standing between them and drift.
   * **A refused protocol version no longer exits straight away.** The cloud
     can refuse the version this package speaks; the fix is a newer package,
-    which the running process could never load. It waits half a minute,
-    jittered, and then exits, so the launch file's respawn retries once every
-    half minute instead of every five seconds — and a fresh process picks up
-    an upgraded package by itself. The exit code is still 2.
+    which the running process could never load. It waits one to two minutes
+    and then exits, so the launch file's respawn retries every couple of
+    minutes instead of every five seconds — and a fresh process picks up an
+    upgraded package by itself. The exit code is still 2.
   * **A deprecated protocol version is warned about once per process**, with
     the date the cloud stops serving it and the newest release to upgrade to.
     Once, not once per reconnect: the date does not move in between.

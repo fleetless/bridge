@@ -80,6 +80,7 @@ from fleetless_bridge.protocol import (
     CLOSE_CODE_ROBOT_DELETED,
     CLOSE_CODE_SUPERSEDED,
     PROTOCOL_VERSION,
+    VERSION_REFUSED_CODE,
     ApplyError,
     CloudAssetRequest,
     CloudCameraStart,
@@ -127,14 +128,12 @@ BACKOFF_CAP_S = 30.0
 # package on disk, which this process can never load. So it waits — far
 # longer than an ordinary reconnect, because nothing it does in the meantime
 # can help — and then exits, and the launch file's respawn is what picks the
-# upgrade up. Half a minute of waiting plus a 5 s respawn is one attempt per
-# ~35 s instead of one every 5 s.
-REFUSAL_BACKOFF_INITIAL_S = 30.0
-# The ceiling the schedule would climb to. One process takes at most one
-# refusal delay today (it exits after it), so this bounds a schedule rather
-# than a wait anybody has measured — kept so that a future in-process retry
-# cannot grow without one.
-REFUSAL_BACKOFF_CAP_S = 600.0
+# upgrade up. One flat wait, equally jittered, so 60 s to 120 s; with the
+# launch file's 5 s respawn that is one attempt every 65 s to 125 s, and an
+# installed upgrade takes effect inside about two minutes. It does not grow:
+# a process takes this wait once and then exits, so there is no schedule to
+# climb.
+REFUSAL_WAIT_S = 120.0
 
 CLOSE_TIMEOUT_S = 5.0
 
@@ -1331,8 +1330,11 @@ class BridgeClient:
         # tests that opt in on purpose (test_client_pressure_pump.py).
         self._pressure_sleep = pressure_sleep if pressure_sleep is not None else asyncio.sleep
         self._backoff = backoff if backoff is not None else ExponentialBackoff()
-        self._refusal_backoff = ExponentialBackoff(
-            initial=REFUSAL_BACKOFF_INITIAL_S, cap=REFUSAL_BACKOFF_CAP_S
+        # `ExponentialBackoff` with the cap at the initial value: nothing to
+        # grow into, and the equal-jitter arithmetic stays in one place
+        # rather than being written a second time for one wait.
+        self._refusal_wait = ExponentialBackoff(
+            initial=REFUSAL_WAIT_S, cap=REFUSAL_WAIT_S
         )
         # Set when the cloud refused this bridge's protocol version, cleared
         # by the next `hello_ok`: `run()` reads it to choose between
@@ -1499,7 +1501,7 @@ class BridgeClient:
                 # would keep running the package the cloud just refused, so
                 # an apt upgrade would never take effect; exiting hands the
                 # decision to the respawn, which loads what is installed now.
-                delay = self._refusal_backoff.next_delay()
+                delay = self._refusal_wait.next_delay()
                 log.info(
                     "Protocol refused; exiting in %.0f s so a restart can pick up "
                     "an upgraded package",
@@ -1717,7 +1719,6 @@ class BridgeClient:
                     # healthy, so only that resets the backoff.
                     self._backoff.reset()
                     self._last_refused_for_version = False
-                    self._refusal_backoff.reset()
                     log.info("Connected as robot %s", message.robot_id)
                     if message.protocol_status == "deprecated" and not self._warned_deprecated:
                         self._warned_deprecated = True
@@ -1726,7 +1727,7 @@ class BridgeClient:
                             "Upgrade before then: apt-get install --only-upgrade "
                             "ros-$ROS_DISTRO-fleetless-bridge (latest is %s).",
                             PROTOCOL_VERSION,
-                            message.sunset_at,
+                            message.sunset_at or "an unannounced date",
                             message.latest_bridge_version or "unknown",
                         )
                     if self._ros is not None:
@@ -1758,7 +1759,7 @@ class BridgeClient:
                             message.message,
                         )
                         return StopReason.REJECTED
-                    if message.code == "protocol_mismatch":
+                    if message.code == VERSION_REFUSED_CODE:
                         if not self._last_refused_for_version:
                             log.error(
                                 "The cloud refused this bridge's protocol version (%s). "

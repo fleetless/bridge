@@ -113,11 +113,10 @@ being superseded would trade the robot back and forth with its replacement
 forever. Everything else is retried with a jittered exponential backoff from
 1 s up to 30 s.
 
-A protocol version the cloud refuses waits half a minute, jittered, before
-that exit. The fix is a newer package, which this process could never load,
-so the wait plus the launch file's five-second respawn makes it one attempt
-every half minute — and the fresh process picks up an upgraded package by
-itself.
+A protocol version the cloud refuses waits one to two minutes before that
+exit, so the launch file's respawn retries every couple of minutes and a
+fresh process picks up an upgraded package by itself. The fix is a newer
+package, which the running process could never load.
 
 ## 📚 Documentation
 

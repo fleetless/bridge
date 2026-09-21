@@ -160,7 +160,12 @@ class Session:
         self._cloud.job_lost.append(payload)
         return payload
 
-    async def accept(self, robot_id: str = ROBOT_ID, protocol: dict = None, bridge: dict = None) -> None:
+    async def accept(
+        self,
+        robot_id: str = ROBOT_ID,
+        protocol: Optional[dict] = None,
+        bridge: Optional[dict] = None,
+    ) -> None:
         # `protocol` and `bridge` are optional on the wire, so an omitted one
         # is left out of the frame rather than sent as null: that is the
         # frame an older cloud produces, and the bridge has to read both.
