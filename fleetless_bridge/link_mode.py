@@ -152,6 +152,14 @@ class LinkMode:
         self._calm_since: Optional[float] = None
         self._last_reason = "lag"
 
+    @property
+    def reason(self) -> str:
+        """Which measure the mode is on for, for a caller holding no
+        transition — the report after a reconnect into a mode that was
+        already on. `lag` or `dwell`; it says nothing while `active` is
+        False, and a forced mode names itself."""
+        return self._last_reason
+
     def update_settings(self, settings: LowBandwidthSettings, now: float) -> Optional[Transition]:
         """New thresholds restart both timers: seconds counted against the old
         numbers say nothing about the new ones."""

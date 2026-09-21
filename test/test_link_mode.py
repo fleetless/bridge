@@ -235,6 +235,26 @@ def test_forced_on_is_active_from_construction():
     assert m.evaluate(1.0) is None
 
 
+def test_reason_names_the_measure_that_entered_the_mode():
+    """A caller that has to state the mode with no transition in hand — the
+    greeting after a reconnect into a mode that was already on — needs the
+    reason the mode actually has, not a guess."""
+    lagging = LinkMode(DEFAULTS, now=0.0)
+    lagging.observe_cloud(lag_ms=9000, latency_ms=100, now=1.0)
+    for t in range(2, 12):
+        lagging.evaluate(float(t))
+    assert lagging.evaluate(12.0) == Transition(True, "lag")
+    assert lagging.reason == "lag"
+
+    dwelling = LinkMode(DEFAULTS, now=0.0)
+    for t in range(1, 11):
+        dwelling.observe_dwell(2500.0, now=float(t))
+        dwelling.evaluate(float(t))
+    dwelling.observe_dwell(2500.0, now=11.0)
+    assert dwelling.evaluate(11.0) == Transition(True, "dwell")
+    assert dwelling.reason == "dwell"
+
+
 def test_a_settings_change_within_auto_reports_nothing():
     m = LinkMode(DEFAULTS, now=0.0)
     tighter = LowBandwidthSettings.resolve({"enter_lag_ms": 300, "exit_lag_ms": 100}, {})

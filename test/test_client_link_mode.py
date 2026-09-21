@@ -15,6 +15,7 @@ itself — and a fast `tick`. Real time would buy the same assertions at ten
 seconds apiece.
 """
 import asyncio
+import logging
 
 from fake_cloud import FakeCloud, accepts, sequence
 from helpers import make_client, run_until
@@ -557,3 +558,128 @@ def test_a_parameter_set_the_published_section_crosses_is_survived():
     assert box["after"] == box["before"]
     assert box["after"].enter_lag_ms == 600
     assert box["still_running"] is True
+
+
+class _CapturingHandler(logging.Handler):
+    """Everything client.py logs, at any level.
+
+    Not `caplog`: this suite has established repeatedly (`test_main.py`,
+    `test_live.py`, `test_livekit_signal.py`) that pytest disables
+    propagation for these loggers, so a `caplog` assertion would pass
+    whether or not the line was written — the worst state for a check whose
+    job is noticing a missing one."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.messages = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def _capturing_client_log():
+    handler = _CapturingHandler()
+    watched = logging.getLogger("fleetless_bridge.client")
+    watched.addHandler(handler)
+    watched.setLevel(logging.DEBUG)
+    return handler, watched
+
+
+def test_the_transition_log_line_carries_the_numbers_that_caused_it():
+    """An operator reading the robot's journal has the threshold in the
+    configuration and needs the reading that crossed it. The controller does
+    not keep either number, so the client remembers what it last fed in."""
+    clock = Clock()
+    ros = FakeRos()
+    ros.low_bandwidth_params_value["enter_after_s"] = 1
+    handler, watched = _capturing_client_log()
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            await session.ping(1, latency_ms=50, lag_ms=5000)
+            await session.recv_pong()
+            await clock.advance(1.0)
+            await clock.advance(5.0)
+            box["entered"] = await session.recv_link_mode()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: "entered" in box)
+        return box
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        watched.removeHandler(handler)
+
+    on = [m for m in handler.messages if m.startswith("Low-bandwidth mode on")]
+    assert len(on) == 1
+    # The reading the cloud sent, and the threshold it crossed.
+    assert "5000 ms" in on[0] and "2000 ms" in on[0]
+
+
+def test_the_greeting_after_a_reconnect_names_the_measure_that_entered_the_mode():
+    """`lag` was hard-coded here, which is a guess: a mode entered on the
+    local queue dwell — the case where the cloud had stopped answering
+    altogether — would have been reported to that same cloud as a lag
+    problem."""
+    clock = Clock()
+    ros = FakeRos()
+    ros.low_bandwidth_params_value["enter_after_s"] = 1
+    # A dwell a test can produce without waiting two real seconds out, and an
+    # exit threshold that stays under it — crossed thresholds are refused.
+    ros.low_bandwidth_params_value["enter_lag_ms"] = 100
+    ros.low_bandwidth_params_value["exit_lag_ms"] = 50
+
+    async def scenario():
+        box = {}
+
+        async def first(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            # No ping at all: the cloud is silent and the dwell carries the
+            # decision, which is the whole point of the second measure.
+            # The session has to be demonstrably older than the sample's
+            # capture stamp, or the guard against measuring an outage drops
+            # the reading — which is the behaviour tested just above.
+            await asyncio.sleep(0.5)
+            loop = asyncio.get_event_loop()
+            ros.samples.put_threadsafe(
+                loop,
+                Sample(slug="speed", value=1, timestamp_ms=capture_timestamp_ms() - 200),
+            )
+            await session.recv_datapoint()
+            # A small step first, so a tick evaluates while the reading is
+            # already in the tracker and opens the enter window at this time
+            # rather than at the far end of the jump. Then the crossing, all
+            # inside the tracker's five-second window so the reading is still
+            # there when the timer comes due.
+            await clock.advance(0.2)
+            await clock.advance(1.5)
+            box["entered"] = await session.recv_link_mode()
+            await session.close()
+
+        async def second(session):
+            await session.recv_hello()
+            await session.accept()
+            box["greeting"] = await session.recv_link_mode()
+            await session.drain()
+
+        async with FakeCloud(sequence(first, second)) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: "greeting" in box)
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["entered"] == {**box["entered"], "low_bandwidth": True, "reason": "dwell"}
+    # The second session restates the mode it is still in, with the reason it
+    # actually has.
+    assert box["greeting"]["low_bandwidth"] is True
+    assert box["greeting"]["reason"] == "dwell"

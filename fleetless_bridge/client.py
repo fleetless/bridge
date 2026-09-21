@@ -1187,6 +1187,13 @@ class _SnapshotSource:
         return await self._ros.next_snapshot(max_bytes)
 
 
+def _ms(value: Optional[float]) -> str:
+    """A reading for a log line, or `none` — which is a real answer here: no
+    ping has arrived, or nothing has been sent, and the controller reads
+    either as calm rather than as a number."""
+    return "none" if value is None else "{:.0f} ms".format(value)
+
+
 def _drain_one(queue: "asyncio.Queue"):
     """One item from a plain `asyncio.Queue`, or `None` — the `try_get`
     the bridge's own queue classes have and `asyncio.Queue` does not."""
@@ -1283,6 +1290,12 @@ class BridgeClient:
         # the link, and a reconnect does not make a narrow uplink wide.
         self._link_mode = LinkMode(self._lb_settings, self._now())
         self._link_mode_task: Optional["asyncio.Task"] = None
+        # The last two readings handed to the controller, kept here only so
+        # a transition can be logged with the numbers that caused it. The
+        # controller decides on a window and a p95 and keeps neither, and
+        # asking it to would be asking it to carry state for a log line.
+        self._last_lag_ms: Optional[int] = None
+        self._last_dwell_ms: Optional[float] = None
         # When this session opened, in the same wall clock a sample's
         # `timestamp_ms` uses — see `_observe_dwell`. Set here too, not only
         # per session, so the attribute exists before the first connection.
@@ -1432,18 +1445,30 @@ class BridgeClient:
             )
 
     def _log_transition(self, transition: Transition) -> None:
+        """One line an operator can act on: the two readings that crossed,
+        the threshold they crossed, and what the robot is now doing about
+        it. A `forced` transition names no reading, because none was
+        consulted."""
         if transition.low_bandwidth:
             log.info(
-                "Low-bandwidth mode on (%s): datapoints are capped to %g Hz, "
-                "live video is set to %s and backfill waits.",
+                "Low-bandwidth mode on (%s): lag %s, queue dwell %s, against "
+                "%d ms. Datapoints are capped to %g Hz, live video is set to "
+                "%s and backfill waits.",
                 transition.reason,
+                _ms(self._last_lag_ms),
+                _ms(self._last_dwell_ms),
+                self._lb_settings.enter_lag_ms,
                 self._lb_settings.datapoint_max_hz,
                 self._lb_settings.camera,
             )
         else:
             log.info(
-                "Low-bandwidth mode off (%s): configured rates, live video and "
-                "backfill are back.", transition.reason,
+                "Low-bandwidth mode off (%s): lag %s, queue dwell %s, against "
+                "%d ms. Configured rates, live video and backfill are back.",
+                transition.reason,
+                _ms(self._last_lag_ms),
+                _ms(self._last_dwell_ms),
+                self._lb_settings.exit_lag_ms,
             )
 
     def _report_link_mode(self, low_bandwidth: bool, reason: str) -> None:
@@ -1479,9 +1504,9 @@ class BridgeClient:
         mode."""
         if captured_ms < self._session_started_ms:
             return
-        self._link_mode.observe_dwell(
-            capture_timestamp_ms() - captured_ms, self._now()
-        )
+        dwell_ms = capture_timestamp_ms() - captured_ms
+        self._last_dwell_ms = dwell_ms
+        self._link_mode.observe_dwell(dwell_ms, self._now())
 
     async def _start_link_mode(self) -> None:
         """At `hello_ok`: read the parameter layer, state the mode once, start
@@ -1514,11 +1539,11 @@ class BridgeClient:
                 reason = "forced"
             elif self._link_mode.active:
                 # Under `auto`, a mode still on from the previous session.
-                # `lag` is the enum's word for "the link is the reason"; which
-                # of the two measures entered it did not survive the
-                # reconnect, and inventing `recovered` here would say the
-                # opposite of what is true.
-                reason = "lag"
+                # The controller knows which measure entered it — hard-coding
+                # `lag` here would report a mode entered on the local queue
+                # dwell, the case where the cloud had stopped answering
+                # altogether, to that same cloud as a lag problem.
+                reason = self._link_mode.reason
             else:
                 reason = "recovered"
             self._report_link_mode(self._link_mode.active, reason)
@@ -1740,6 +1765,7 @@ class BridgeClient:
                     # over before the pong only because nothing here awaits —
                     # the pong is still the first thing enqueued after the
                     # frame was read.
+                    self._last_lag_ms = message.lag_ms
                     self._link_mode.observe_cloud(
                         message.lag_ms, message.latency_ms, self._now()
                     )
