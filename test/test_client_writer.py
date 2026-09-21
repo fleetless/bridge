@@ -98,18 +98,21 @@ def test_every_large_send_feeds_the_rate_estimate():
     # seconds_per_send=0.1: a 100_000-byte payload observes ~1_000_000 B/s,
     # a 300_000-byte payload observes ~3_000_000 B/s; the second folds onto
     # the first exactly like `_record_snapshot_send`'s `(prev+observed)/2`.
-    # Real wall-clock sleeps, so `approx` — not exact equality — is the
-    # honest tolerance for a measured rate.
+    # Priced from what each send actually took (`ws.elapsed`), not from the
+    # 0.1 s it asked for: `asyncio.sleep` is a floor, and on a loaded
+    # machine it overshoots by more than the tolerance below — which failed
+    # this test for the machine's timer rather than for the fold.
     async def scenario():
         ws = TimedWs(0.1)
         source = FakeSource([b"y" * 300_000])
         writer = PrioritizedWriter(ws, sources=[(1, source)])
         writer.enqueue(0, b"x" * 100_000)
         await _run_briefly(writer, 0.5)
-        return writer.rate_estimate()
+        return writer.rate_estimate(), ws.elapsed
 
-    rate = asyncio.run(scenario())
-    assert rate == pytest.approx((1_000_000.0 + 3_000_000.0) / 2, rel=0.05)
+    rate, elapsed = asyncio.run(scenario())
+    first, second = 100_000 / elapsed[0], 300_000 / elapsed[1]
+    assert rate == pytest.approx((first + second) / 2, rel=0.05)
 
 
 def test_a_mix_of_small_sends_never_sets_the_rate_estimate():
@@ -173,10 +176,15 @@ def test_small_sends_after_a_large_one_do_not_drag_the_estimate():
         for _ in range(8):
             writer.enqueue(0, b"s" * 900)  # ~9_000 B/s each, if folded
         await _run_briefly(writer, 1.2)
-        return established, writer.rate_estimate(), len(ws.sent)
+        return established, writer.rate_estimate(), len(ws.sent), ws.elapsed[0]
 
-    established, after, sent_count = asyncio.run(scenario())
-    assert established == pytest.approx(1_000_000, rel=0.05), established
+    established, after, sent_count, took = asyncio.run(scenario())
+    # Priced from what the large send actually took, not the 0.1 s it asked
+    # for — the claim here is only that a rate *was* established for the
+    # small sends to drag; the exact number is the machine's timer, which
+    # overshoots `asyncio.sleep` under load and has nothing to do with
+    # the size bound under test.
+    assert established == pytest.approx(100_000 / took, rel=0.05), established
     assert sent_count == 9, "the small sends never happened: {}".format(sent_count)
     assert after == established
 
@@ -194,11 +202,17 @@ def test_snapshot_max_bytes_follows_the_rate():
         # without the rate ever being consulted.
         writer.enqueue(0, b"x" * 70_000)
         await _run_briefly(writer, 0.3)
-        return before, writer.snapshot_max_bytes()
+        return before, writer.snapshot_max_bytes(), ws.elapsed[0]
 
-    before, after = asyncio.run(scenario())
+    before, after, took = asyncio.run(scenario())
     assert before == SNAPSHOT_MAX_BYTES
-    assert after == pytest.approx(700_000 * MAX_SEND_OCCUPANCY_S, rel=0.05)
+    # Against what the send actually took, not the 0.1 s it asked for:
+    # `asyncio.sleep` is a floor, and on a loaded machine it overshoots by
+    # more than the tolerance below. Compared against the nominal rate this
+    # failed for the machine's timer rather than for anything
+    # `snapshot_max_bytes` does — a third of the time on the container this
+    # suite runs in.
+    assert after == pytest.approx(70_000 / took * MAX_SEND_OCCUPANCY_S, rel=0.05)
     assert after < SNAPSHOT_MAX_BYTES, "clamped by the ceiling; the rate was never spent"
 
 

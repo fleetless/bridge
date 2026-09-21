@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Small utilities the client tests share."""
 import asyncio
+import time
 
 from fleetless_bridge.client import BridgeClient
 from fleetless_bridge.config import BridgeConfig
@@ -11,14 +12,25 @@ class TimedWs:
     known number, not whatever the machine did. Shared by
     `test_client_snapshot_budget.py` (2.0.2's per-snapshot budget) and
     `test_client_writer.py` (the `PrioritizedWriter` that supersedes it) —
-    one copy, not two drifting definitions."""
+    one copy, not two drifting definitions.
+
+    `elapsed` is what each send *actually* took, because "a known number"
+    is only half true: `asyncio.sleep(0.1)` is a floor, not a duration, and
+    on a loaded machine it overshoots by several percent. A test that
+    compares a measured rate against the nominal one is then measuring the
+    machine's timer, which it cannot assert anything about — read the
+    matching `elapsed` entry instead and the claim stays about the
+    arithmetic under test."""
 
     def __init__(self, seconds_per_send: float) -> None:
         self.sent = []
+        self.elapsed = []
         self._seconds = seconds_per_send
 
     async def send(self, payload) -> None:
+        started = time.monotonic()
         await asyncio.sleep(self._seconds)
+        self.elapsed.append(time.monotonic() - started)
         self.sent.append(payload)
 
 
