@@ -158,14 +158,20 @@ APPLY_ERROR_KIND_CAMERA = "camera"
 
 # `ApplyError.code` values this bridge actually produces (contracts:
 # deliberately a bounded string, not an enum — a classification the bridge
-# introduces does not need the cloud taught first). Exactly the three
-# classifications the apply path really makes today; adding a fourth
+# introduces does not need the cloud taught first). Exactly the
+# classifications the apply path really makes today; adding one
 # without first checking where it would actually be raised from is exactly
 # the defect this design avoids (see ros_runtime.py's five apply loops and
 # client.py's `_apply_or_report`).
 APPLY_ERROR_CODE_FIELD_PATH_INVALID = "field_path_invalid"  # FieldPathError (sampling.py)
 APPLY_ERROR_CODE_WHOLE_KIND_FAILED = "whole_kind_failed"  # _apply_or_report's catch, slug '*'
 APPLY_ERROR_CODE_UNKNOWN = "unknown"  # everything else the per-slug broad catch sees
+# The `low_bandwidth` section did not resolve — `LowBandwidthSettings.resolve`
+# raised, and the bridge kept the settings it had. Reported under the
+# `datapoint` kind with slug `*`, because `kind` is a closed enum on the wire
+# and the rate cap is the lever the section mostly governs; the message
+# carries the sentence naming the key and the rule.
+APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID = "low_bandwidth_invalid"
 
 # Close codes the cloud uses (frozen with the cloud): 4000 supersede,
 # 4002 hello timeout, 4003 pong timeout. Only supersede is terminal — it means

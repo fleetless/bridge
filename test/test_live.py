@@ -1047,6 +1047,31 @@ def test_the_budget_is_reasserted_after_the_receivers_estimate_overwrites_it():
     assert after_remb == 800_000
 
 
+def test_set_bitrate_kbps_moves_the_budget_the_loop_re_asserts():
+    """Low-bandwidth mode's `reduce` lever. The budget used to be read once,
+    before the loop, so a setter that only wrote the field would have changed
+    nothing for the rest of the session."""
+
+    async def scenario():
+        encoder = _FakeEncoder(target_bitrate=3_000_000)
+        connection = _FakeConnection(sender=_FakeSender(encoder=encoder))
+        pub, _, _, _ = _started(connection=connection, bitrate_kbps=800,
+                                bitrate_interval_s=0.01)
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.03)
+        configured = encoder.target_bitrate
+        pub.set_bitrate_kbps(300)
+        await asyncio.sleep(0.05)
+        reduced = encoder.target_bitrate
+        pub.set_bitrate_kbps(800)
+        await asyncio.sleep(0.05)
+        await pub.stop()
+        return configured, reduced, encoder.target_bitrate
+
+    configured, reduced, restored = asyncio.run(scenario())
+    assert (configured, reduced, restored) == (800_000, 300_000, 800_000)
+
+
 def test_an_encoder_that_does_not_exist_yet_is_not_an_error():
     """The sender builds its encoder on the first frame it encodes, so a camera
     that has not produced one has a `None` there for as long as that lasts."""

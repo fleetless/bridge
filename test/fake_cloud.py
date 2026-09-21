@@ -15,6 +15,7 @@ import itertools
 import json
 import socket
 import struct
+from collections import deque
 from typing import Optional
 
 from aiohttp import WSMsgType, web
@@ -96,17 +97,57 @@ class Session:
     def __init__(self, cloud: "FakeCloud", ws) -> None:
         self._cloud = cloud
         self._ws = ws
+        # `link_mode` frames another `recv*` stepped over — see `recv`.
+        self._stepped_over_link_modes = deque()
 
     async def recv(self) -> dict:
-        raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
-        return json.loads(raw)
+        """The next JSON frame that is not a `link_mode`.
+
+        **Why one frame kind is stepped over.** `link_mode` is unsolicited
+        and session-level: the bridge states the mode once right after
+        `hello_ok` and again on every crossing, so it can land between any
+        two frames a test is actually about. A real cloud dispatches on
+        `type` and never on arrival position; a fake that made every caller
+        expect this one by position would turn one frame's existence into a
+        hundred tests' business, and each of those tests would then be
+        asserting something it is not about. Recorded on the way past —
+        `cloud.link_modes` keeps every one — and `recv_link_mode` hands them
+        back in order, which is where the claims about this frame live.
+
+        Tier order is not weakened by this: it is asserted directly against
+        `PrioritizedWriter` in test_client_writer.py, not inferred from the
+        order frames happen to arrive in here."""
+        while True:
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
+            payload = json.loads(raw)
+            if payload.get("type") != "link_mode":
+                return payload
+            self._stepped_over_link_modes.append(self._record_link_mode(payload))
 
     async def recv_raw(self):
         """The frame exactly as it arrived: `str` for text, `bytes` for
         binary. `recv()` assumes text since every other frame kind is JSON —
         snapshot is the one exception, and JSON-decoding it would raise on
-        the binary payload rather than parse it."""
-        return await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
+        the binary payload rather than parse it.
+
+        Steps over a `link_mode` for the same reason `recv` does; a caller
+        waiting for a snapshot is not waiting for this."""
+        while True:
+            wire = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
+            if not isinstance(wire, str):
+                return wire
+            try:
+                payload = json.loads(wire)
+            except ValueError:
+                return wire  # deliberate garbage from a transport test
+            if not isinstance(payload, dict) or payload.get("type") != "link_mode":
+                return wire
+            self._stepped_over_link_modes.append(self._record_link_mode(payload))
+
+    def _record_link_mode(self, payload: dict) -> dict:
+        validate_frame("bridge-link-mode", payload)
+        self._cloud.link_modes.append(payload)
+        return payload
 
     async def recv_snapshot(self):
         """Unpacks a binary snapshot frame — `[4-byte BE header length]
@@ -129,6 +170,21 @@ class Session:
         payload = validate_frame("bridge-pong", await self.recv())
         self._cloud.pongs.append(payload)
         return payload
+
+    async def recv_link_mode(self) -> dict:
+        """The next `link_mode`, whether another `recv*` already stepped over
+        it or it is still to come. A different frame arriving first is the
+        caller's expectation failing, so it is raised rather than stepped
+        over — the asymmetry with `recv` is the point."""
+        if self._stepped_over_link_modes:
+            return self._stepped_over_link_modes.popleft()
+        raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
+        payload = json.loads(raw)
+        if payload.get("type") != "link_mode":
+            raise AssertionError(
+                "expected a link_mode frame, got {!r}".format(payload.get("type"))
+            )
+        return self._record_link_mode(payload)
 
     async def recv_config_applied(self) -> dict:
         payload = validate_frame("bridge-config-applied", await self.recv())
@@ -213,6 +269,7 @@ class Session:
         publishers: dict = None,
         cameras: dict = None,
         messages: dict = None,
+        low_bandwidth: dict = None,
     ) -> None:
         # Every section is a slug-keyed mapping and optional, so an omitted
         # section stays omitted rather than empty — the shape a real cloud
@@ -226,6 +283,7 @@ class Session:
             ("services", services),
             ("publishers", publishers),
             ("cameras", cameras),
+            ("low_bandwidth", low_bandwidth),
         ):
             if section is not None:
                 doc[key] = section
@@ -366,6 +424,7 @@ class FakeCloud:
         self._open_sockets = set()
         self.hellos = []
         self.pongs = []
+        self.link_modes = []
         self.config_applied = []
         self.introspects = []
         self.type_definitions = []

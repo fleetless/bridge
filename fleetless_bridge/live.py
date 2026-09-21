@@ -659,6 +659,19 @@ class LivePublisher:
 
     # -- the bitrate budget ------------------------------------------------
 
+    def set_bitrate_kbps(self, kbps: int) -> None:
+        """Re-target a running stream — low-bandwidth mode's `reduce` lever,
+        and the restore when the mode lifts.
+
+        Nothing here touches the encoder: `_hold_bitrate_budget` re-reads the
+        field on its next tick, which is the same path a REMB already loses
+        against. The clamp flag is cleared with it, so a new budget outside
+        the codec's bounds says so once for itself rather than staying silent
+        behind a line logged for the value this camera no longer encodes at.
+        """
+        self._bitrate_kbps = kbps
+        self._bitrate_clamp_logged = False
+
     async def _hold_bitrate_budget(self) -> None:
         """Keep the encoder's target at `bitrate_kbps`.
 
@@ -694,7 +707,6 @@ class LivePublisher:
         publish/do-not-publish rather than as a layer choice.
         """
         sender = self._sender
-        budget_bps = self._bitrate_kbps * 1000
         if sender is None:
             return
         if not hasattr(sender, SENDER_ENCODER_ATTR):
@@ -705,6 +717,10 @@ class LivePublisher:
             )
             return
         while True:
+            # Read inside the loop, not before it: `set_bitrate_kbps` moves
+            # the budget mid-session, and a value hoisted out of here would
+            # pin the encoder to whatever the camera was configured with.
+            budget_bps = self._bitrate_kbps * 1000
             encoder = getattr(sender, SENDER_ENCODER_ATTR, None)
             if encoder is not None and hasattr(encoder, "target_bitrate"):
                 if not self._bitrate_clamp_logged:

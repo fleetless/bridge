@@ -50,5 +50,22 @@ def generate_launch_description() -> LaunchDescription:
             # an environment this package does not own; this reaches only into
             # its own process.
             additional_env={"PYTHONNOUSERSITE": "1"},
+            # Low-bandwidth mode, spelled out at its defaults. Nothing here
+            # changes behaviour — the bridge declares the same values on its
+            # own — but an operator editing this file sees every knob without
+            # reading the source, and `ros2 param set /fleetless_bridge
+            # low_bandwidth.mode on` works on a running robot either way. The
+            # `low_bandwidth` section of the published `fleetless.yaml`
+            # overrides whatever stands here.
+            parameters=[{
+                "low_bandwidth.mode": "auto",
+                "low_bandwidth.enter_lag_ms": 2000,
+                "low_bandwidth.enter_after_s": 10,
+                "low_bandwidth.exit_lag_ms": 500,
+                "low_bandwidth.exit_after_s": 60,
+                "low_bandwidth.datapoint_max_hz": 1.0,
+                "low_bandwidth.camera": "reduce",
+                "low_bandwidth.camera_bitrate_kbps": 300,
+            }],
         ),
     ])

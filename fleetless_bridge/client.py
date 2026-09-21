@@ -70,7 +70,9 @@ import aiohttp
 from fleetless_bridge import __version__
 from fleetless_bridge.camera import SNAPSHOT_MAX_BYTES
 from fleetless_bridge.config import BridgeConfig
+from fleetless_bridge.link_mode import LinkMode, LowBandwidthSettings, Transition
 from fleetless_bridge.protocol import (
+    APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID,
     APPLY_ERROR_CODE_WHOLE_KIND_FAILED,
     APPLY_ERROR_KIND_ACTION,
     APPLY_ERROR_KIND_CAMERA,
@@ -103,10 +105,12 @@ from fleetless_bridge.protocol import (
     hello_message,
     introspect_message,
     job_update_message,
+    link_mode_message,
     parse_cloud_message,
     pong_message,
     type_definitions_message,
 )
+from fleetless_bridge.sampling import capture_timestamp_ms
 
 log = logging.getLogger(__name__)
 
@@ -230,6 +234,12 @@ _TIER_OUTCOME = 1     # config_applied, job_update
 _TIER_TELEMETRY = 2   # datapoint (live), camera_state
 _TIER_TOOLING = 3     # introspect, type_definitions, assets_available, asset_progress
 _TIER_BACKFILL = 4    # datapoint (backfill)
+
+# How often the low-bandwidth controller is asked to decide. Its timers
+# advance only inside `evaluate`, so this is the resolution of `enter_after_s`
+# and `exit_after_s` — one second against thresholds counted in whole seconds,
+# which costs one function call a second and nothing on the wire.
+LINK_MODE_TICK_S = 1.0
 
 # Tier 5: pulled via `snapshot_source.next(max_bytes)`, never pushed through
 # `enqueue()` or a `sources` entry — see `PrioritizedWriter.run`.
@@ -1007,23 +1017,43 @@ class _SampleSource:
     on overflow and counts it for the once-per-reconnect log line
     (`_log_dropped_samples`), so there is nothing to track here and nothing
     to put back: a sample that missed the wire has a successor a moment
-    later, which is the whole reason it is allowed to drop at all."""
+    later, which is the whole reason it is allowed to drop at all.
 
-    def __init__(self, ros, tier: int) -> None:
+    `on_dwell` is the one thing it does track. The gap between a sample's
+    capture time and the moment it actually reached the wire is
+    low-bandwidth mode's second input, and the only one that still works
+    when the cloud has stopped answering — a narrow uplink shows up here as
+    a growing queue long before anything else says so. Read in `on_sent`
+    rather than in `try_next`: what matters is when `ws.send()` returned,
+    which on a full socket buffer is the whole point.
+
+    `_inflight_ms` holds the capture stamp the frame was built from, the
+    same shape and the same reason `_JobSource._inflight` has: the writer
+    hands the callbacks the payload, not the sample, and at most one can be
+    outstanding."""
+
+    def __init__(self, ros, tier: int, on_dwell=None) -> None:
         self._ros = ros
         self._tier = tier
+        self._on_dwell = on_dwell
+        self._inflight_ms = None
 
     def try_next(self):
         sample = self._ros.samples.try_get()
         if sample is None:
             return None
+        self._inflight_ms = sample.timestamp_ms
         return datapoint_message(sample.slug, sample.value, sample.timestamp_ms)
 
     def on_sent(self, payload) -> None:
-        pass
+        captured_ms, self._inflight_ms = self._inflight_ms, None
+        if captured_ms is not None and self._on_dwell is not None:
+            self._on_dwell(captured_ms)
 
     def on_send_failure(self, payload) -> None:
-        pass
+        # A send that failed measures nothing: the session is ending, and the
+        # time it took says more about the socket dying than about the link.
+        self._inflight_ms = None
 
 
 class _CameraStateSource:
@@ -1185,6 +1215,8 @@ class BridgeClient:
         bridge_version: str = __version__,
         ros: Optional[Any] = None,
         max_send_occupancy_s: float = MAX_SEND_OCCUPANCY_S,
+        now: Optional[Callable[[], float]] = None,
+        tick: float = LINK_MODE_TICK_S,
     ) -> None:
         self._config = config
         self._max_send_occupancy_s = max_send_occupancy_s
@@ -1231,6 +1263,28 @@ class BridgeClient:
         # answer than nothing until `_build_writer` overwrites this with a
         # fresh one.
         self._last_writer: Optional[PrioritizedWriter] = None
+        # --- low-bandwidth mode ------------------------------------------
+        # The controller's clock and its tick, both injectable for the same
+        # reason `connect` and `sleep` are: `enter_after_s` counts in whole
+        # seconds and the smallest the contract allows is one, so a suite
+        # that waited the timers out in real time would pay ten seconds an
+        # assertion. `now` is `time.monotonic` in the bridge; a test hands in
+        # a clock it moves itself.
+        self._now = now if now is not None else time.monotonic
+        self._tick = tick
+        # The two layers the settings resolve from, in precedence order.
+        # Parameters are read at `hello_ok` (the node has to exist first) and
+        # again whenever a `ros2 param set` succeeds; the YAML section
+        # arrives with every config.
+        self._param_low_bandwidth: Dict[str, Any] = {}
+        self._yaml_low_bandwidth: Dict[str, Any] = {}
+        self._lb_settings = LowBandwidthSettings.resolve({}, {})
+        # Deliberately per client, not per session: the mode is a property of
+        # the link, and a reconnect does not make a narrow uplink wide.
+        self._link_mode = LinkMode(self._lb_settings, self._now())
+        self._link_mode_task: Optional["asyncio.Task"] = None
+        if self._ros is not None:
+            self._ros.on_low_bandwidth_params(self._on_low_bandwidth_params)
 
     def stop(self) -> None:
         """Ask the bridge to shut down; safe to call from a signal handler."""
@@ -1304,6 +1358,151 @@ class BridgeClient:
         finally:
             await self._close(ws)
 
+    # --- low-bandwidth mode ------------------------------------------------
+
+    def _on_low_bandwidth_params(self, values: Dict[str, Any]) -> None:
+        """A `ros2 param set` the runtime already validated and accepted.
+
+        Runs on the event loop, hands the new parameter layer to the resolver
+        and lets the task below carry the result to the wire. The runtime
+        refused anything `resolve` would reject on its own, but the YAML on
+        top can still cross a threshold with it, so this path survives a
+        `ValueError` exactly the way the config apply does: keep what was
+        running, say so in the log."""
+        self._param_low_bandwidth = dict(values)
+        asyncio.ensure_future(self._apply_params_change())
+
+    async def _apply_params_change(self) -> None:
+        try:
+            await self._apply_low_bandwidth_settings(self._now())
+        except ValueError as exc:
+            log.error(
+                "The low-bandwidth parameters do not combine with the published "
+                "section: %s. The bridge keeps the settings it had.", exc,
+            )
+        except Exception:  # noqa: BLE001 - nobody awaits this job; say so here or nowhere
+            log.exception("Unexpected error applying a low-bandwidth parameter change")
+
+    async def _apply_low_bandwidth_settings(self, now: float) -> None:
+        """Re-resolve both layers, hand the result to the controller, pull the
+        levers. Raises `ValueError` — with the sentence naming the key and the
+        rule — without having changed anything, so a caller can report it and
+        carry on."""
+        settings = LowBandwidthSettings.resolve(
+            self._param_low_bandwidth, self._yaml_low_bandwidth
+        )
+        transition = self._link_mode.update_settings(settings, now)
+        self._lb_settings = settings
+        await self._on_transition(transition)
+
+    async def _on_transition(self, transition: Optional[Transition]) -> None:
+        """Say a crossing once, then pull the levers.
+
+        Called with `None` too, after a settings change that did not flip the
+        mode: `datapoint_max_hz` can move while the mode stays on, and the
+        levers carry the numbers, not only the state. Pulling them is
+        idempotent, so the extra call costs nothing and the missing one would
+        cost a cap nobody applied."""
+        if transition is not None:
+            self._log_transition(transition)
+            self._report_link_mode(transition.low_bandwidth, transition.reason)
+        if self._ros is not None:
+            await self._ros.set_low_bandwidth(
+                self._link_mode.active, self._lb_settings
+            )
+
+    def _log_transition(self, transition: Transition) -> None:
+        if transition.low_bandwidth:
+            log.info(
+                "Low-bandwidth mode on (%s): datapoints are capped to %g Hz, "
+                "live video is set to %s and backfill waits.",
+                transition.reason,
+                self._lb_settings.datapoint_max_hz,
+                self._lb_settings.camera,
+            )
+        else:
+            log.info(
+                "Low-bandwidth mode off (%s): configured rates, live video and "
+                "backfill are back.", transition.reason,
+            )
+
+    def _report_link_mode(self, low_bandwidth: bool, reason: str) -> None:
+        """One `link_mode` frame, tier 0 — the tier a pong sits in, because a
+        frame the mode exists to make room for must not queue behind the bulk
+        it is about to cut.
+
+        Silently dropped when no session is open to carry it: a transition
+        while disconnected is reported by the next `hello_ok`, which states
+        the mode outright."""
+        writer = self._last_writer
+        if writer is None or not self._session_open:
+            return
+        writer.enqueue(
+            _TIER_SESSION,
+            link_mode_message(low_bandwidth, reason, capture_timestamp_ms()),
+        )
+
+    def _observe_dwell(self, captured_ms: int) -> None:
+        """How long one sample waited between capture and the wire.
+
+        Two clocks on purpose: the dwell is the distance between two wall-clock
+        stamps (the capture time the wire carries and now), while the window it
+        lands in is monotonic, because a stepped system clock must not be able
+        to empty or fill the tracker."""
+        self._link_mode.observe_dwell(
+            capture_timestamp_ms() - captured_ms, self._now()
+        )
+
+    async def _start_link_mode(self, writer: PrioritizedWriter) -> None:
+        """At `hello_ok`: read the parameter layer, state the mode once, start
+        the tick.
+
+        The parameters only exist once `ros.start()` has run, which is after
+        this client was constructed — so this is the first moment they can be
+        read at all. The report goes out whether or not anything changed: the
+        cloud's `bridge_state` should be right from the first second of a
+        session rather than from the first transition, which on a healthy link
+        never comes."""
+        try:
+            if self._ros is not None:
+                self._param_low_bandwidth = dict(self._ros.low_bandwidth_params())
+            await self._apply_low_bandwidth_settings(self._now())
+        except ValueError as exc:
+            log.error(
+                "The low-bandwidth settings do not resolve: %s. The bridge keeps "
+                "the settings it had.", exc,
+            )
+        except Exception:  # noqa: BLE001 - a mode that will not engage beats a handshake that dies
+            log.exception("Unexpected error starting low-bandwidth mode for this session")
+        if self._lb_settings.mode != "auto":
+            reason = "forced"
+        elif self._link_mode.active:
+            # Under `auto`, a mode still on from the previous session. `lag` is
+            # the enum's word for "the link is the reason"; which of the two
+            # measures entered it did not survive the reconnect, and inventing
+            # `recovered` here would say the opposite of what is true.
+            reason = "lag"
+        else:
+            reason = "recovered"
+        self._report_link_mode(self._link_mode.active, reason)
+        self._link_mode_task = asyncio.ensure_future(self._pump_link_mode())
+
+    async def _pump_link_mode(self) -> None:
+        """`evaluate` on a fixed tick, for as long as the session lasts.
+
+        The controller's timers advance only inside `evaluate`, so this tick
+        is the resolution of both `_after_s` thresholds — twelve seconds of
+        observed lag and one call would start the timer at that call, not
+        twelve seconds ago."""
+        while True:
+            await asyncio.sleep(self._tick)
+            try:
+                transition = self._link_mode.evaluate(self._now())
+                if transition is not None:
+                    await self._on_transition(transition)
+            except Exception:  # noqa: BLE001 - one bad tick must not end the mode for the session
+                log.exception("Unexpected error evaluating low-bandwidth mode")
+
     def _build_writer(self, ws) -> PrioritizedWriter:
         """The session's one writer, with every source it will ever have.
 
@@ -1323,14 +1522,24 @@ class BridgeClient:
             def is_open() -> bool:
                 return self._session_open
 
+            def backfill_open() -> bool:
+                # Tier 4 is the one tier low-bandwidth mode silences outright.
+                # Buffered history has no deadline — it is already late by
+                # definition — so it is the one thing that can wait for the
+                # link the mode exists to spare. Read per call, so the gate
+                # opens and closes with the mode and no writer is rebuilt.
+                return is_open() and not self._link_mode.active
+
             camera_states = _CameraStateSource(self._ros, _TIER_TELEMETRY)
-            samples = _SampleSource(self._ros, _TIER_TELEMETRY)
+            samples = _SampleSource(
+                self._ros, _TIER_TELEMETRY, on_dwell=self._observe_dwell
+            )
             sources = [
                 (_TIER_OUTCOME, _GatedSource(is_open, _JobSource(self._ros))),
                 (_TIER_TELEMETRY, _GatedSource(is_open, camera_states)),
                 (_TIER_TELEMETRY, _GatedSource(is_open, samples)),
                 (_TIER_TOOLING, _GatedSource(is_open, _AssetSource(self._ros))),
-                (_TIER_BACKFILL, _GatedSource(is_open, _BackfillSource(self._ros))),
+                (_TIER_BACKFILL, _GatedSource(backfill_open, _BackfillSource(self._ros))),
             ]
             snapshot_source = _SnapshotSource(is_open, self._ros)
         writer = PrioritizedWriter(
@@ -1365,6 +1574,9 @@ class BridgeClient:
         self._first_config_since_hello = True
         # Closed until `hello_ok`; see `_GatedSource`.
         self._session_open = False
+        # Started at `hello_ok`, cancelled in `finally` — one per session, the
+        # same lifecycle the control pump has.
+        self._link_mode_task = None
         # The handshake gets one deadline for the whole of it, not one per
         # frame, so a cloud that keeps sending other traffic without ever
         # answering the hello still times out.
@@ -1457,6 +1669,7 @@ class BridgeClient:
                     # the runtime still believes nobody is connected for.
                     self._session_open = True
                     writer.wake()
+                    await self._start_link_mode(writer)
                 elif isinstance(message, HelloError):
                     if message.terminal:
                         log.error(
@@ -1484,6 +1697,14 @@ class BridgeClient:
                     )
                     return None
                 elif isinstance(message, Ping):
+                    # The ping carries the cloud's two measurements; the
+                    # controller takes them both and uses `lag_ms`. Handed
+                    # over before the pong only because nothing here awaits —
+                    # the pong is still the first thing enqueued after the
+                    # frame was read.
+                    self._link_mode.observe_cloud(
+                        message.lag_ms, message.latency_ms, self._now()
+                    )
                     # Tier 0, and the reason the tier exists: the cloud
                     # closes the socket after three unanswered pings, so
                     # this must overtake whatever bulk is queued rather
@@ -1522,6 +1743,8 @@ class BridgeClient:
             # onto a socket this session has already given up on.
             self._session_open = False
             self._detach_wake()
+            await self._cancel_pump(self._link_mode_task, "link mode")
+            self._link_mode_task = None
             await self._cancel_pump(control_task, "control")
             await self._cancel_pump(writer_task, "writer")
 
@@ -1737,6 +1960,9 @@ class BridgeClient:
         the config landed keeps re-sending it, which is a session-level
         cost, not a telemetry one."""
         errors: List[ApplyError] = []
+        # First, because the mode's ceiling is what the datapoint apply below
+        # builds each subscription's cap against.
+        errors.extend(await self._apply_low_bandwidth_section(message))
         if self._ros is not None:
             errors.extend(await self._apply_or_report(
                 APPLY_ERROR_KIND_DATAPOINT, message.version,
@@ -1799,6 +2025,37 @@ class BridgeClient:
         writer.enqueue(
             _TIER_OUTCOME, config_applied_message(message.version, not errors, errors)
         )
+
+    async def _apply_low_bandwidth_section(self, message: Config) -> List[ApplyError]:
+        """The document's `low_bandwidth` section, on top of the parameters.
+
+        A section that does not resolve is an entry in the ack and nothing
+        else. It has to be: contracts compares `enter_lag_ms` against
+        `exit_lag_ms` only when the section carries both, so a published,
+        perfectly valid `low_bandwidth: {exit_lag_ms: 3000}` arrives here
+        crossed against the default `enter_lag_ms` — and a bridge that treated
+        that as fatal would be taken down by a document the console accepted.
+        The previous section stays in force.
+
+        The error rides the `datapoint` kind with slug `*`: `kind` is a closed
+        enum on the wire, and the rate cap is the lever this section mostly
+        governs. The message is the sentence `resolve` raised, naming the key
+        and the rule."""
+        previous = self._yaml_low_bandwidth
+        self._yaml_low_bandwidth = dict(message.low_bandwidth)
+        try:
+            await self._apply_low_bandwidth_settings(self._now())
+        except ValueError as exc:
+            self._yaml_low_bandwidth = previous
+            log.warning(
+                "Config version %d: the low_bandwidth section was refused: %s",
+                message.version, exc,
+            )
+            return [ApplyError(
+                slug="*", kind=APPLY_ERROR_KIND_DATAPOINT,
+                code=APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID, message=str(exc),
+            )]
+        return []
 
     async def _apply_or_report(self, kind: str, version: int, apply) -> List[ApplyError]:
         """Runs one `apply_*` call, turning an unexpected exception into a

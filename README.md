@@ -68,6 +68,63 @@ the console decides what it exposes; the bridge only follows.
 
 Set them in the launch file or in the environment.
 
+## 🐌 Low-bandwidth mode
+
+Some uplinks are only nominally up. When the lag the cloud measures stays
+high, or the bridge's own send queue backs up, the bridge stops pushing a
+full telemetry stream through a pipe that cannot carry it: every datapoint
+is capped to one sample a second, live video is re-encoded smaller or
+ended, new streams are refused, and buffered history waits. It leaves once
+both measurements have been calm for a minute, and tells the cloud each
+time it crosses, so the console can say why a robot went quiet.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `low_bandwidth.mode` | `auto` | `auto` decides from the measurements. `on` and `off` force it, for a link you already know about. |
+| `low_bandwidth.enter_lag_ms` | `2000` | Lag or queue dwell above this enters the mode. |
+| `low_bandwidth.enter_after_s` | `10` | How long that has to hold. A spike is not a narrow link. |
+| `low_bandwidth.exit_lag_ms` | `500` | Lag and dwell both at or below this leave the mode. |
+| `low_bandwidth.exit_after_s` | `60` | How long that has to hold. |
+| `low_bandwidth.datapoint_max_hz` | `1.0` | The ceiling for every datapoint in the mode, unless it says `low_bandwidth: keep`. |
+| `low_bandwidth.camera` | `reduce` | `reduce` re-encodes a running stream smaller; `stop` ends it. New streams are refused either way. |
+| `low_bandwidth.camera_bitrate_kbps` | `300` | What `reduce` re-encodes at. |
+
+They are ordinary ROS parameters, so they move at runtime:
+
+```sh
+ros2 param set /fleetless_bridge low_bandwidth.mode on
+ros2 param set /fleetless_bridge low_bandwidth.datapoint_max_hz 0.5
+```
+
+A value the bridge cannot use is refused by the set, with the rule it broke,
+and the parameter keeps what it had.
+
+The published `fleetless.yaml` overrides all of them, so a fleet's settings
+live in the console rather than on each robot:
+
+```yaml
+low_bandwidth:
+  enter_lag_ms: 3000
+  datapoint_max_hz: 0.5
+  camera: stop
+```
+
+A datapoint that must keep its rate whatever the link is doing says so for
+itself, and is the one thing the cap does not touch:
+
+```yaml
+datapoints:
+  emergency_stop:
+    topic: /estop
+    type: std_msgs/msg/Bool
+    field: data
+    low_bandwidth: keep
+```
+
+Nothing is lost in the mode, only delayed: a capped datapoint with
+`retention` still buffers every sample it held back, and the history fills in
+once the link recovers.
+
 ## 📄 What the robot exposes
 
 Nothing, on its own. What a robot exposes is a document, `fleetless.yaml`,

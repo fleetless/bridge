@@ -102,6 +102,7 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 from defusedxml import DefusedXmlException
 import rclpy
 from action_msgs.msg import GoalStatus
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
@@ -112,7 +113,9 @@ from std_msgs.msg import String as StringMsg
 
 from fleetless_bridge import camera, camera_sources, introspection, live, params, sampling
 from fleetless_bridge.jobs import JobManager, JobUpdate
+from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.protocol import (
+    LOW_BANDWIDTH_DEFAULTS,
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
     APPLY_ERROR_CODE_UNKNOWN,
     APPLY_ERROR_KIND_ACTION,
@@ -672,6 +675,16 @@ class _Subscription:
     offset: Optional[float]
     rate: sampling.RatePolicy
     buffer_enabled: bool = False
+    #: What `rate_throttle_hz` asked for, kept alongside the policy built from
+    #: it: low-bandwidth mode has to compare the configured rate against its
+    #: own ceiling, and a `RatePolicy` does not say what rate it holds.
+    configured_hz: Optional[float] = None
+    #: `low_bandwidth: keep` — this datapoint is exempt from the mode's cap.
+    keep: bool = False
+    #: The mode's ceiling for this slug while it bites, else `None`. A second
+    #: policy rather than a replacement for `rate`, so leaving the mode
+    #: restores the configured rate without rebuilding it.
+    cap: Optional[sampling.RatePolicy] = None
     handle: object = None  # the rclpy Subscription, set once created
 
 
@@ -1146,6 +1159,17 @@ class RosRuntime:
         # stale read (one sample landing on the wrong side of a transition)
         # is one sample in the wrong queue, not a corrupted one.
         self._connected = False
+        # Low-bandwidth mode, as the levers see it. `_lb_active` is read by the
+        # subscription callback on the executor thread and written by
+        # `set_low_bandwidth` on the event loop — the same single-flag
+        # reasoning `_connected` above states, and the same cost when a read
+        # is stale: one sample on the wrong side of a transition.
+        self._lb_active = False
+        self._lb_max_hz = float(LOW_BANDWIDTH_DEFAULTS["datapoint_max_hz"])
+        self._lb_camera = LOW_BANDWIDTH_DEFAULTS["camera"]
+        self._lb_bitrate_kbps = int(LOW_BANDWIDTH_DEFAULTS["camera_bitrate_kbps"])
+        # What client.py wants told after a successful `ros2 param set`.
+        self._lb_params_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         self.samples = SampleQueue(maxsize=sample_queue_maxsize)
         self.backlog = BacklogStore()
         self.jobs = JobManager()
@@ -1228,6 +1252,20 @@ class RosRuntime:
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
         self._guard = self._node.create_guard_condition(self._drain_work)
+        # Low-bandwidth parameters. Declared with the vendored defaults so
+        # `ros2 param list` shows every knob and `ros2 param set
+        # /fleetless_bridge low_bandwidth.mode on` works on a running robot
+        # with no cloud involved. The YAML section overrides these in
+        # client.py; a bad value is refused here with the sentence
+        # `LowBandwidthSettings` uses everywhere else.
+        for key, default in LOW_BANDWIDTH_DEFAULTS.items():
+            # `datapoint_max_hz` is a number on the wire and `1` in the
+            # vendored constants. Declared as it stands, ROS would type the
+            # parameter as an integer and refuse `1.5` for the rest of the run.
+            if key == "datapoint_max_hz":
+                default = float(default)
+            self._node.declare_parameter("low_bandwidth." + key, default)
+        self._node.add_on_set_parameters_callback(self._on_set_parameters)
         # One shared watchdog, two independent checks on the same cadence —
         # same "one rule beats juggling a lifecycle per entity" reasoning
         # `_check_failsafes` already uses, now applied to goal acceptance
@@ -1404,6 +1442,132 @@ class RosRuntime:
         return await loop.run_in_executor(None, future.result, timeout)
 
     # --- asyncio-facing API -------------------------------------------------
+
+    def low_bandwidth_params(self) -> Dict[str, Any]:
+        """The eight `low_bandwidth.*` parameters, shaped for
+        `LowBandwidthSettings.resolve`.
+
+        `{}` before `start()`: the parameters live on the node, and the node
+        does not exist until then. That is a real state — `main.py` builds the
+        client before it starts the runtime — and an empty layer resolves to
+        the defaults, which is the right answer for it."""
+        if self._node is None:
+            return {}
+        values: Dict[str, Any] = {}
+        for key in LOW_BANDWIDTH_DEFAULTS:
+            values[key] = self._node.get_parameter("low_bandwidth." + key).value
+        return values
+
+    def on_low_bandwidth_params(
+        self, callback: Callable[[Dict[str, Any]], None]
+    ) -> None:
+        """Ask to be told when a `ros2 param set` changes the section.
+
+        The callback runs on the asyncio loop (the set arrives on whichever
+        thread the ROS service handled it on) and is handed the whole section,
+        not only the keys that moved: the client resolves all eight against
+        the YAML layer on top of them."""
+        self._lb_params_callback = callback
+
+    def _on_set_parameters(self, params) -> SetParametersResult:
+        """rclpy's pre-set hook: refuse a value the settings would reject,
+        before it is stored.
+
+        Validated by building the settings the set would produce, so
+        `ros2 param set` is refused with exactly the sentence a bad YAML
+        section is refused with. Nothing here mutates on a bad value — the
+        parameter keeps what it had, and no callback fires."""
+        touched = [p for p in params if p.name.startswith("low_bandwidth.")]
+        if not touched:
+            # `use_sim_time` and anything else on this node: none of this
+            # mode's business, and re-applying the levers for it would be a
+            # lever pull nobody asked for.
+            return SetParametersResult(successful=True)
+        proposed = self.low_bandwidth_params()
+        for param in touched:
+            proposed[param.name[len("low_bandwidth."):]] = param.value
+        try:
+            LowBandwidthSettings.resolve(proposed, {})
+        except ValueError as exc:
+            return SetParametersResult(successful=False, reason=str(exc))
+        if self._loop is not None and self._lb_params_callback is not None:
+            self._loop.call_soon_threadsafe(self._lb_params_callback, proposed)
+        return SetParametersResult(successful=True)
+
+    async def set_low_bandwidth(
+        self, active: bool, settings: LowBandwidthSettings
+    ) -> None:
+        """Pull the mode's levers, or release them. Idempotent.
+
+        client.py calls this on every transition *and* after every settings
+        change that did not cause one, because the numbers can move while the
+        state does not — a `datapoint_max_hz` of 5 while the mode is already
+        on has to reach the subscriptions somehow.
+
+        The cap is rebuilt on the executor thread, where every other touch of
+        a `_Subscription` happens; the camera lever runs here on the event
+        loop, where `stop_live` and the publishers already live. `async` and
+        not a plain setter, because stopping a stream is a coroutine and a
+        fire-and-forget job would let a session end with the robot still
+        publishing into a room nobody can reach."""
+        self._lb_active = active
+        self._lb_max_hz = float(settings.datapoint_max_hz)
+        self._lb_camera = settings.camera
+        self._lb_bitrate_kbps = int(settings.camera_bitrate_kbps)
+        if self._node is not None:
+            await self._submit_async(self._rebuild_caps)
+        await self._apply_camera_lever()
+
+    def _rebuild_caps(self) -> None:
+        """Executor thread: every subscription's cap, against the settings
+        that just changed."""
+        for entry in self._subscriptions.values():
+            entry.cap = self._cap_policy(entry.configured_hz, entry.keep)
+
+    def _cap_policy(
+        self, configured_hz: Optional[float], keep: bool
+    ) -> Optional[sampling.RatePolicy]:
+        """The mode's ceiling for one datapoint, or `None` where it does not
+        bite: the mode is off, the datapoint says `keep`, or its own
+        configured rate is already at or below the ceiling.
+
+        A falsy `configured_hz` is "no ceiling configured" (sampling.py reads
+        `None` and `0` the same way), so it never counts as slower than the
+        cap — `0 <= 1.0` is arithmetically true and exactly backwards."""
+        if not self._lb_active or keep:
+            return None
+        if configured_hz and configured_hz <= self._lb_max_hz:
+            return None
+        return sampling.rate_policy(self._lb_max_hz)
+
+    async def _apply_camera_lever(self) -> None:
+        """`stop` ends every running stream and says why; `reduce` re-targets
+        each one, and leaving the mode puts each camera's configured bitrate
+        back. New streams are refused in `start_live` either way, so there is
+        nothing here for a camera that is not live."""
+        if self._lb_active and self._lb_camera == "stop":
+            for slug in list(self._live_publishers):
+                await self.stop_live(
+                    slug,
+                    cause=CAMERA_STATE_CAUSE_LIVE_LOST,
+                    error=(
+                        "low_bandwidth",
+                        "Live video stopped: the bridge entered low-bandwidth mode.",
+                    ),
+                )
+            return
+        for slug, publisher in list(self._live_publishers.items()):
+            if self._lb_active:
+                kbps = self._lb_bitrate_kbps
+            else:
+                entry = self._cameras.get(slug)
+                if entry is None:
+                    continue  # the camera left the config while the stream ran
+                kbps = entry.bitrate_kbps
+            try:
+                publisher.set_bitrate_kbps(kbps)
+            except Exception:  # noqa: BLE001 - a lever that failed must not end the session
+                log.exception("Could not re-target the live bitrate for slug %r", slug)
 
     def set_connected(self, connected: bool) -> None:
         """Called by client.py when a session starts (`True`, right after
@@ -1675,6 +1839,28 @@ class RosRuntime:
                 )
                 return
 
+            if self._lb_active:
+                # Refused for as long as the mode holds, under `reduce` as
+                # much as under `stop`: a new stream is new uplink, and the
+                # mode exists because there is none to spare. After the
+                # slug's own lookup, so a slug nobody configured still hears
+                # the truth about itself rather than being sent chasing the
+                # link.
+                self.camera_states.put(
+                    CameraStateUpdate(
+                        slug, False,
+                        (
+                            "low_bandwidth",
+                            "The bridge is in low-bandwidth mode; live video "
+                            "waits until the link recovers.",
+                        ),
+                        cause=CAMERA_STATE_CAUSE_COMMAND,
+                        observed_at_ms=sampling.capture_timestamp_ms(),
+                        request_id=request_id,
+                    )
+                )
+                return
+
             # a non-ROS source can be known-broken (auth failed,
             # unreachable) before anyone ever asked for live — it runs
             # continuously in the background to keep snapshots warm,
@@ -1884,6 +2070,9 @@ class RosRuntime:
         entry.offset = dp.numeric.offset
         entry.rate = sampling.rate_policy(dp.rate_throttle_hz)
         entry.buffer_enabled = dp.retention.enabled
+        entry.configured_hz = dp.rate_throttle_hz
+        entry.keep = dp.low_bandwidth_keep
+        entry.cap = self._cap_policy(dp.rate_throttle_hz, dp.low_bandwidth_keep)
         self.backlog.configure(slug, dp.retention.enabled, _backlog_depth(dp.retention))
 
     def _create(self, slug: str, dp: DatapointConfig) -> None:
@@ -1906,6 +2095,9 @@ class RosRuntime:
             offset=dp.numeric.offset,
             rate=sampling.rate_policy(dp.rate_throttle_hz),
             buffer_enabled=dp.retention.enabled,
+            configured_hz=dp.rate_throttle_hz,
+            keep=dp.low_bandwidth_keep,
+            cap=self._cap_policy(dp.rate_throttle_hz, dp.low_bandwidth_keep),
         )
 
         def callback(msg, slug=slug):
@@ -1944,6 +2136,18 @@ class RosRuntime:
             return
 
         sample = sampling.Sample(slug, value, timestamp_ms)
+        if self._connected and entry.cap is not None and not entry.cap.should_send(
+            value, time.monotonic()
+        ):
+            # Low-bandwidth mode: the configured rate said yes, the cap says
+            # not now. Kept for backfill where the datapoint buffers, so the
+            # history fills in once the link recovers — the mode spares the
+            # link, not the record. Only while connected: disconnected, the
+            # branches below already decide, and capping a sample nothing is
+            # sending would only thin the backlog.
+            if entry.buffer_enabled:
+                self.backlog.push(slug, sample)
+            return
         if self._connected:
             # Live: someone is actually connected to receive it right now.
             self.samples.put_threadsafe(self._loop, sample)

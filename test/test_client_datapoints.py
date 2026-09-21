@@ -14,6 +14,7 @@ from fleetless_bridge.jobs import JobUpdateQueue
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_UNKNOWN,
     APPLY_ERROR_KIND_DATAPOINT,
+    LOW_BANDWIDTH_DEFAULTS,
     ApplyError,
 )
 from fleetless_bridge.ros_runtime import BacklogStore, CameraStateQueue, SampleQueue
@@ -102,6 +103,12 @@ class FakeRos:
         self.introspect_calls = 0
         self.resolve_calls = []
         self.connected_calls = []
+        # Low-bandwidth mode, as the client sees the runtime: the parameter
+        # layer a test can move, the callback the runtime would fire after a
+        # `ros2 param set`, and a record of every lever pull.
+        self.low_bandwidth_params_value = dict(LOW_BANDWIDTH_DEFAULTS)
+        self.low_bandwidth_calls = []
+        self.low_bandwidth_callback = None
         self._apply_errors = apply_errors or []
         self._apply_action_errors = apply_action_errors or []
         self._apply_service_errors = apply_service_errors or []
@@ -182,6 +189,15 @@ class FakeRos:
 
     def set_connected(self, connected):
         self.connected_calls.append(connected)
+
+    def low_bandwidth_params(self):
+        return dict(self.low_bandwidth_params_value)
+
+    def on_low_bandwidth_params(self, callback):
+        self.low_bandwidth_callback = callback
+
+    async def set_low_bandwidth(self, active, settings):
+        self.low_bandwidth_calls.append((active, settings))
 
     async def graph_snapshot(self):
         self.introspect_calls += 1
