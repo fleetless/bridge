@@ -7,8 +7,10 @@ ros-@ROS_DISTRO@-fleetless-bridge (4.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgenc
     against a one-gigabyte store the cloud alone can evaluate — it knows what
     the robot's other files already occupy and this process does not. So every
     mesh and texture is attempted, and an upload the store has no room for is
-    reported as `refused`, carrying the cloud's own three numbers. Nothing is
-    read into memory to find this out: the upload streams, as it already did.
+    reported as `refused`, carrying the cloud's own three numbers. The upload
+    itself still streams — no file is read whole to send it — but a `.dae`
+    has to be read to find the textures inside it, so one over 64 MiB is
+    uploaded without being scanned, and the log says which and why.
   * **A backfilled datapoint says so.** A sample replayed after a
     disconnect carries `backfill`, so an hour of buffered history arriving at
     once no longer reads to the cloud as an hour of lag on a link that is fine.

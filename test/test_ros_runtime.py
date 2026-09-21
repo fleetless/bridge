@@ -66,6 +66,7 @@ from fleetless_bridge.ros_runtime import (
     AssetProgress,
     CameraStateQueue,
     CameraStateUpdate,
+    DAE_SCAN_MAX_BYTES,
     RosRuntime,
     UploadResult,
 )
@@ -4875,6 +4876,8 @@ class _AssetUploadHandler(http.server.BaseHTTPRequestHandler):
                 "X-Fleetless-Asset-Name-Raw": raw_name,
                 "X-Fleetless-Asset-Name-Encoded-Raw": raw_name_encoded,
                 "X-Fleetless-Sync-Id": self.headers.get("X-Fleetless-Sync-Id"),
+                "X-Fleetless-Asset-Size": self.headers.get("X-Fleetless-Asset-Size"),
+                "Content-Length": self.headers.get("Content-Length"),
             },
             "body": body,
         }
@@ -5145,7 +5148,11 @@ def test_a_mesh_far_over_the_old_ceiling_is_uploaded_rather_than_refused():
     The size is mocked rather than written: the claim is about the
     comparison that no longer happens, and a 194 MB fixture has no business
     in this package. `_upload_mesh_file` is mocked with it, so the lied-about
-    size never reaches a real `Content-Length`."""
+    size never reaches a real `Content-Length`.
+
+    A file this size is still not *scanned* if it is a `.dae` — see
+    `DAE_SCAN_MAX_BYTES` and its own tests below. Uploading and reading are
+    two different costs, and only one of them was the cloud's to bound."""
     with mock.patch.object(
         RosRuntime, "_file_size_or_none", return_value=193_886_766
     ):
@@ -5168,47 +5175,6 @@ def test_a_mesh_far_over_the_old_ceiling_is_uploaded_rather_than_refused():
 
     assert updates[-1].state == "finished"
     assert updates[-1].done == updates[-1].total == 2
-    assert updates[-1].failed == ()
-
-
-def test_a_dae_over_the_old_ceiling_still_has_its_references_scanned():
-    """The other half: `_extract_dae_texture_references` used to be skipped
-    for an over-ceiling `.dae`, because reading it was the expensive thing
-    the ceiling existed to prevent. With no ceiling there is nothing to
-    skip on, and a large `.dae` whose textures went unscanned would sync a
-    mesh the cloud then cannot render."""
-    dae_uri = "package://robot_description_fixture/big.dae"
-    with tempfile.NamedTemporaryFile(suffix=".dae") as dae_file:
-        dae_file.write(b"x" * 200)
-        dae_file.flush()
-
-        with mock.patch.object(
-            RosRuntime, "_file_size_or_none", return_value=193_886_766
-        ):
-            with mock.patch.object(
-                RosRuntime, "_extract_dae_texture_references", return_value=[]
-            ) as extract_mock:
-                with mock.patch.object(
-                    RosRuntime, "_upload_mesh_file", return_value=UploadResult(True)
-                ):
-
-                    async def body(rt):
-                        await _publish_urdf_and_wait(rt)
-                        server, url, stop = _start_asset_upload_server()
-                        try:
-                            with mock.patch.object(
-                                RosRuntime, "_resolve_package_uri", return_value=dae_file.name,
-                            ):
-                                await rt.sync_assets("sync-1", url, "upload-tok", (dae_uri,))
-                                updates = await _drain_asset_progress_until(rt, {"finished"})
-                            return updates
-                        finally:
-                            stop()
-
-                    updates = run(body)
-                    extract_mock.assert_called_once()
-
-    assert updates[-1].state == "finished"
     assert updates[-1].failed == ()
 
 
@@ -6850,3 +6816,152 @@ def test_a_sync_that_raised_still_frees_the_slot_for_the_next_one():
     updates = run(body)
     assert updates[-1].sync_id == "sync-b"
     assert updates[-1].state == "finished"  # not refused — the failed sync still freed the slot
+
+
+# --- the announced size, and the two refusals it decides between ---------
+
+
+def test_every_upload_announces_its_size_before_the_body():
+    """The cloud weighs `x-fleetless-asset-size` against the robot's store
+    *before* it accepts a body. Without the header nothing is weighed and
+    an over-large file comes back as a bare `413` instead of a `409` naming
+    the store — so this asserts the header on every upload of a sync, the
+    URDF included, and that it agrees with the `Content-Length` beside it.
+
+    Against a real HTTP server, so what is asserted is what a real client
+    sent rather than what this test built."""
+
+    async def body(rt):
+        await _publish_urdf_and_wait(rt)
+        server, url, stop = _start_asset_upload_server()
+        try:
+            await rt.sync_assets("sync-1", url, "upload-tok", (_RESOLVABLE_MESH_URI,))
+            await _drain_asset_progress_until(rt, {"finished"})
+            return server.received
+        finally:
+            stop()
+
+    received = run(body)
+    assert len(received) == 2, [r["headers"]["X-Fleetless-Asset-Name"] for r in received]
+    for record in received:
+        announced = record["headers"]["X-Fleetless-Asset-Size"]
+        assert announced is not None, record["headers"]["X-Fleetless-Asset-Name"]
+        # The same number twice, deliberately: one is read before the body
+        # and one describes it, and a gate that disagreed with the body it
+        # let through would be worse than no gate.
+        assert announced == record["headers"]["Content-Length"]
+        assert int(announced) == len(record["body"])
+
+
+def test_a_bare_413_is_a_refusal_not_a_transfer_failure():
+    """A file over the server's own body limit never reaches the store
+    gate, so the refusal names nothing. It is still a refusal: `upload_
+    failed` would tell a reconciliation the asset is still worth retrying,
+    and this one can never fit however many times it is sent."""
+
+    def status_for(record):
+        if record["headers"]["X-Fleetless-Asset-Name"] == URDF_ASSET_NAME:
+            return 201
+        return 413, b""
+
+    async def body(rt):
+        await _publish_urdf_and_wait(rt)
+        server, url, stop = _start_asset_upload_server()
+        server.status_for = status_for
+        try:
+            await rt.sync_assets("sync-1", url, "upload-tok", (_RESOLVABLE_MESH_URI,))
+            return await _drain_asset_progress_until(rt, {"finished"})
+        finally:
+            stop()
+
+    updates = run(body)
+    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None),)
+
+
+# --- the .dae scan cap ---------------------------------------------------
+
+
+def test_a_dae_over_the_scan_cap_is_uploaded_without_being_read():
+    """`_extract_dae_texture_references` reads the whole file and parses
+    it into an ElementTree — a multiple of the file size in memory, and
+    nothing the cloud's store has an opinion about. The upload ceiling
+    that used to bound it is gone, so `DAE_SCAN_MAX_BYTES` does.
+
+    The claim is that the scan never happens: the mock raises if it is
+    called at all, which no amount of "the sync still finished" could
+    satisfy by other means. The mesh must still upload — an untextured
+    render beats a bridge that died reading the file."""
+    dae_uri = "package://robot_description_fixture/enormous.dae"
+    with tempfile.NamedTemporaryFile(suffix=".dae") as dae_file:
+        dae_file.write(b"x" * 200)
+        dae_file.flush()
+
+        with mock.patch.object(
+            RosRuntime, "_file_size_or_none", return_value=DAE_SCAN_MAX_BYTES + 1
+        ):
+            with mock.patch.object(
+                RosRuntime, "_extract_dae_texture_references", side_effect=AssertionError(
+                    "a .dae over the scan cap must not be read"
+                )
+            ) as extract_mock:
+                with mock.patch.object(
+                    RosRuntime, "_upload_mesh_file", return_value=UploadResult(True)
+                ) as upload_mock:
+
+                    async def body(rt):
+                        await _publish_urdf_and_wait(rt)
+                        server, url, stop = _start_asset_upload_server()
+                        try:
+                            with mock.patch.object(
+                                RosRuntime, "_resolve_package_uri", return_value=dae_file.name,
+                            ):
+                                await rt.sync_assets("sync-1", url, "upload-tok", (dae_uri,))
+                                return await _drain_asset_progress_until(rt, {"finished"})
+                        finally:
+                            stop()
+
+                    updates = run(body)
+                    extract_mock.assert_not_called()
+                    upload_mock.assert_called_once()
+
+    assert updates[-1].state == "finished"
+    # Not a failure of any reference: this sync determined nothing about
+    # what is inside that file, and saying otherwise would name something
+    # it never looked at.
+    assert updates[-1].failed == ()
+
+
+def test_a_dae_just_under_the_scan_cap_is_still_scanned():
+    """The other side of the boundary, so the cap is a comparison and not
+    a switch somebody left off."""
+    dae_uri = "package://robot_description_fixture/large.dae"
+    with tempfile.NamedTemporaryFile(suffix=".dae") as dae_file:
+        dae_file.write(b"x" * 200)
+        dae_file.flush()
+
+        with mock.patch.object(
+            RosRuntime, "_file_size_or_none", return_value=DAE_SCAN_MAX_BYTES
+        ):
+            with mock.patch.object(
+                RosRuntime, "_extract_dae_texture_references", return_value=[]
+            ) as extract_mock:
+                with mock.patch.object(
+                    RosRuntime, "_upload_mesh_file", return_value=UploadResult(True)
+                ):
+
+                    async def body(rt):
+                        await _publish_urdf_and_wait(rt)
+                        server, url, stop = _start_asset_upload_server()
+                        try:
+                            with mock.patch.object(
+                                RosRuntime, "_resolve_package_uri", return_value=dae_file.name,
+                            ):
+                                await rt.sync_assets("sync-1", url, "upload-tok", (dae_uri,))
+                                return await _drain_asset_progress_until(rt, {"finished"})
+                        finally:
+                            stop()
+
+                    updates = run(body)
+                    extract_mock.assert_called_once()
+
+    assert updates[-1].failed == ()

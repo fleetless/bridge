@@ -302,6 +302,29 @@ ROBOT_ASSET_STORE_BYTES = _CONTRACTS_CONSTANTS["ROBOT_ASSET_STORE_BYTES"]
 # prevent, one layer over.
 ASSET_REFUSAL_BODY_MAX_BYTES = 64 * 1024
 
+# The two statuses that mean "the cloud will not keep these bytes", as
+# opposed to "the transfer did not succeed". `409` is the store's own
+# refusal, which names its three numbers; `413` is the server's body
+# limit, which names nothing — reached only by a file so large that the
+# announced size never got weighed, and reported as a bare refusal rather
+# than a transfer failure precisely because retrying it is futile.
+ASSET_REFUSAL_STATUSES = frozenset({409, 413})
+
+# How large a `.dae` may be before this bridge stops scanning it for
+# internal texture references. A **local policy, not a wire constant**:
+# nothing on the other side knows or cares about it, which is why it is a
+# literal here rather than something vendored.
+#
+# The per-file upload ceiling is gone — the cloud's store decides what fits
+# now — but `_extract_dae_texture_references` reads the whole file and
+# builds an ElementTree over it, which is a multiple of the file size in
+# memory and has nothing to do with what the cloud will accept. A real
+# robot's 193 MB `base.dae` is the case this exists for. Above the cap the
+# scan is skipped and the mesh still uploads, streamed: a `.dae` whose
+# textures were never discovered renders untextured, which is worse than
+# textured and much better than a bridge that died reading it.
+DAE_SCAN_MAX_BYTES = 64 * 1024 * 1024
+
 # Generous relative to a mesh file's realistic size (tens of MB is not
 # unusual for a detailed collision mesh) — this only has to rule out a
 # genuinely hung upload, not compete with normal transfer time on a slow
@@ -3964,12 +3987,24 @@ class RosRuntime:
                     sizes[uri] = await loop.run_in_executor(None, self._file_size_or_none, path)
                 if path is None or not path.lower().endswith(".dae"):
                     continue
-                # Every `.dae` is scanned now, whatever its size. There
-                # used to be a ceiling check here, skipping the read for a
-                # file the upload loop was going to refuse anyway; with the
-                # per-file cap gone there is nothing to skip on, and a large
-                # `.dae` whose textures went unscanned would sync a mesh the
-                # cloud then cannot render.
+                # `_extract_dae_texture_references` below reads this file
+                # whole and parses it; `DAE_SCAN_MAX_BYTES` is what keeps
+                # that bounded now that the upload ceiling is gone. One
+                # line per oversized file and no more, because this loop
+                # visits each `.dae` exactly once per sync. No entry is
+                # added to `dae_textures`: "its textures were not looked
+                # for" is not a failure of any reference — inventing one
+                # would put a name on the wire this sync never determined
+                # anything about.
+                dae_size = sizes.get(uri)
+                if dae_size is not None and dae_size > DAE_SCAN_MAX_BYTES:
+                    log.warning(
+                        "Not scanning %r for internal textures: %d bytes is over "
+                        "the %d-byte scan cap. Textures inside it are not "
+                        "discovered; the mesh still uploads",
+                        uri, dae_size, DAE_SCAN_MAX_BYTES,
+                    )
+                    continue
                 if sync_budget_exhausted:
                     continue
                 if sync_reference_count >= DAE_MAX_INTERNAL_REFERENCES_PER_SYNC:
@@ -4477,19 +4512,26 @@ class RosRuntime:
 
     @staticmethod
     def _refused(name: str, exc: "urllib.error.HTTPError") -> UploadResult:
-        """A `409` from the store, logged once and classified.
+        """A refusal from the cloud (`ASSET_REFUSAL_STATUSES`), logged and
+        classified.
 
         Its own branch rather than a line in each caller because both
-        uploaders have to say the same thing about it, and because a `409`
-        is not a transfer failure: the bytes arrived and the cloud declined
-        to keep them, which is a different instruction to whoever reads the
-        progress frame."""
+        uploaders have to say the same thing about it, and because neither
+        status is a transfer failure: the cloud declined to keep these
+        bytes, and telling a reconciliation to retry would mean retrying
+        forever for a file that can never fit."""
         details = RosRuntime._store_refusal_details(exc)
-        if details is None:
+        if details is None and exc.code == 413:
             log.warning(
-                "Asset upload for %r refused: the robot's asset store had no "
-                "room, and the refusal did not say how much is left",
+                "Asset upload for %r refused: the cloud would not accept a "
+                "body that large. Nothing about retrying changes that",
                 name,
+            )
+        elif details is None:
+            log.warning(
+                "Asset upload for %r refused (HTTP %d): the refusal did not "
+                "say how much of the robot's asset store is left",
+                name, exc.code,
             )
         else:
             log.warning(
@@ -4534,12 +4576,23 @@ class RosRuntime:
 
     @staticmethod
     def _asset_upload_headers(
-        token: str, sync_id: str, kind: str, name: str, media_type: str
+        token: str, sync_id: str, kind: str, name: str, media_type: str, size: int
     ) -> Dict[str, str]:
         """Builds the header dict shared by `_upload_asset_bytes` and
         `_upload_asset_stream` — everything both need except `data` itself
         and (for the stream variant) `Content-Length`, which each caller
         adds on top since only one of the two needs it stated explicitly.
+
+        **`size` is announced, not only sent.** It is the same number as
+        `Content-Length`, and it is here as well because the two are read
+        at different moments: the cloud weighs this header against the
+        robot's store *before* it accepts a body, and refuses a file that
+        cannot fit with a `409` naming the store's three numbers. Without
+        it nothing is weighed, and a file over the server's own body limit
+        comes back as a bare `413` with nothing in it — which this bridge would file
+        as a transfer failure and retry on every sync, forever, for a file
+        that can never fit. Both callers already know the number, so
+        neither pays a `stat` for it.
 
         Header names from `ASSET_UPLOAD_HEADERS` (vendored from the wire
         contracts' own `constants.json`), not hand-typed and not from
@@ -4602,6 +4655,7 @@ class RosRuntime:
             # counterpart, not a hand-rolled scheme; see the docstring.
             ASSET_UPLOAD_HEADERS["nameEncoded"]: urllib.parse.quote(name, safe=""),
             ASSET_UPLOAD_HEADERS["syncId"]: sync_id,
+            ASSET_UPLOAD_HEADERS["size"]: str(size),
         }
 
     @staticmethod
@@ -4649,7 +4703,9 @@ class RosRuntime:
         widening the gap between `asset_progress` frames for no benefit
         (an unreachable cloud does not become reachable by waiting a
         fraction of a second, the way an emptied token bucket does)."""
-        headers = RosRuntime._asset_upload_headers(token, sync_id, kind, name, media_type)
+        headers = RosRuntime._asset_upload_headers(
+            token, sync_id, kind, name, media_type, len(data)
+        )
         request = urllib.request.Request(upload_url, data=data, method="POST", headers=headers)
         # `request` (bytes `data`, not a stream) is safe to hand to
         # `urlopen` more than once — nothing here consumes it. Contrast
@@ -4674,7 +4730,7 @@ class RosRuntime:
                         name, ASSET_UPLOAD_RATE_LIMIT_MAX_RETRIES,
                     )
                     return UploadResult(False)
-                if exc.code == 409:
+                if exc.code in ASSET_REFUSAL_STATUSES:
                     return RosRuntime._refused(name, exc)
                 log.warning("Asset upload for %r failed: HTTP %d", name, exc.code)
                 return UploadResult(False)
@@ -4729,7 +4785,9 @@ class RosRuntime:
            layer in. Reopening fresh each attempt (rather than seeking one
            handle back to 0) needs no state carried between iterations and
            cannot forget the rewind."""
-        headers = dict(RosRuntime._asset_upload_headers(token, sync_id, kind, name, media_type))
+        headers = dict(
+            RosRuntime._asset_upload_headers(token, sync_id, kind, name, media_type, size)
+        )
         headers["Content-Length"] = str(size)
         for attempt in range(ASSET_UPLOAD_RATE_LIMIT_MAX_RETRIES + 1):
             try:
@@ -4753,7 +4811,7 @@ class RosRuntime:
                         name, ASSET_UPLOAD_RATE_LIMIT_MAX_RETRIES,
                     )
                     return UploadResult(False)
-                if exc.code == 409:
+                if exc.code in ASSET_REFUSAL_STATUSES:
                     return RosRuntime._refused(name, exc)
                 log.warning("Asset upload for %r failed: HTTP %d", name, exc.code)
                 return UploadResult(False)
