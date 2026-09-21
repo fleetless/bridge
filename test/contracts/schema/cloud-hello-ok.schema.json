@@ -12,6 +12,7 @@
       "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
     },
     "protocol": {
+      "description": "The cloud's verdict on the announced protocol version; absent from an older cloud.",
       "type": "object",
       "properties": {
         "status": {
@@ -19,7 +20,8 @@
           "enum": [
             "current",
             "deprecated"
-          ]
+          ],
+          "description": "`current` or `deprecated` — never `unsupported`, which is a `hello_error`."
         },
         "sunset_at": {
           "anyOf": [
@@ -31,7 +33,8 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "ISO date a deprecated version stops being served; `null` when current."
         }
       },
       "required": [
@@ -40,11 +43,13 @@
       ]
     },
     "bridge": {
+      "description": "What the cloud knows about bridge packages; absent from an older cloud.",
       "type": "object",
       "properties": {
         "latest_version": {
           "type": "string",
-          "minLength": 1
+          "minLength": 1,
+          "description": "The newest published fleetless-bridge package version, for the bridge's own upgrade hint."
         }
       },
       "required": [

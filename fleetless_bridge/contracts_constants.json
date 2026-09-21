@@ -9,7 +9,7 @@
     }
   ],
   "PROTOCOL_SUNSET_DAYS": 90,
-  "LATEST_BRIDGE_VERSION": "3.1.0",
+  "LATEST_BRIDGE_VERSION": "3.2.0",
   "ASSET_UPLOAD_HEADERS": {
     "kind": "x-fleetless-asset-kind",
     "name": "x-fleetless-asset-name",
