@@ -1,5 +1,15 @@
 {
   "AUDIT_RETENTION_DAYS": 90,
+  "PROTOCOL_VERSION": 2,
+  "PROTOCOL_VERSIONS": [
+    {
+      "version": 2,
+      "bridge_from": "3.0.0",
+      "deprecated_at": null
+    }
+  ],
+  "PROTOCOL_SUNSET_DAYS": 90,
+  "LATEST_BRIDGE_VERSION": "3.1.0",
   "ASSET_UPLOAD_HEADERS": {
     "kind": "x-fleetless-asset-kind",
     "name": "x-fleetless-asset-name",

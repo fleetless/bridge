@@ -118,7 +118,7 @@
                 ]
               },
               "description": {
-                "description": "Prose about what this value is, for whoever meets it in the console later. It changes nothing the robot does, so a publish that touches only it pushes no configuration at all — but it is carried verbatim into `robot_describe`, where a model that has never seen this robot reads it. The datapoint is offered whenever the role grants it; without one it is offered with `description: null` and the model has less to go on, as for actions, services, publishers and cameras. Omission is the only way to say nothing; an empty string is refused, here and on all five.",
+                "description": "Prose about what this value is, for whoever meets it in the console. It changes nothing the robot does, so a publish that touches only it pushes no configuration at all — but it is carried verbatim into `robot_describe`, where a model that has never seen this robot reads it. The datapoint is offered whenever the role grants it; without one it is offered with `description: null` and the model has less to go on, as for actions, services, publishers and cameras. Omission is the only way to say nothing; an empty string is refused, here and on all five.",
                 "examples": [
                   "What this value is, for whoever meets it in the console."
                 ],

@@ -1,3 +1,21 @@
+ros-@ROS_DISTRO@-fleetless-bridge (3.2.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * **The protocol version comes from the vendored contracts now**, together
+    with the version window the cloud serves and the newest bridge release
+    the contracts knew about. It used to be a literal typed on both sides of
+    the wire, with one test standing between them and drift.
+  * **A refused protocol version no longer exits straight away.** The cloud
+    can refuse the version this package speaks; the fix is a newer package,
+    which the running process could never load. It waits half a minute,
+    jittered, and then exits, so the launch file's respawn retries once every
+    half minute instead of every five seconds — and a fresh process picks up
+    an upgraded package by itself. The exit code is still 2.
+  * **A deprecated protocol version is warned about once per process**, with
+    the date the cloud stops serving it and the newest release to upgrade to.
+    Once, not once per reconnect: the date does not move in between.
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Mon, 21 Sep 2026 12:00:00 +0200
+
 ros-@ROS_DISTRO@-fleetless-bridge (3.1.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * **Relicensed to the Apache License 2.0.** The package's installed

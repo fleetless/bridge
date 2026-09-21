@@ -15,8 +15,8 @@ these is stray".
 
 **`../../fleetless_bridge/contracts_constants.json` is a second,
 differently-shaped vendored artifact, not a schema** — a copy of the contracts
-package's own `constants.json`, loaded by `ros_runtime.py` at import time
-rather than only checked against by the test suite. It lives inside the Python
+package's own `constants.json`, loaded at import time by `ros_runtime.py`
+and `protocol.py` rather than only checked against by the test suite. It lives inside the Python
 package, not here, because it has to ship with an installed robot (`setup.py`'s
 `package_data`), while `schema/` only ever needs to exist for this package's
 own suite. `test_the_vendored_constants_still_match_the_contracts` is its
@@ -25,6 +25,17 @@ carries (`URDF_ASSET_NAME`, `ASSET_UPLOAD_HEADERS`) were Python literals
 hand-typed under a comment naming the TypeScript constant they came from — the
 exact drift these constants exist to prevent, surviving in the one place that
 could not import them.
+
+Since 1.3.0 it also carries the **protocol version window**:
+`PROTOCOL_VERSION`, `PROTOCOL_VERSIONS` (which bridge version first spoke
+each protocol version, and when that version was deprecated),
+`PROTOCOL_SUNSET_DAYS` and `LATEST_BRIDGE_VERSION`. `protocol.py` reads the
+first three at import time instead of typing them — until 2026-09 the `2` was
+a literal on both sides of the wire, and one test stood between them and
+drift. `LATEST_BRIDGE_VERSION` names a bridge release, so it is one release
+behind by construction: the constant cannot name a package that does not
+exist yet, and the follow-up contracts patch after a bridge release is what
+catches it up.
 
 **The three asset frames describe a conversation, not a payload.** The bytes never
 travel on this socket — a frame is capped at 2 MiB and a mesh exceeds that
@@ -61,7 +72,7 @@ than what this bridge's own serializer produces (`strict=False`).
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@1.0.5
+    Source: @fleetless/contracts@1.3.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
 An **exact npm version**, not a git revision. The contracts package is

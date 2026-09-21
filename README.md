@@ -105,13 +105,19 @@ A supervisor cannot read log messages, so the exit code says what happened.
 |---|---|
 | 0 | Stopped on request (SIGINT/SIGTERM). Nothing is wrong. |
 | 1 | Stopped by an unexpected error. |
-| 2 | Stopped because it will not heal by itself: no token, an unusable cloud URL, a token the cloud rejects, a protocol version the cloud refuses, or another bridge that took the robot over. |
+| 2 | Stopped because retrying in this process cannot help: no token, an unusable cloud URL, a token the cloud rejects, a protocol version the cloud refuses, or another bridge that took the robot over. |
 
 Code 2 is deliberate. A bridge that kept retrying a rejected token would
 hammer the cloud and hide the real problem, and one that reconnected after
 being superseded would trade the robot back and forth with its replacement
 forever. Everything else is retried with a jittered exponential backoff from
 1 s up to 30 s.
+
+A protocol version the cloud refuses waits half a minute, jittered, before
+that exit. The fix is a newer package, which this process could never load,
+so the wait plus the launch file's five-second respawn makes it one attempt
+every half minute — and the fresh process picks up an upgraded package by
+itself.
 
 ## 📚 Documentation
 

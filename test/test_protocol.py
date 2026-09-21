@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """The wire protocol in isolation: what we send, and how we read what arrives."""
 import json
+import pathlib
 import struct
 
 import pytest
 from jsonschema import ValidationError
 
 from fleetless_bridge.protocol import (
+    LATEST_BRIDGE_VERSION,
     PROTOCOL_VERSION,
+    PROTOCOL_VERSIONS,
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
     APPLY_ERROR_CODE_UNKNOWN,
     APPLY_ERROR_CODE_WHOLE_KIND_FAILED,
@@ -58,11 +61,30 @@ from fleetless_bridge.protocol import (
 from schemas import SCHEMA_DIR, validate_frame
 
 
-def test_protocol_version_matches_the_contracts_pin():
-    """`PROTOCOL_VERSION` is a hand-kept literal that must match the wire
-    contracts — nothing else checks it. It became 2 when
-    `bridgeConfigApplied.errors` grew `kind`/`code` (contracts @ d58f9d2)."""
-    assert PROTOCOL_VERSION == 2
+def _semver(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+def test_the_protocol_version_comes_from_the_vendored_constants():
+    """Not a literal any more. Until 2026-09 the `2` was typed on both sides
+    of the wire and `test_contracts_sync.py` was the only thing between them
+    and drift; now there is one value, read from the vendored artifact."""
+    constants = json.loads(
+        (pathlib.Path(__file__).resolve().parents[1] / "fleetless_bridge" / "contracts_constants.json").read_text()
+    )
+    assert PROTOCOL_VERSION == constants["PROTOCOL_VERSION"]
+    assert PROTOCOL_VERSIONS == constants["PROTOCOL_VERSIONS"]
+    assert LATEST_BRIDGE_VERSION == constants["LATEST_BRIDGE_VERSION"]
+
+
+def test_this_bridge_appears_in_the_versions_table():
+    """The window says which bridge version first spoke the protocol version
+    this package sends. A package older than its own `bridge_from` would be
+    claiming a version it predates."""
+    from fleetless_bridge import __version__
+
+    entry = next(e for e in PROTOCOL_VERSIONS if e["version"] == PROTOCOL_VERSION)
+    assert _semver(entry["bridge_from"]) <= _semver(__version__)
 
 
 def test_hello_carries_the_token_the_version_and_the_protocol():
@@ -111,6 +133,21 @@ def test_hello_ok_is_read_as_a_robot_binding():
     assert message == HelloOk(robot_id="r-42")
 
 
+def test_hello_ok_parses_the_window_fields_and_tolerates_their_absence():
+    """Both shapes are on the wire at once: an older cloud sends neither
+    object, and nothing about a missing window is an error."""
+    bare = parse_cloud_message(json.dumps({"type": "hello_ok", "robot_id": "r"}))
+    assert isinstance(bare, HelloOk) and bare.protocol_status is None
+    full = parse_cloud_message(json.dumps({
+        "type": "hello_ok", "robot_id": "r",
+        "protocol": {"status": "deprecated", "sunset_at": "2026-12-20"},
+        "bridge": {"latest_version": "3.9.0"},
+    }))
+    assert full.protocol_status == "deprecated"
+    assert full.sunset_at == "2026-12-20"
+    assert full.latest_bridge_version == "3.9.0"
+
+
 def test_a_rejected_token_is_terminal():
     message = parse_cloud_message(
         '{"type":"hello_error","code":"invalid_token","message":"no such robot"}'
@@ -119,11 +156,12 @@ def test_a_rejected_token_is_terminal():
     assert message.terminal
 
 
-def test_a_version_mismatch_is_terminal():
-    message = parse_cloud_message(
-        '{"type":"hello_error","code":"protocol_mismatch","message":"upgrade"}'
-    )
-    assert message.terminal
+def test_only_an_invalid_token_is_terminal():
+    """`protocol_mismatch` left the terminal set with the version window: the
+    refusal is about which package is installed, and a restart that installs a
+    newer one ends it without a human."""
+    assert HelloError("invalid_token", "x").terminal
+    assert not HelloError("protocol_mismatch", "x").terminal
 
 
 def test_an_unfamiliar_rejection_is_worth_retrying():

@@ -160,8 +160,16 @@ class Session:
         self._cloud.job_lost.append(payload)
         return payload
 
-    async def accept(self, robot_id: str = ROBOT_ID) -> None:
-        await self._send("cloud-hello-ok", {"type": "hello_ok", "robot_id": robot_id})
+    async def accept(self, robot_id: str = ROBOT_ID, protocol: dict = None, bridge: dict = None) -> None:
+        # `protocol` and `bridge` are optional on the wire, so an omitted one
+        # is left out of the frame rather than sent as null: that is the
+        # frame an older cloud produces, and the bridge has to read both.
+        frame = {"type": "hello_ok", "robot_id": robot_id}
+        if protocol is not None:
+            frame["protocol"] = protocol
+        if bridge is not None:
+            frame["bridge"] = bridge
+        await self._send("cloud-hello-ok", frame)
 
     async def reject(self, code: str, message: str = "refused by the fake cloud") -> None:
         await self._send(
@@ -442,12 +450,15 @@ def sequence(*behaviors):
     return dispatch
 
 
-def accepts(robot_id: str = ROBOT_ID, then=None):
-    """Answer the hello with hello_ok, then run `then` (or just stay open)."""
+def accepts(robot_id: str = ROBOT_ID, then=None, protocol=None, bridge=None):
+    """Answer the hello with hello_ok, then run `then` (or just stay open).
+
+    `protocol` and `bridge` are the version-window objects, omitted unless a
+    test asks for them."""
 
     async def behavior(session):
         await session.recv_hello()
-        await session.accept(robot_id)
+        await session.accept(robot_id, protocol=protocol, bridge=bridge)
         if then is None:
             await session.drain()
         else:

@@ -79,6 +79,7 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_KIND_SERVICE,
     CLOSE_CODE_ROBOT_DELETED,
     CLOSE_CODE_SUPERSEDED,
+    PROTOCOL_VERSION,
     ApplyError,
     CloudAssetRequest,
     CloudCameraStart,
@@ -121,6 +122,19 @@ IDLE_TIMEOUT_S = 30.0
 BACKOFF_INITIAL_S = 1.0
 BACKOFF_FACTOR = 2.0
 BACKOFF_CAP_S = 30.0
+
+# A refused protocol version is not a network hiccup: the fix is a newer
+# package on disk, which this process can never load. So it waits — far
+# longer than an ordinary reconnect, because nothing it does in the meantime
+# can help — and then exits, and the launch file's respawn is what picks the
+# upgrade up. Half a minute of waiting plus a 5 s respawn is one attempt per
+# ~35 s instead of one every 5 s.
+REFUSAL_BACKOFF_INITIAL_S = 30.0
+# The ceiling the schedule would climb to. One process takes at most one
+# refusal delay today (it exits after it), so this bounds a schedule rather
+# than a wait anybody has measured — kept so that a future in-process retry
+# cannot grow without one.
+REFUSAL_BACKOFF_CAP_S = 600.0
 
 CLOSE_TIMEOUT_S = 5.0
 
@@ -1317,6 +1331,17 @@ class BridgeClient:
         # tests that opt in on purpose (test_client_pressure_pump.py).
         self._pressure_sleep = pressure_sleep if pressure_sleep is not None else asyncio.sleep
         self._backoff = backoff if backoff is not None else ExponentialBackoff()
+        self._refusal_backoff = ExponentialBackoff(
+            initial=REFUSAL_BACKOFF_INITIAL_S, cap=REFUSAL_BACKOFF_CAP_S
+        )
+        # Set when the cloud refused this bridge's protocol version, cleared
+        # by the next `hello_ok`: `run()` reads it to choose between
+        # reconnecting and waiting out a long backoff before exiting.
+        self._last_refused_for_version = False
+        # Once per process, not per session: the sunset date does not move
+        # between two reconnects, and a bridge on a flaky link would
+        # otherwise repeat the same sentence every few minutes.
+        self._warned_deprecated = False
         self._handshake_timeout = handshake_timeout
         self._idle_timeout = idle_timeout
         self._bridge_version = bridge_version
@@ -1469,6 +1494,20 @@ class BridgeClient:
                 return reason
             if self._stop.is_set():
                 break
+            if self._last_refused_for_version:
+                # Wait, then exit rather than reconnect. An in-process retry
+                # would keep running the package the cloud just refused, so
+                # an apt upgrade would never take effect; exiting hands the
+                # decision to the respawn, which loads what is installed now.
+                delay = self._refusal_backoff.next_delay()
+                log.info(
+                    "Protocol refused; exiting in %.0f s so a restart can pick up "
+                    "an upgraded package",
+                    delay,
+                )
+                if await self._sleep_or_stop(delay):
+                    break
+                return StopReason.REJECTED
             delay = self._backoff.next_delay()
             log.info("Reconnecting in %.0f s", delay)
             if await self._sleep_or_stop(delay):
@@ -1677,7 +1716,19 @@ class BridgeClient:
                     # Only a handshake that actually succeeded proves the cloud is
                     # healthy, so only that resets the backoff.
                     self._backoff.reset()
+                    self._last_refused_for_version = False
+                    self._refusal_backoff.reset()
                     log.info("Connected as robot %s", message.robot_id)
+                    if message.protocol_status == "deprecated" and not self._warned_deprecated:
+                        self._warned_deprecated = True
+                        log.warning(
+                            "This bridge speaks protocol %s, which the cloud stops serving on %s. "
+                            "Upgrade before then: apt-get install --only-upgrade "
+                            "ros-$ROS_DISTRO-fleetless-bridge (latest is %s).",
+                            PROTOCOL_VERSION,
+                            message.sunset_at,
+                            message.latest_bridge_version or "unknown",
+                        )
                     if self._ros is not None:
                         self._log_dropped_samples()
                         self._ros.set_connected(True)
@@ -1707,6 +1758,16 @@ class BridgeClient:
                             message.message,
                         )
                         return StopReason.REJECTED
+                    if message.code == "protocol_mismatch":
+                        if not self._last_refused_for_version:
+                            log.error(
+                                "The cloud refused this bridge's protocol version (%s). "
+                                "Waiting, then exiting so a restart can pick up an "
+                                "upgraded package.",
+                                message.message,
+                            )
+                        self._last_refused_for_version = True
+                        return None
                     log.warning(
                         "The cloud refused the hello for now (%s): %s",
                         message.code,

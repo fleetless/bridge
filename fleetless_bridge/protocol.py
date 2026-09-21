@@ -58,16 +58,35 @@ and kept in step with the schema; this module only frames them onto the wire.
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
-PROTOCOL_VERSION = 2
+# Read from the vendored contracts constants, not typed here: until 2026-09
+# the `2` was a literal on both sides of the wire and one test stood between
+# them and drift. `ros_runtime.py` loads the same file — two readers of one
+# file is fine, two literals is not.
+_CONSTANTS_PATH = pathlib.Path(__file__).with_name("contracts_constants.json")
+with _CONSTANTS_PATH.open("r", encoding="utf-8") as _f:
+    _CONSTANTS = json.load(_f)
 
-# The `fleetless.yaml` format version — `doc.fleetless`, a hand-kept literal
-# on both sides of the wire like `PROTOCOL_VERSION` above (contracts'
-# `FLEETLESS_FORMAT_VERSION`; it exports no artifact constant to vendor).
+#: The protocol version this bridge speaks, sent in every hello.
+PROTOCOL_VERSION: int = _CONSTANTS["PROTOCOL_VERSION"]
+#: The window the cloud serves: one entry per protocol version, saying which
+#: bridge release first spoke it and when it was deprecated (`None` while it
+#: is current). The cloud decides; this copy is what the package can answer
+#: with offline.
+PROTOCOL_VERSIONS: List[Dict[str, Any]] = _CONSTANTS["PROTOCOL_VERSIONS"]
+#: The newest bridge release the contracts knew about when they were built —
+#: one release behind after every bridge release, by construction.
+LATEST_BRIDGE_VERSION: str = _CONSTANTS["LATEST_BRIDGE_VERSION"]
+
+# The `fleetless.yaml` format version — `doc.fleetless`. Still a hand-kept
+# literal on both sides of the wire, which `PROTOCOL_VERSION` above stopped
+# being: contracts' `FLEETLESS_FORMAT_VERSION` exports no artifact constant
+# to vendor, so there is nothing here to read it from.
 # Deliberately not called a version anywhere it could be read as the
 # published-configuration counter `Config.version` holds: those are two
 # different numbers.
@@ -76,7 +95,12 @@ FLEETLESS_FORMAT_VERSION = 1
 # A hello refused for one of these reasons will be refused again for as long as
 # the robot's configuration stays as it is: retrying only hammers the cloud
 # with a token it has already rejected.
-TERMINAL_HELLO_ERROR_CODES = frozenset({"invalid_token", "protocol_mismatch"})
+#
+# `protocol_mismatch` left this set with the version window: a cloud that
+# refuses a version today may serve it after its own next deploy is rolled
+# back, and a robot that exits leaves its supervisor respawning it every five
+# seconds. The client waits out a long backoff before that exit instead.
+TERMINAL_HELLO_ERROR_CODES = frozenset({"invalid_token"})
 
 # Why a camera_state frame was sent (`bridgeCameraState.cause` in the wire
 # contracts). Required on every frame, not just the unsolicited ones:
@@ -183,9 +207,15 @@ class ApplyError(NamedTuple):
 
 @dataclass(frozen=True)
 class HelloOk:
-    """The cloud accepted the token and bound this connection to a robot."""
+    """The cloud accepted the token and bound this connection to a robot.
+
+    The window fields are optional on the wire (an older cloud sends none)
+    and `None` here in that case."""
 
     robot_id: str
+    protocol_status: Optional[str] = None
+    sunset_at: Optional[str] = None
+    latest_bridge_version: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1418,9 +1448,22 @@ def parse_cloud_message(raw: object) -> CloudMessage:
     kind = payload.get("type")
     if kind == "hello_ok":
         robot_id = payload.get("robot_id")
-        if isinstance(robot_id, str) and robot_id:
-            return HelloOk(robot_id=robot_id)
-        return Unknown(raw, "hello_ok without a usable robot_id")
+        if not (isinstance(robot_id, str) and robot_id):
+            return Unknown(raw, "hello_ok without a usable robot_id")
+        # Each field is taken only if it is the type it should be: a window
+        # the cloud garbled is worth less than no window, and never worth
+        # losing the binding this frame carries.
+        protocol = payload.get("protocol") if isinstance(payload.get("protocol"), dict) else {}
+        bridge = payload.get("bridge") if isinstance(payload.get("bridge"), dict) else {}
+        status = protocol.get("status")
+        sunset = protocol.get("sunset_at")
+        latest = bridge.get("latest_version")
+        return HelloOk(
+            robot_id=robot_id,
+            protocol_status=status if isinstance(status, str) else None,
+            sunset_at=sunset if isinstance(sunset, str) else None,
+            latest_bridge_version=latest if isinstance(latest, str) else None,
+        )
     if kind == "hello_error":
         code = payload.get("code")
         message = payload.get("message")

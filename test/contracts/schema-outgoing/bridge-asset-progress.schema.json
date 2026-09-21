@@ -59,7 +59,7 @@
                     "type": "integer",
                     "exclusiveMinimum": 0,
                     "maximum": 9007199254740991,
-                    "description": "How large the refused file actually is, in bytes. With `limit_bytes` beside it a developer can tell whether to shrink the mesh or raise the limit; \"too large\" alone answers neither."
+                    "description": "How large the refused file is, in bytes. With `limit_bytes` beside it a developer can tell whether to shrink the mesh or raise the limit; \"too large\" alone answers neither."
                   }
                 },
                 "required": [

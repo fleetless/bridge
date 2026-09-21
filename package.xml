@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>fleetless_bridge</name>
-  <version>3.1.0</version>
+  <version>3.2.0</version>
   <description>Fleetless Bridge: connects a ROS2 robot to the Fleetless cloud.</description>
   <maintainer email="andre@dehne-robotik.de">Andre Dehne</maintainer>
   <license>Apache-2.0</license>
