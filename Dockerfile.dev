@@ -53,7 +53,14 @@ COPY package.xml /tmp/fleetless_bridge/package.xml
 # configure time until a recent version removed it (see README.md's own
 # history section for what that means for robots already on the version
 # before this one).
+# The `ros:<distro>` base image is a snapshot of the apt repository, and the
+# repository moves under it: on 2026-09-22 rosdep pulled a fresh
+# example_interfaces onto lyrical's month-old service_msgs, and every process
+# loading its typesupport died in the dynamic linker (exit 127, no traceback).
+# Nothing in the .deb metadata refuses that pairing, so the image brings
+# itself up to the repository before installing anything on top.
 RUN apt-get update \
+    && apt-get dist-upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends python3-rosdep \
         debhelper dh-python python3-all python3-setuptools fakeroot \
     && (rosdep init 2>/dev/null || true) \
