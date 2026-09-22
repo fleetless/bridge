@@ -399,9 +399,14 @@ class Session:
         self._ws.abort()
 
     async def drain(self) -> None:
-        """Hold the connection open until the bridge goes away, saying nothing."""
+        """Hold the connection open until the bridge goes away, saying nothing.
+
+        Through `recv`, not the socket: a `link_mode` arriving after the last
+        explicit receive would otherwise be neither recorded nor stepped
+        over, and the frame-count assertions — the only thing that would
+        catch a frame per tick — are blind to whatever lands here."""
         while True:
-            await self._ws.recv()
+            await self.recv()
 
     async def _send(self, schema: str, payload: dict) -> None:
         validate_frame(schema, payload)
