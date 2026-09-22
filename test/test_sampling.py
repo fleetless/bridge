@@ -4,11 +4,13 @@ real ROS message types throughout, not synthetic stand-ins, so the IDL
 quirks (nested messages in short form, `float`/`double` not
 `float32`/`float64`, `sequence<uint8>` for byte arrays) are real."""
 import base64
+import json
 
 import pytest
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import BatteryState, CompressedImage, JointState
 
+from fleetless_bridge.protocol import datapoint_message
 from fleetless_bridge.sampling import (
     FieldPathError,
     AverageHzPolicy,
@@ -122,6 +124,61 @@ def test_a_field_pointing_at_a_nested_message_converts_just_that_subtree():
         "y": 0.0,
         "z": 0.0,
     }
+
+
+# --- non-finite floats --------------------------------------------------------
+
+
+def test_a_non_finite_scalar_field_becomes_null():
+    """JSON has no `NaN`/`Infinity`. `json.dumps`' default `allow_nan=True`
+    writes a bare literal Python accepts but `JSON.parse` refuses, so one
+    unmeasured field costs the whole frame; `null` is the JSON reading of
+    "not measured"."""
+    msg = BatteryState()
+    msg.percentage = float("nan")
+    value = extract_value(msg, "percentage")
+    assert value_to_json(value, resolve_field(BatteryState, "percentage")) is None
+
+
+def test_non_finite_sequence_elements_become_null_and_finite_ones_stay():
+    msg = JointState()
+    msg.position = [1.0, float("nan"), float("inf"), float("-inf"), 2.0]
+    value = extract_value(msg, "position")
+    assert value_to_json(value, resolve_field(JointState, "position")) == [
+        1.0,
+        None,
+        None,
+        None,
+        2.0,
+    ]
+
+
+def test_a_whole_message_maps_each_non_finite_field_to_null():
+    msg = JointState()
+    msg.position = [557.0875, 79.075]
+    msg.effort = [float("nan"), float("nan")]
+    msg.velocity = [float("inf"), float("-inf")]
+
+    result = message_to_json(msg)
+
+    assert result["position"] == [557.0875, 79.075]
+    assert result["effort"] == [None, None]
+    assert result["velocity"] == [None, None]
+
+
+def test_a_datapoint_with_non_finite_floats_is_valid_json():
+    """The wire claim: what a current bridge sends is valid JSON.
+    `parse_constant` fires on a bare `NaN`/`Infinity` literal — exactly the
+    tokens `JSON.parse` refuses — so this fails if one reaches the bytes."""
+    msg = JointState()
+    msg.effort = [float("nan"), float("nan")]
+    frame = datapoint_message("joint_states", message_to_json(msg), 1234)
+
+    def reject_bare_literal(literal):
+        raise AssertionError("bare {} literal on the wire".format(literal))
+
+    parsed = json.loads(frame, parse_constant=reject_bare_literal)
+    assert parsed["value"]["effort"] == [None, None]
 
 
 # --- scale/offset ---------------------------------------------------------------
