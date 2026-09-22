@@ -155,6 +155,12 @@ APPLY_ERROR_KIND_ACTION = "action"
 APPLY_ERROR_KIND_SERVICE = "service"
 APPLY_ERROR_KIND_PUBLISHER = "publisher"
 APPLY_ERROR_KIND_CAMERA = "camera"
+#: Not an exposure kind like the five above: the `low_bandwidth` section
+#: configures the bridge rather than exposing anything, so it has no slug of
+#: its own and names itself in both fields. It is a kind because a developer
+#: reading a `config_applied` has to be able to tell a datapoint that would
+#: not apply from a mode setting that would not resolve.
+APPLY_ERROR_KIND_LOW_BANDWIDTH = "low_bandwidth"
 
 # `ApplyError.code` values this bridge actually produces (contracts:
 # deliberately a bounded string, not an enum — a classification the bridge
@@ -167,10 +173,9 @@ APPLY_ERROR_CODE_FIELD_PATH_INVALID = "field_path_invalid"  # FieldPathError (sa
 APPLY_ERROR_CODE_WHOLE_KIND_FAILED = "whole_kind_failed"  # _apply_or_report's catch, slug '*'
 APPLY_ERROR_CODE_UNKNOWN = "unknown"  # everything else the per-slug broad catch sees
 # The `low_bandwidth` section did not resolve — `LowBandwidthSettings.resolve`
-# raised, and the bridge kept the settings it had. Reported under the
-# `datapoint` kind with slug `*`, because `kind` is a closed enum on the wire
-# and the rate cap is the lever the section mostly governs; the message
-# carries the sentence naming the key and the rule.
+# raised, and the bridge kept the settings it had. Carried on
+# `APPLY_ERROR_KIND_LOW_BANDWIDTH`, whose slug is the section's own name;
+# the message is the sentence naming the key and the rule.
 APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID = "low_bandwidth_invalid"
 
 # Close codes the cloud uses (frozen with the cloud): 4000 supersede,

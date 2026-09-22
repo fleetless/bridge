@@ -195,8 +195,8 @@ def test_a_section_that_does_not_resolve_is_reported_and_the_mode_stays_put():
     box = asyncio.run(scenario())
     assert box["applied"]["ok"] is False
     assert box["applied"]["errors"] == [{
-        "slug": "*",
-        "kind": "datapoint",
+        "slug": "low_bandwidth",
+        "kind": "low_bandwidth",
         "code": "low_bandwidth_invalid",
         "message": "low_bandwidth.exit_lag_ms must be at or below enter_lag_ms",
     }]

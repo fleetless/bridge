@@ -77,6 +77,7 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_KIND_ACTION,
     APPLY_ERROR_KIND_CAMERA,
     APPLY_ERROR_KIND_DATAPOINT,
+    APPLY_ERROR_KIND_LOW_BANDWIDTH,
     APPLY_ERROR_KIND_PUBLISHER,
     APPLY_ERROR_KIND_SERVICE,
     CLOSE_CODE_ROBOT_DELETED,
@@ -2111,10 +2112,12 @@ class BridgeClient:
         that as fatal would be taken down by a document the console accepted.
         The previous section stays in force.
 
-        The error rides the `datapoint` kind with slug `*`: `kind` is a closed
-        enum on the wire, and the rate cap is the lever this section mostly
-        governs. The message is the sentence `resolve` raised, naming the key
-        and the rule."""
+        The error carries the section's own kind and names itself as the
+        slug — the section configures the bridge rather than exposing
+        anything, so there is no exposure slug to blame, and a developer
+        reading the ack has to be able to tell a datapoint that would not
+        apply from a mode setting that would not resolve. The message is the
+        sentence `resolve` raised, naming the key and the rule."""
         previous = self._yaml_low_bandwidth
         self._yaml_low_bandwidth = dict(message.low_bandwidth)
         try:
@@ -2126,7 +2129,8 @@ class BridgeClient:
                 message.version, exc,
             )
             return [ApplyError(
-                slug="*", kind=APPLY_ERROR_KIND_DATAPOINT,
+                slug=APPLY_ERROR_KIND_LOW_BANDWIDTH,
+                kind=APPLY_ERROR_KIND_LOW_BANDWIDTH,
                 code=APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID, message=str(exc),
             )]
         return []
