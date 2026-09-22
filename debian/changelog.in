@@ -3,13 +3,13 @@ ros-@ROS_DISTRO@-fleetless-bridge (4.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgenc
   * **Low-bandwidth mode.** The cloud measures the lag, the bridge measures
     how long its own sends wait, and when either stays high for ten seconds
     the bridge stops pushing a full telemetry stream through a pipe that
-    cannot carry it: every datapoint is capped to 1 Hz, a running video
-    stream is re-encoded at 300 kbps or ended, new streams are refused, and
-    buffered history waits. It leaves once both measurements have been calm
-    for a minute, and tells the cloud each time it crosses, so the console
-    can say why a robot went quiet. A capped datapoint with `retention`
-    still buffers what the cap held back — the mode spares the link, not the
-    record.
+    cannot carry it: every datapoint is held to 1 Hz on average, a running
+    video stream is re-encoded at 300 kbps or ended, new streams are
+    refused, and buffered history waits. It leaves once both measurements
+    have been calm for a minute, and tells the cloud each time it crosses,
+    so the console can say why a robot went quiet. A held-back datapoint
+    with `retention` still buffers what did not go out — the mode spares the
+    link, not the record.
   * **Eight new ROS parameters, `low_bandwidth.*`**, listed in the launch
     file and settable on a running robot with `ros2 param set`. A value the
     bridge cannot use is refused by the set, naming the rule it broke. The
