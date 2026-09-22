@@ -90,20 +90,15 @@ than what this bridge's own serializer produces (`strict=False`).
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@1.3.0
-            at commit df52195
+    Source: @fleetless/contracts@2.0.0
+            at commit 23dfc22 (tag v2.0.0)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
-            Next release: 2.0.0 (unreleased; the release chore records the tag)
 
-**This pin is provisional and currently names a version these bytes did not
-come from.** They were vendored from the contracts checkout that carries
-protocol 3 and the per-robot asset store, while its `package.json` still
-said `1.3.0` — the 2.0.0 release chore lands after the bridge work. The sync test compares against whatever
-`$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version
-against this line, so a pre-release checkout agrees with it and a published
-1.3.0 tarball would not. **Set this to `2.0.0` when contracts releases it**,
-and re-run the suite against the published package; until then this line
-records where the bytes came from, not a version anyone else can resolve.
+These bytes are the 2.0.0 release: protocol 3, the per-robot asset store,
+the close codes and the low-bandwidth defaults in `constants.json`. The sync
+test compares against whatever `$FLEETLESS_CONTRACTS_DIR` points at and
+checks that tree's own version against this line, so only a checkout or a
+tarball of 2.0.0 agrees with it.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a
