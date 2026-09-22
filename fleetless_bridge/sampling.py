@@ -6,10 +6,11 @@ Three independent concerns live here:
   whole message, a dot path with optional `[idx]` picks one value or one
   nested message out of it.
 - `value_to_json`: the fixed message -> JSON rules (nested message -> object,
-  sequence -> array, `uint8[]` -> base64, everything else passthrough — this
-  also covers `builtin_interfaces/Time` and `Duration`, whose only fields are
-  `sec`/`nanosec` ints, so `{sec, nanosec}` falls out of the generic nested
-  message rule with no special case).
+  sequence -> array, `uint8[]` -> base64, a non-finite float -> `null`,
+  everything else passthrough — this also covers `builtin_interfaces/Time`
+  and `Duration`, whose only fields are `sec`/`nanosec` ints, so
+  `{sec, nanosec}` falls out of the generic nested message rule with no
+  special case).
 - `RatePolicy` and its three implementations. The bridge is the only place
   that rate-limits, so every subscriber of a slug sees the same rate.
   - `MaxHzPolicy`: what `rate_throttle_hz` asks for. A minimum gap — drop a
@@ -26,6 +27,7 @@ Three independent concerns live here:
 from __future__ import annotations
 
 import base64
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -112,10 +114,27 @@ def extract_value(msg: Any, field_path: Optional[str]) -> Any:
     return current
 
 
+def _finite_or_null(value: Any) -> Any:
+    """A non-finite float becomes `None`, i.e. `null` on the wire.
+
+    JSON has no `NaN`. `json.dumps`' default `allow_nan=True` writes a bare
+    `NaN`/`Infinity` literal, which Python's permissive parser accepts but
+    JavaScript's `JSON.parse` — the cloud's parser — refuses, so one
+    unmeasured field (an unset `sensor_msgs/JointState.effort`, a covariance
+    entry) costs the whole frame. `null` is the JSON reading of "not
+    measured". Only floats can be non-finite; ints, bools and every other
+    type pass through untouched."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 def value_to_json(value: Any, type_str: str) -> Any:
     """The fixed value -> JSON rules for one field's raw value, given its IDL
     type string (from `resolve_field`, or a message class's own
-    `get_fields_and_field_types()` while recursing)."""
+    `get_fields_and_field_types()` while recursing). A non-finite float
+    becomes `null` — see `_finite_or_null` — in the scalar path and for every
+    element of an array."""
     item_type, is_array = classify(type_str)
     if item_type == "uint8" and is_array:
         return base64.b64encode(bytes(value)).decode("ascii")
@@ -124,8 +143,8 @@ def value_to_json(value: Any, type_str: str) -> Any:
             return [_message_fields_to_json(item) for item in value]
         return _message_fields_to_json(value)
     if is_array:
-        return list(value)
-    return value
+        return [_finite_or_null(item) for item in value]
+    return _finite_or_null(value)
 
 
 def _message_fields_to_json(msg: Any) -> dict:
