@@ -16,8 +16,9 @@ ros-@ROS_DISTRO@-fleetless-bridge (4.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgenc
     `low_bandwidth` section of the published `fleetless.yaml` overrides them,
     and a datapoint that must keep its rate says `low_bandwidth: keep`.
   * **Protocol 3.** The uplink budget, the `/fleetless/uplink_kbps` override
-    topic and the `bridge_pressure` datapoint are gone; a cloud speaking
-    protocol 2 will refuse this package, and this package will refuse it.
+    topic and the `bridge_pressure` datapoint are gone; a cloud that does not
+    serve protocol 3 refuses this package at the hello, and it waits and
+    exits rather than reconnecting into the same wall.
   * **No upload size cap of the bridge's own.** A robot's assets are charged
     against a one-gigabyte store the cloud alone can evaluate — it knows what
     the robot's other files already occupy and this process does not. So every

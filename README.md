@@ -87,7 +87,7 @@ time it crosses, so the console can say why a robot went quiet.
 | `low_bandwidth.exit_after_s` | `60` | How long that has to hold. |
 | `low_bandwidth.datapoint_max_hz` | `1.0` | What every datapoint is held to in the mode, unless it says `low_bandwidth: keep`. A long-run rate, not a minimum gap: after a quiet spell two samples may go out close together. |
 | `low_bandwidth.camera` | `reduce` | `reduce` re-encodes a running stream smaller; `stop` ends it. New streams are refused either way. |
-| `low_bandwidth.camera_bitrate_kbps` | `300` | What `reduce` re-encodes at. |
+| `low_bandwidth.camera_bitrate_kbps` | `300` | What `reduce` aims at. The encoder clamps it — VP8 to 250 kbps…1.5 Mbps, H264 to 500 kbps…3 Mbps — and which codec is in use is the session's answer, not the bridge's choice, so under H264 this lands at 500. The log says so once per stream. |
 
 They are ordinary ROS parameters, so they move at runtime:
 
@@ -97,7 +97,12 @@ ros2 param set /fleetless_bridge low_bandwidth.datapoint_max_hz 0.5
 ```
 
 A value the bridge cannot use is refused by the set, with the rule it broke,
-and the parameter keeps what it had. One rule spans two keys: `exit_lag_ms`
+and the parameter keeps what it had. Two things about `ros2 param set` that
+are ROS's doing rather than the bridge's: the types are fixed at declaration,
+so `datapoint_max_hz` takes `2.0` and not `2`, while the `_ms` and `_s` keys
+take `2000` and not `2000.0`; and each parameter is validated on its own, so
+lowering `enter_lag_ms` below the current `exit_lag_ms` is refused until
+`exit_lag_ms` is lowered first. One rule spans two keys: `exit_lag_ms`
 must stay at or below `enter_lag_ms`. Crossed, the same reading satisfies
 both thresholds and the mode leaves as it arrives, so the bridge refuses the
 pair — including when only one of the two is published and it crosses the
@@ -130,9 +135,11 @@ A `camera_start` that arrives while the mode holds is refused, under
 exists because there is none to spare. The camera says so for itself —
 `low_bandwidth`, with the sentence — rather than failing silently.
 
-Nothing is lost in the mode, only delayed: a capped datapoint with
-`retention` still buffers every sample it held back, and the history fills in
-once the link recovers.
+Nothing a retained datapoint held back is lost, only delayed: it buffers
+every sample the ceiling kept off the wire, and the history fills in once the
+link recovers. Without `retention` there is no buffer and the held-back
+samples are gone, and a stream ended under `stop` stays ended until somebody
+starts it again.
 
 ## 📄 What the robot exposes
 
