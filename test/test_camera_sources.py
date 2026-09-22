@@ -1769,7 +1769,6 @@ def test_same_transport_rtsp_opens_now_run_genuinely_concurrently():
             )
         )
 
-    overall_start = time.monotonic()
     for adapter in adapters:
         adapter.start()
     try:
@@ -1778,37 +1777,29 @@ def test_same_transport_rtsp_opens_now_run_genuinely_concurrently():
     finally:
         for adapter in adapters:
             adapter.stop()
-    total_elapsed = time.monotonic() - overall_start
 
     assert len(starts) == n and len(finishes) == n
 
-    # The property this redesign exists to deliver, checked exactly rather
+    # The property this redesign exists to deliver, checked directly rather
     # than inferred from a total: at least one pair of critical sections
     # genuinely overlapped in wall-clock time. In a debug run of this
     # exact test all eight started within ~1ms of each
     # other and finished between 0.300s-0.409s -- true concurrent
     # execution, not a fast-looking illusion.
+    #
+    # **A total-time bound used to sit below this, and was removed because it
+    # cannot separate a loaded parallel run from a serialized one.** Measured
+    # parallel-under-load totals of 3.77s and 4.47s overlap the 3.94s-4.75s a
+    # serialized run of this same n=8/delay=0.3s shape costs, so any bound
+    # stable enough for a loaded runner no longer catches serialization --
+    # it reddened on GitHub's runners while the property it guards held. The
+    # overlap check is the precise, non-noisy signal: serialize the opens and
+    # no pair overlaps, so this fails.
     intervals = sorted(((starts[i], finishes[i]) for i in range(n)), key=lambda pair: pair[0])
     any_overlap = any(
         finish_a > start_b for (start_a, finish_a), (start_b, _finish_b) in zip(intervals, intervals[1:])
     )
     assert any_overlap, "same-transport RTSP opens did not actually overlap -- still serialized"
-
-    # A loose sanity bound on the total, deliberately not a tight one: the
-    # overlap check above is the precise, non-noisy signal. Four real runs
-    # of just this test measured totals of 0.71s-2.24s against a nominal
-    # 8 * 0.3s = 2.4s fully-serial time -- real thread-scheduling overhead
-    # under this bench's own contention (same caveat the first
-    # measurement already established), sometimes substantial, but still
-    # meaningfully below where true serialization lands: the first
-    # measurement found *actual* serialization of this same n=8/delay=0.3s
-    # shape costs 3.94s-4.75s. This bound sits between the two ranges, so
-    # it still catches a gross regression back toward serialization
-    # without failing on ordinary scheduling noise.
-    assert total_elapsed <= n * delay_s * 1.5, (
-        "total time ({:.2f}s) looks like serialization crept back in, "
-        "for {} same-transport opens at {:.1f}s each".format(total_elapsed, n, delay_s)
-    )
 
 
 def test_different_transport_rtsp_opens_still_exclude_each_other():
@@ -1894,7 +1885,6 @@ def test_a_mixed_transport_fleet_keeps_same_transport_parallel_and_cross_transpo
             )
         )
 
-    overall_start = time.monotonic()
     for adapter in adapters:
         adapter.start()
     try:
@@ -1903,7 +1893,6 @@ def test_a_mixed_transport_fleet_keeps_same_transport_parallel_and_cross_transpo
     finally:
         for adapter in adapters:
             adapter.stop()
-    total_elapsed = time.monotonic() - overall_start
 
     assert set(starts) == {key for _t, key in fleet}
 
@@ -1925,13 +1914,13 @@ def test_a_mixed_transport_fleet_keeps_same_transport_parallel_and_cross_transpo
             overlap = a_start < b_finish and b_start < a_finish
             assert not overlap, "tcp={} overlapped udp={} in a mixed fleet".format(tcp_key, udp_key)
 
-    # And the total must not look like the old linear behaviour (5 * 0.3s
-    # fully serial = 1.5s) -- two transport groups running in parallel
-    # with each other, one exclusion window between them, should land
-    # closer to "slowest single transition" than "every camera serially".
-    assert total_elapsed <= len(fleet) * delay_s * 1.5, (
-        "total time ({:.2f}s) looks like a mixed fleet degraded toward full serialization".format(total_elapsed)
-    )
+    # The old linear behaviour would show up as **no within-transport
+    # overlap** -- five cameras running serially cannot overlap each other --
+    # so the two checks above already catch a fleet degraded toward full
+    # serialization. A total-time bound used to sit here and was removed for
+    # the same reason as the one in the same-transport test: on a loaded
+    # runner its parallel range overlaps the serialized range, so it
+    # reddened without the property failing.
 
 
 def test_a_healthy_rtsp_camera_can_wait_behind_several_broken_ones_at_the_full_timeout():
