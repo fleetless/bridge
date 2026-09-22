@@ -1655,7 +1655,7 @@
               ]
             },
             "enter_lag_ms": {
-              "description": "Lag or queue dwell above this enters the mode.",
+              "description": "Lag or queue dwell above this enters the mode. Checked against exit_lag_ms only when both are in this document; a lone key composes with the bridge's parameter or the default on the robot, and a crossed pair is refused there when the configuration is applied, so name both when you change either.",
               "type": "integer",
               "minimum": 100,
               "maximum": 9007199254740991
@@ -1667,7 +1667,7 @@
               "maximum": 9007199254740991
             },
             "exit_lag_ms": {
-              "description": "Lag and dwell both at or below this leave the mode.",
+              "description": "Lag and dwell both at or below this leave the mode. Must be at or below enter_lag_ms: a crossed pair is a mode that leaves as it arrives. Checked here only when both keys are present; a lone key is checked on the robot against the parameter or default it composes with.",
               "type": "integer",
               "minimum": 0,
               "maximum": 9007199254740991
@@ -1679,7 +1679,7 @@
               "maximum": 9007199254740991
             },
             "datapoint_max_hz": {
-              "description": "Ceiling for every datapoint in the mode, unless the datapoint says `low_bandwidth: keep`.",
+              "description": "The long-run rate for every datapoint in the mode, unless the datapoint says `low_bandwidth: keep`. It is an average, not a minimum gap: after a quiet spell two samples may go out close together, and over any longer window the rate holds.",
               "type": "number",
               "exclusiveMinimum": 0,
               "maximum": 20

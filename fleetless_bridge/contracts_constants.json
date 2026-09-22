@@ -15,6 +15,8 @@
   ],
   "PROTOCOL_SUNSET_DAYS": 90,
   "LATEST_BRIDGE_VERSION": "4.0.0",
+  "CLOSE_ROBOT_DELETED": 4004,
+  "CLOSE_TOKEN_ROTATED": 4005,
   "ASSET_UPLOAD_HEADERS": {
     "kind": "x-fleetless-asset-kind",
     "name": "x-fleetless-asset-name",

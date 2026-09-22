@@ -91,7 +91,9 @@ than what this bridge's own serializer produces (`strict=False`).
 ## Which version these came from
 
     Source: @fleetless/contracts@1.3.0
+            at commit df52195
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
+            Next release: 2.0.0 (unreleased; the release chore records the tag)
 
 **This pin is provisional and currently names a version these bytes did not
 come from.** They were vendored from the contracts checkout that carries

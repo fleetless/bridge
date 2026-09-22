@@ -33,7 +33,7 @@
           "type": "null"
         }
       ],
-      "description": "Datapoint lag over the link: median of the last five seconds minus the ten-minute minimum, in milliseconds; null until a sample exists."
+      "description": "Datapoint lag over the link: median of the last five seconds minus the ten-minute minimum, in milliseconds; null until a sample exists, and null again whenever no live sample arrived in the last five seconds, because a stale median would be a lie."
     }
   },
   "required": [
