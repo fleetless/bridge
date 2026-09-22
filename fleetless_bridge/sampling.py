@@ -224,13 +224,15 @@ class AverageHzPolicy(RatePolicy):
     _CAPACITY = 2.0
 
     def __init__(self, hz: float) -> None:
-        self._hz = hz
+        #: Read by `_cap_policy` so a rebuild that does not change the number
+        #: can keep the policy — and with it the credit it has spent.
+        self.hz = hz
         self._credit = 1.0
         self._last: Optional[float] = None
 
     def should_send(self, value: Any, now: float) -> bool:
         if self._last is not None:
-            self._credit = min(self._CAPACITY, self._credit + (now - self._last) * self._hz)
+            self._credit = min(self._CAPACITY, self._credit + (now - self._last) * self.hz)
         self._last = now
         if self._credit >= 1.0:
             self._credit -= 1.0

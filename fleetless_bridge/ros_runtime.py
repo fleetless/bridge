@@ -596,7 +596,8 @@ def _backlog_depth(retention: RetentionConfig) -> int:
 
 class BacklogStore:
     """Per-slug, bounded, drop-oldest backlog for datapoints configured with
-    `retention.enabled` — filled only while disconnected (the
+    `retention.enabled` — filled while disconnected, and while connected for
+    a sample low-bandwidth mode's ceiling held back (the
     subscription callback checks `buffer_enabled` and `RosRuntime._connected`
     before ever pushing here; an unbuffered datapoint never reaches this
     class at all, which is what makes its "gap" honest rather than merely
@@ -1171,6 +1172,13 @@ class RosRuntime:
         self._lb_bitrate_kbps = int(LOW_BANDWIDTH_DEFAULTS["camera_bitrate_kbps"])
         # What client.py wants told after a successful `ros2 param set`.
         self._lb_params_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        # The published `low_bandwidth` section, as client.py last resolved it
+        # — held here only so a `ros2 param set` is validated against the same
+        # two layers that will be in force if it is accepted. Without it the
+        # callback validates the parameters alone and answers a question
+        # nobody asked: it refuses a set the section makes valid, and accepts
+        # one the section makes impossible.
+        self._lb_yaml: Dict[str, Any] = {}
         self.samples = SampleQueue(maxsize=sample_queue_maxsize)
         self.backlog = BacklogStore()
         self.jobs = JobManager()
@@ -1470,14 +1478,30 @@ class RosRuntime:
         the YAML layer on top of them."""
         self._lb_params_callback = callback
 
+    def set_low_bandwidth_section(self, section: Mapping[str, Any]) -> None:
+        """The published `low_bandwidth` section, whenever client.py accepts
+        one. Loop-side and plain: it is read by the parameter callback on
+        whichever thread the parameter service runs on, and a stale read
+        costs one `ros2 param set` the wrong answer, which the operator sees
+        and can repeat."""
+        self._lb_yaml = dict(section)
+
     def _on_set_parameters(self, params) -> SetParametersResult:
         """rclpy's pre-set hook: refuse a value the settings would reject,
         before it is stored.
 
-        Validated by building the settings the set would produce, so
-        `ros2 param set` is refused with exactly the sentence a bad YAML
-        section is refused with. Nothing here mutates on a bad value — the
-        parameter keeps what it had, and no callback fires."""
+        Validated by building the settings the set would actually produce —
+        the proposed parameters *under the published section* — so the answer
+        is about the pair that would be in force. Validating the parameters
+        alone refuses a set the section makes valid and accepts one it makes
+        impossible, and the accepted-then-impossible half is the expensive
+        one: the client cannot use it either, so every later config apply
+        re-resolves against a number the bridge is not running and refuses a
+        document the console accepted.
+
+        Refused with exactly the sentence a bad YAML section is refused with.
+        Nothing here mutates on a bad value — the parameter keeps what it
+        had, and no callback fires."""
         touched = [p for p in params if p.name.startswith("low_bandwidth.")]
         if not touched:
             # `use_sim_time` and anything else on this node: none of this
@@ -1488,7 +1512,7 @@ class RosRuntime:
         for param in touched:
             proposed[param.name[len("low_bandwidth."):]] = param.value
         try:
-            LowBandwidthSettings.resolve(proposed, {})
+            LowBandwidthSettings.resolve(proposed, self._lb_yaml)
         except ValueError as exc:
             return SetParametersResult(successful=False, reason=str(exc))
         if self._loop is not None and self._lb_params_callback is not None:
@@ -1515,7 +1539,11 @@ class RosRuntime:
         self._lb_max_hz = float(settings.datapoint_max_hz)
         self._lb_camera = settings.camera
         self._lb_bitrate_kbps = int(settings.camera_bitrate_kbps)
-        if self._node is not None:
+        # `stop()` leaves `_node` set and flips `_stopped`, so a parameter
+        # change landing after teardown would otherwise trigger a destroyed
+        # guard condition or wait out `WORK_TIMEOUT_S` for a queue nobody
+        # drains.
+        if self._node is not None and not self._stopped:
             await self._submit_async(self._rebuild_caps)
         await self._apply_camera_lever()
 
@@ -1523,10 +1551,13 @@ class RosRuntime:
         """Executor thread: every subscription's cap, against the settings
         that just changed."""
         for entry in self._subscriptions.values():
-            entry.cap = self._cap_policy(entry.configured_hz, entry.keep)
+            entry.cap = self._cap_policy(entry.configured_hz, entry.keep, entry.cap)
 
     def _cap_policy(
-        self, configured_hz: Optional[float], keep: bool
+        self,
+        configured_hz: Optional[float],
+        keep: bool,
+        existing: Optional[sampling.RatePolicy] = None,
     ) -> Optional[sampling.RatePolicy]:
         """The mode's ceiling for one datapoint, or `None` where it does not
         bite: the mode is off, the datapoint says `keep`, or its own
@@ -1544,6 +1575,13 @@ class RosRuntime:
             return None
         if configured_hz and configured_hz <= self._lb_max_hz:
             return None
+        if isinstance(existing, sampling.AverageHzPolicy) and existing.hz == self._lb_max_hz:
+            # The rate did not move, so neither should the credit. The client
+            # rebuilds at every `hello_ok` and after every settings change,
+            # including ones that change nothing, and a fresh policy starts
+            # with a full credit — one extra sample per datapoint per
+            # reconnect, on the link the mode exists to spare.
+            return existing
         # An average, not a minimum gap: this ceiling is applied to what
         # `entry.rate` has already admitted, and a minimum gap asked about
         # such a grid settles at half the rate it was given — a 0.2 s
@@ -1585,8 +1623,10 @@ class RosRuntime:
         `hello_ok`) and ends (`False`, in `_converse`'s `finally`). Plain and
         synchronous — no `_submit` round trip — because it only flips a flag
         the subscription callback reads: while connected, a
-        sample is live; while not, it goes to `self.backlog` if its
-        datapoint is buffered, or is simply dropped (an honest gap) if not."""
+        sample is live unless low-bandwidth mode's ceiling holds it back, in
+        which case it joins the backlog too; while not connected, it goes to
+        `self.backlog` if its datapoint is buffered, or is simply dropped (an
+        honest gap) if not."""
         self._connected = connected
 
     async def apply_config(
@@ -1941,6 +1981,37 @@ class RosRuntime:
                     )
                 )
                 return
+            if self._lb_active:
+                # The mode entered while this join was in flight. The check
+                # before the join passed, and the lever that ran meanwhile
+                # iterated the committed publishers and found none — so this
+                # one stream would commit at full rate with nothing left to
+                # catch it, on the very link the mode has just called narrow.
+                # A join takes seconds on such a link, which is exactly when
+                # this window is widest.
+                if self._lb_camera == "stop":
+                    await publisher.stop()
+                    self.camera_states.put(
+                        CameraStateUpdate(
+                            slug, False,
+                            (
+                                "low_bandwidth",
+                                "The bridge is in low-bandwidth mode; live video "
+                                "waits until the link recovers.",
+                            ),
+                            cause=CAMERA_STATE_CAUSE_COMMAND,
+                            observed_at_ms=sampling.capture_timestamp_ms(),
+                            request_id=request_id,
+                        )
+                    )
+                    return
+                try:
+                    publisher.set_bitrate_kbps(self._lb_bitrate_kbps)
+                except Exception:  # noqa: BLE001 - a lever that failed must not end the session
+                    log.exception(
+                        "Could not re-target a live stream that joined during "
+                        "low-bandwidth mode, slug %r", slug,
+                    )
             self._live_publishers[slug] = publisher
             self.camera_states.put(
                 CameraStateUpdate(

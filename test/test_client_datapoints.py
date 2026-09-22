@@ -11,6 +11,7 @@ from helpers import make_client, run_until
 
 import fleetless_bridge.client as client_module
 from fleetless_bridge.jobs import JobUpdateQueue
+from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_UNKNOWN,
     APPLY_ERROR_KIND_DATAPOINT,
@@ -107,6 +108,7 @@ class FakeRos:
         # layer a test can move, the callback the runtime would fire after a
         # `ros2 param set`, and a record of every lever pull.
         self.low_bandwidth_params_value = dict(LOW_BANDWIDTH_DEFAULTS)
+        self.low_bandwidth_section = {}
         self.low_bandwidth_calls = []
         self.low_bandwidth_callback = None
         self._apply_errors = apply_errors or []
@@ -195,6 +197,24 @@ class FakeRos:
 
     def on_low_bandwidth_params(self, callback):
         self.low_bandwidth_callback = callback
+
+    def set_low_bandwidth_section(self, section):
+        self.low_bandwidth_section = dict(section)
+
+    def refuse_or_accept_param(self, key, value):
+        """Stand in for the runtime's parameter callback: validate the whole
+        proposed section against the published one, and hand it over only on
+        success. Returns what `ros2 param set` would report."""
+        proposed = dict(self.low_bandwidth_params_value)
+        proposed[key] = value
+        try:
+            LowBandwidthSettings.resolve(proposed, self.low_bandwidth_section)
+        except ValueError:
+            return False
+        self.low_bandwidth_params_value = proposed
+        if self.low_bandwidth_callback is not None:
+            self.low_bandwidth_callback(dict(proposed))
+        return True
 
     async def set_low_bandwidth(self, active, settings):
         self.low_bandwidth_calls.append((active, settings))

@@ -9,6 +9,7 @@ stays unset, and that a capped sample lands in the backlog rather than
 nowhere.
 """
 import asyncio
+import json
 import time
 
 import pytest
@@ -51,14 +52,17 @@ def _settings(**overrides):
 def _publish(count):
     """`count` battery messages on `/battery` from a throwaway node, as fast
     as they go out — well inside one second, so a 1 Hz cap admits exactly the
-    first of them."""
+    first of them.
+
+    Returns the node rather than destroying it: the executor takes the
+    samples asynchronously, and a witness on the bridge's own context loses
+    one it has not taken yet when the publisher goes. Every caller here
+    asserts an exact count, so the node is destroyed after the drain."""
     node = rclpy.create_node("test_lb_publisher")
-    try:
-        pub = node.create_publisher(BatteryState, "/battery", 10)
-        for i in range(count):
-            pub.publish(_battery(0.1 * i))
-    finally:
-        node.destroy_node()
+    pub = node.create_publisher(BatteryState, "/battery", 10)
+    for i in range(count):
+        pub.publish(_battery(0.1 * i))
+    return node
 
 
 class _LivePublisher:
@@ -68,6 +72,9 @@ class _LivePublisher:
     put a method on every camera test that has no use for it."""
 
     instances = []
+    #: Set by a test to hold `start()` open, so the mode can enter while a
+    #: join is still in flight.
+    gate = None
 
     def __init__(self, *, holder, width, height, fps, bitrate_kbps, on_lost=None):
         self.bitrate_kbps = bitrate_kbps
@@ -79,6 +86,8 @@ class _LivePublisher:
 
     async def start(self, url, room, token):
         self.start_calls.append((url, room, token))
+        if _LivePublisher.gate is not None:
+            await _LivePublisher.gate.wait()
 
     async def stop(self):
         self.stop_calls += 1
@@ -202,8 +211,11 @@ def test_the_cap_applies_unless_the_datapoint_says_keep():
         await rt.apply_config(by_slug([_dp("capped"), _dp("kept", keep=True)]))
         await asyncio.sleep(0.3)
         await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=1))
-        _publish(6)
-        return await _drain_samples(rt)
+        node = _publish(6)
+        try:
+            return await _drain_samples(rt)
+        finally:
+            node.destroy_node()
 
     samples = run(body)
     per_slug = {}
@@ -351,8 +363,11 @@ def test_a_datapoint_configured_while_the_mode_is_on_is_capped_too():
         await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=1))
         await rt.apply_config(by_slug([_dp("late")]))
         await asyncio.sleep(0.3)
-        _publish(6)
-        return await _drain_samples(rt)
+        node = _publish(6)
+        try:
+            return await _drain_samples(rt)
+        finally:
+            node.destroy_node()
 
     samples = run(body)
     assert len([s for s in samples if s.slug == "late"]) == 1
@@ -369,8 +384,11 @@ def test_capped_samples_go_to_the_backlog_when_retention_is_enabled():
         ]))
         await asyncio.sleep(0.3)
         await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=1))
-        _publish(6)
-        live = await _drain_samples(rt)
+        node = _publish(6)
+        try:
+            live = await _drain_samples(rt)
+        finally:
+            node.destroy_node()
         held = []
         while True:
             sample = rt.backlog.pop_any()
@@ -389,8 +407,11 @@ def test_an_unbuffered_capped_sample_is_dropped_and_not_queued_anywhere():
         await rt.apply_config(by_slug([_dp("plain")]))
         await asyncio.sleep(0.3)
         await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=1))
-        _publish(6)
-        live = await _drain_samples(rt)
+        node = _publish(6)
+        try:
+            live = await _drain_samples(rt)
+        finally:
+            node.destroy_node()
         return live, rt.backlog.has_pending()
 
     live, pending = run(body)
@@ -429,6 +450,67 @@ def test_stop_ends_running_streams_and_says_why():
         "low_bandwidth", "Live video stopped: the bridge entered low-bandwidth mode."
     )
     assert states[0].cause == "live_lost"
+
+
+def test_a_settings_change_while_the_mode_holds_rebuilds_with_the_new_numbers():
+    """The levers carry numbers, not only a state, and the client re-applies
+    them after a settings change that flipped nothing. Both halves: the
+    datapoint ceiling and a running stream's bitrate."""
+
+    async def body(rt):
+        await rt.apply_config(by_slug([_dp("capped")]))
+        await rt.apply_cameras(by_slug([_camera_cfg("front", bitrate_kbps=800)]))
+        await asyncio.sleep(0.3)
+        # The stream joins before the mode: a `camera_start` arriving after
+        # it is refused outright, which the tests below cover.
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=1, camera_bitrate_kbps=300))
+        first = rt._subscriptions["capped"].cap.hz
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=5, camera_bitrate_kbps=200))
+        return first, rt._subscriptions["capped"].cap.hz, _LivePublisher.instances[0].bitrate_calls
+
+    first, second, bitrates = run(body, live_publisher_factory=_live_factory())
+    assert (first, second) == (1.0, 5.0)
+    # The lever on entry, then the lever again with the number that moved.
+    assert bitrates == [300, 200]
+
+
+def test_a_rebuild_that_changes_no_number_keeps_the_credit_it_has_spent():
+    """The client rebuilds at every `hello_ok` and after every settings
+    change, including ones that change nothing. A fresh policy starts with a
+    full credit, so a reconnecting robot on a degraded link would buy one
+    extra sample per datapoint per reconnect."""
+
+    async def body(rt):
+        await rt.apply_config(by_slug([_dp("capped")]))
+        await asyncio.sleep(0.3)
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=1))
+        before = rt._subscriptions["capped"].cap
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=1))
+        same = rt._subscriptions["capped"].cap
+        await rt.set_low_bandwidth(True, _settings(datapoint_max_hz=5))
+        return before is same, rt._subscriptions["capped"].cap is same
+
+    kept, replaced_on_change = run(body)
+    assert kept is True
+    assert replaced_on_change is False
+
+
+@pytest.mark.parametrize("camera", ["reduce", "stop"])
+def test_start_live_is_refused_under_either_lever(camera):
+    """A new stream is new uplink whichever lever the mode is set to; the
+    code does not branch on it, and this says so rather than leaving it to
+    be read off the source."""
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front")]))
+        await rt.set_low_bandwidth(True, _settings(camera=camera))
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-9")
+        return await _drain_camera_states(rt), list(rt._live_publishers)
+
+    states, publishers = run(body, live_publisher_factory=_live_factory())
+    assert publishers == []
+    assert states[0].error[0] == "low_bandwidth"
 
 
 def test_start_live_is_refused_while_the_mode_holds():
@@ -565,3 +647,182 @@ def test_a_minimum_gap_cap_would_settle_at_the_beat_frequency():
     gapped, _, _ = _simulate(50, 6, 5, cap_policy=MaxHzPolicy)
     assert abs(average - 5.0) <= 0.1
     assert gapped < 3.5
+
+
+def test_a_join_still_in_flight_when_the_mode_enters_does_not_commit_a_stream():
+    """The one window the pre-join refusal cannot close.
+
+    A `camera_start` arriving during the `enter_after_s` window passes the
+    refusal, and its LiveKit join — ICE and TURN, on the very link the mode
+    is about to call narrow — can still be awaiting when the lever runs. The
+    lever iterates the committed publishers and finds none; the join then
+    returns and commits a full-rate stream that nothing will touch until the
+    next transition. So the mode is read again after the join, and this one
+    publisher gets the lever it missed."""
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", bitrate_kbps=800)]))
+        gate = asyncio.Event()
+        _LivePublisher.gate = gate
+        joining = asyncio.ensure_future(
+            rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        )
+        await asyncio.sleep(0.05)  # the join is now awaiting the gate
+        await rt.set_low_bandwidth(True, _settings(camera="stop"))
+        gate.set()
+        await joining
+        states = await _drain_camera_states(rt)
+        return states, list(rt._live_publishers), _LivePublisher.instances[0].stop_calls
+
+    try:
+        states, publishers, stop_calls = run(body, live_publisher_factory=_live_factory())
+    finally:
+        _LivePublisher.gate = None
+    assert publishers == []
+    assert stop_calls == 1
+    assert len(states) == 1
+    assert states[0].publishing is False
+    assert states[0].request_id == "req-1"
+    assert states[0].error == (
+        "low_bandwidth",
+        "The bridge is in low-bandwidth mode; live video waits until the link recovers.",
+    )
+
+
+def test_a_join_that_lands_under_reduce_is_re_targeted_before_it_commits():
+    """The same window under the other lever: the stream is kept, at the
+    mode's bitrate rather than the camera's."""
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", bitrate_kbps=800)]))
+        gate = asyncio.Event()
+        _LivePublisher.gate = gate
+        joining = asyncio.ensure_future(
+            rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        )
+        await asyncio.sleep(0.05)
+        await rt.set_low_bandwidth(True, _settings(camera="reduce", camera_bitrate_kbps=300))
+        gate.set()
+        await joining
+        await _drain_camera_states(rt)
+        return _LivePublisher.instances[0].bitrate_calls, list(rt._live_publishers)
+
+    try:
+        calls, publishers = run(body, live_publisher_factory=_live_factory())
+    finally:
+        _LivePublisher.gate = None
+    assert publishers == ["front"]
+    assert calls == [300]
+
+
+# --- the asset refusal paths the low-bandwidth work sits beside -------------
+
+
+class _FakeHTTPError:
+    """Just the half `_store_refusal_details` reads: a bounded `read`."""
+
+    def __init__(self, body):
+        self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
+
+    def read(self, limit):
+        return self._body[:limit]
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"store_bytes": 1000, "used_bytes": 900, "size_bytes": 200.5},
+        {"store_bytes": 1000, "used_bytes": -1, "size_bytes": 200},
+        {"store_bytes": True, "used_bytes": 900, "size_bytes": 200},
+        {"store_bytes": 1000, "used_bytes": 900},
+        {"store_bytes": "1000", "used_bytes": 900, "size_bytes": 200},
+    ],
+)
+def test_refusal_details_are_all_three_numbers_or_none(details):
+    """Two thirds of an answer is worse than admitting there is none: the
+    cloud's three numbers go on a `refused` entry a developer reads, and a
+    float, a negative, a bool, a string or a missing key all mean the body
+    did not say."""
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    assert RosRuntime._store_refusal_details(_FakeHTTPError({"details": details})) is None
+
+
+def test_refusal_details_read_the_three_numbers_when_they_are_all_there():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    body = {"details": {"store_bytes": 1000, "used_bytes": 900, "size_bytes": 200}}
+    assert RosRuntime._store_refusal_details(_FakeHTTPError(body)) == {
+        "store_bytes": 1000, "used_bytes": 900, "size_bytes": 200,
+    }
+
+
+def test_a_body_that_is_not_json_at_all_reads_as_no_details():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    assert RosRuntime._store_refusal_details(_FakeHTTPError(b"<html>502</html>")) is None
+
+
+def _refusing_server(status, body):
+    """A one-shot HTTP server that answers every POST with `status`."""
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            payload = json.dumps(body).encode() if body is not None else b""
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = "http://127.0.0.1:{}/upload".format(server.server_port)
+
+    def stop():
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+
+    return url, stop
+
+
+def test_the_urdf_upload_path_classifies_a_refusal_the_same_way():
+    """Both refusal tests elsewhere drive the streaming path with a mesh.
+    The URDF goes through the in-memory one, and the cloud never refuses a
+    URDF today — which is exactly why this branch would otherwise be the one
+    a future cloud change hits unseen."""
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    url, stop = _refusing_server(
+        409, {"details": {"store_bytes": 1000, "used_bytes": 999, "size_bytes": 200}}
+    )
+    try:
+        result = RosRuntime._upload_asset_bytes(
+            url, "tok", "sync-1", "urdf", "robot_description", "text/xml", b"<robot/>",
+        )
+    finally:
+        stop()
+    assert result.ok is False
+    assert result.refused is True
+    assert result.details == {"store_bytes": 1000, "used_bytes": 999, "size_bytes": 200}
+
+
+def test_a_bare_refusal_on_the_urdf_path_carries_no_invented_numbers():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    url, stop = _refusing_server(413, None)
+    try:
+        result = RosRuntime._upload_asset_bytes(
+            url, "tok", "sync-1", "urdf", "robot_description", "text/xml", b"<robot/>",
+        )
+    finally:
+        stop()
+    assert (result.ok, result.refused, result.details) == (False, True, None)

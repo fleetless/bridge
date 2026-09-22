@@ -838,9 +838,9 @@ class PrioritizedWriter:
     async def _tick(self) -> None:
         """Wait for `wake()` or `_WRITER_TICK_S`, whichever comes first.
 
-        Deliberately **not** `asyncio.wait_for`, which this was until the
-        pressure pump stopped hiding what it does: on Python 3.10 — ROS
-        Humble's interpreter, the oldest this one source is built for —
+        Deliberately **not** `asyncio.wait_for`, which this was: on Python
+        3.10 — ROS Humble's interpreter, the oldest this one source is built
+        for —
         `wait_for` catches the cancellation, and if its inner future
         happens to be done already, returns that result and **drops the
         CancelledError on the floor** (CPython bpo-37658, fixed in 3.12).
@@ -850,8 +850,8 @@ class PrioritizedWriter:
         looks like. The writer then never stopped, `await task` in
         `_cancel_pump` never returned, and the session hung on teardown
         with the reconnect that would have delivered its queued frames
-        never starting. The pressure pump's own cancel, one `await`
-        earlier, used to move the phase enough to hide it.
+        never starting. Anything that cancelled one `await` earlier moved
+        the phase enough to hide it, which is why this survived so long.
 
         `asyncio.wait` has no such shortcut: a cancellation arriving here
         propagates. The inner task is cancelled in `finally` so a tick cut
@@ -1297,6 +1297,15 @@ class BridgeClient:
         # be asking it to carry state for a log line. There is deliberately no
         # counterpart for the dwell — see `_log_transition`.
         self._last_lag_ms: Optional[int] = None
+        # When the last session ended, on the controller's clock — the gap to
+        # the next one is discounted rather than counted as evidence. `None`
+        # before the first session ends.
+        self._session_ended_at: Optional[float] = None
+        # A lever pull the runtime has not taken yet. Set when one is due and
+        # cleared when it lands, so the tick retries it: a `set_low_bandwidth`
+        # that raised mid-transition would otherwise leave the cloud told the
+        # mode is on while the cap and the camera are untouched.
+        self._levers_pending = False
         # When this session opened, in the same wall clock a sample's
         # `timestamp_ms` uses — see `_observe_dwell`. Set here too, not only
         # per session, so the attribute exists before the first connection.
@@ -1381,27 +1390,36 @@ class BridgeClient:
     def _on_low_bandwidth_params(self, values: Dict[str, Any]) -> None:
         """A `ros2 param set` the runtime already validated and accepted.
 
-        Runs on the event loop, hands the new parameter layer to the resolver
-        and lets the task below carry the result to the wire. The runtime
-        refused anything `resolve` would reject on its own, but the YAML on
-        top can still cross a threshold with it, so this path survives a
-        `ValueError` exactly the way the config apply does: keep what was
-        running, say so in the log."""
+        The runtime validates the proposed parameters under the section this
+        client last handed it, so a set that reaches here resolves. The
+        restore below is the backstop for the one window that leaves: a
+        config landing between that validation and this call."""
+        previous = self._param_low_bandwidth
         self._param_low_bandwidth = dict(values)
-        asyncio.ensure_future(self._apply_params_change())
+        asyncio.ensure_future(self._apply_params_change(previous))
 
-    async def _apply_params_change(self) -> None:
+    async def _apply_params_change(self, previous: Dict[str, Any]) -> None:
         try:
             await self._apply_low_bandwidth_settings(self._now())
         except ValueError as exc:
+            # Put the layer back. Keeping a parameter layer the settings
+            # cannot use costs far more than the set it came from: every
+            # later config apply re-resolves against it, so the published
+            # section is refused from here on — on every reconnect, for a
+            # number the bridge is not running.
+            self._param_low_bandwidth = previous
             log.error(
                 "The low-bandwidth parameters do not combine with the published "
-                "section: %s. The bridge keeps the settings it had.", exc,
+                "section: %s. The parameter is stored in ROS but not in force; "
+                "the bridge keeps the settings it had.", exc,
             )
         except Exception:  # noqa: BLE001 - nobody awaits this job; say so here or nowhere
+            self._param_low_bandwidth = previous
             log.exception("Unexpected error applying a low-bandwidth parameter change")
 
-    async def _apply_low_bandwidth_settings(self, now: float) -> bool:
+    async def _apply_low_bandwidth_settings(
+        self, now: float, *, defer_levers: bool = False
+    ) -> bool:
         """Re-resolve both layers, hand the result to the controller, pull the
         levers. Returns whether a transition was reported.
 
@@ -1420,30 +1438,62 @@ class BridgeClient:
         settings = LowBandwidthSettings.resolve(
             self._param_low_bandwidth, self._yaml_low_bandwidth
         )
+        if self._ros is not None:
+            # The runtime validates a `ros2 param set` against this, so it
+            # has to hold what just resolved rather than what was published.
+            self._ros.set_low_bandwidth_section(self._yaml_low_bandwidth)
         transition = (
             self._link_mode.update_settings(settings, now)
             if settings != self._lb_settings
             else None
         )
         self._lb_settings = settings
-        await self._on_transition(transition)
+        await self._on_transition(transition, defer_levers=defer_levers)
         return transition is not None
 
-    async def _on_transition(self, transition: Optional[Transition]) -> None:
+    async def _on_transition(
+        self, transition: Optional[Transition], *, defer_levers: bool = False
+    ) -> None:
         """Say a crossing once, then pull the levers.
 
         Called with `None` too, after a settings change that did not flip the
         mode: `datapoint_max_hz` can move while the mode stays on, and the
         levers carry the numbers, not only the state. Pulling them is
         idempotent, so the extra call costs nothing and the missing one would
-        cost a cap nobody applied."""
+        cost a cap nobody applied.
+
+        `defer_levers` hands the pull to the tick instead of awaiting it here
+        — see `_start_link_mode`, the one caller that runs on the receive
+        loop."""
         if transition is not None:
             self._log_transition(transition)
             self._report_link_mode(transition.low_bandwidth, transition.reason)
-        if self._ros is not None:
+        if defer_levers:
+            self._levers_pending = True
+            return
+        await self._apply_levers()
+
+    async def _apply_levers(self) -> None:
+        """Hand the current state and settings to the runtime.
+
+        A failure leaves `_levers_pending` set, so the next tick tries again.
+        Without that, a `set_low_bandwidth` that raised mid-transition would
+        leave the cloud told the mode is on and the backfill gate shut while
+        the cap and the camera lever were never applied — until the next
+        settings change or reconnect, neither of which a narrow link
+        promises."""
+        if self._ros is None:
+            self._levers_pending = False
+            return
+        try:
             await self._ros.set_low_bandwidth(
                 self._link_mode.active, self._lb_settings
             )
+        except Exception:  # noqa: BLE001 - retried on the next tick, not swallowed
+            self._levers_pending = True
+            log.exception("Could not apply the low-bandwidth levers; retrying")
+            return
+        self._levers_pending = False
 
     def _log_transition(self, transition: Transition) -> None:
         """One line an operator can act on: what crossed, and what the robot
@@ -1532,12 +1582,27 @@ class BridgeClient:
 
         Once, though, not twice. A parameter layer that forces the mode makes
         the resolve above return a `forced` transition, which has already been
-        reported by the time the greeting below would state the same thing."""
+        reported by the time the greeting below would state the same thing.
+
+        **The levers are handed to the tick rather than awaited here.** This
+        runs on the receive loop, and `set_low_bandwidth` waits on the ROS
+        work queue behind whatever the previous session left there — a graph
+        snapshot over a large graph takes seconds. No ping is answered while
+        it waits, and the cloud closes the socket after three unanswered
+        ones, so awaiting it here would let a stalled executor cost the
+        session it is greeting."""
         reported = False
         try:
+            if self._session_ended_at is not None:
+                # Nothing was observed while the socket was down, so nothing
+                # about the outage is evidence for either timer.
+                self._link_mode.skip_gap(self._now() - self._session_ended_at)
+                self._session_ended_at = None
             if self._ros is not None:
                 self._param_low_bandwidth = dict(self._ros.low_bandwidth_params())
-            reported = await self._apply_low_bandwidth_settings(self._now())
+            reported = await self._apply_low_bandwidth_settings(
+                self._now(), defer_levers=True
+            )
         except ValueError as exc:
             log.error(
                 "The low-bandwidth settings do not resolve: %s. The bridge keeps "
@@ -1573,6 +1638,8 @@ class BridgeClient:
                 transition = self._link_mode.evaluate(self._now())
                 if transition is not None:
                     await self._on_transition(transition)
+                elif self._levers_pending:
+                    await self._apply_levers()
             except Exception:  # noqa: BLE001 - one bad tick must not end the mode for the session
                 log.exception("Unexpected error evaluating low-bandwidth mode")
 
@@ -1817,6 +1884,7 @@ class BridgeClient:
             # Before the writer is cancelled, so nothing can be answered
             # onto a socket this session has already given up on.
             self._session_open = False
+            self._session_ended_at = self._now()
             self._detach_wake()
             await self._cancel_pump(self._link_mode_task, "link mode")
             self._link_mode_task = None
@@ -2132,6 +2200,23 @@ class BridgeClient:
                 slug=APPLY_ERROR_KIND_LOW_BANDWIDTH,
                 kind=APPLY_ERROR_KIND_LOW_BANDWIDTH,
                 code=APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID, message=str(exc),
+            )]
+        except Exception:  # noqa: BLE001 - one section's bug must not end the session
+            # The same shape `_apply_or_report` gives the five exposure kinds,
+            # and for the same reason: unhandled, this reaches
+            # `_pump_control`'s catch-all, which closes the socket — so a bug
+            # in the mode would cost the whole session rather than one ack
+            # entry.
+            self._yaml_low_bandwidth = previous
+            log.exception(
+                "Unexpected error applying the low_bandwidth section for config "
+                "version %d", message.version,
+            )
+            return [ApplyError(
+                slug=APPLY_ERROR_KIND_LOW_BANDWIDTH,
+                kind=APPLY_ERROR_KIND_LOW_BANDWIDTH,
+                code=APPLY_ERROR_CODE_WHOLE_KIND_FAILED,
+                message="internal error applying {}".format(APPLY_ERROR_KIND_LOW_BANDWIDTH),
             )]
         return []
 

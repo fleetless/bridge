@@ -734,3 +734,225 @@ def test_a_forced_transition_logs_no_reading():
     assert len(on) == 1
     assert "(forced)" in on[0]
     assert "lag" not in on[0] and "4000" not in on[0]
+
+
+def test_a_refused_parameter_set_never_reaches_the_settings_in_force():
+    """A `ros2 param set` the settings cannot use must leave nothing behind.
+
+    The runtime validates the parameters against the published section, so a
+    set that only crosses a threshold once that section is laid over it is
+    refused there and never becomes the client's parameter layer. Keeping it
+    would refuse every later config apply — including the re-send after
+    every reconnect — for a value the bridge is not using, and blame a
+    document the console accepted."""
+    clock = Clock()
+    ros = FakeRos()
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            await session.send_config(1, {}, low_bandwidth={"enter_lag_ms": 600})
+            box["first"] = await session.recv_config_applied()
+            box["greeted"] = True
+            while "set_done" not in box:
+                await asyncio.sleep(0.005)
+            # The same document again, the way a reconnect re-sends it.
+            await session.send_config(2, {}, low_bandwidth={"enter_lag_ms": 600})
+            box["second"] = await session.recv_config_applied()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            task = asyncio.ensure_future(client.run())
+            while "greeted" not in box:
+                await asyncio.sleep(0.005)
+            # `exit_lag_ms: 1000` clears the default `enter_lag_ms` of 2000
+            # but crosses the published 600. The runtime refuses it.
+            box["refused"] = ros.refuse_or_accept_param("exit_lag_ms", 1000)
+            box["set_done"] = True
+            while "second" not in box:
+                await asyncio.sleep(0.005)
+            box["settings"] = client._lb_settings
+            client.stop()
+            await asyncio.wait_for(task, timeout=10.0)
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["first"]["ok"] is True
+    # The set was refused where it is validated, against the section on top.
+    assert box["refused"] is False
+    # And the document the console published still applies.
+    assert box["second"]["ok"] is True and box["second"]["errors"] == []
+    assert box["settings"].enter_lag_ms == 600
+    assert box["settings"].exit_lag_ms == 500
+
+
+def test_a_parameter_set_the_published_section_makes_valid_is_accepted():
+    """The other direction of the same handover. `exit_lag_ms: 3000` crosses
+    the default `enter_lag_ms` of 2000 and would be refused on the
+    parameters alone — but under a published `enter_lag_ms: 5000` the pair
+    is fine, and the README promises a set is refused only for a rule it
+    broke."""
+    clock = Clock()
+    ros = FakeRos()
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            await session.send_config(1, {}, low_bandwidth={"enter_lag_ms": 5000})
+            await session.recv_config_applied()
+            box["greeted"] = True
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            task = asyncio.ensure_future(client.run())
+            while "greeted" not in box:
+                await asyncio.sleep(0.005)
+            box["accepted"] = ros.refuse_or_accept_param("exit_lag_ms", 3000)
+            await asyncio.sleep(0.05)
+            box["settings"] = client._lb_settings
+            client.stop()
+            await asyncio.wait_for(task, timeout=10.0)
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["accepted"] is True
+    assert box["settings"].enter_lag_ms == 5000
+    assert box["settings"].exit_lag_ms == 3000
+
+
+def test_the_lever_pull_does_not_hold_up_the_receive_loop_at_hello():
+    """`set_low_bandwidth` waits on the ROS work queue, behind whatever the
+    previous session left there. Awaited on the receive loop it would stop
+    the bridge answering pings, and the cloud closes a socket after three
+    unanswered ones — so a stalled executor would cost the session it is
+    greeting. The tick pulls the levers instead."""
+    clock = Clock()
+    ros = FakeRos()
+
+    async def scenario():
+        box = {}
+        gate = asyncio.Event()
+
+        async def blocking(active, settings):
+            ros.low_bandwidth_calls.append((active, settings))
+            await gate.wait()
+
+        ros.set_low_bandwidth = blocking
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            await session.ping(1, latency_ms=10, lag_ms=0)
+            # The pong has to come back while the lever is still blocked —
+            # and it does so before the pull has even been attempted, which
+            # is the ordering this test is about.
+            box["pong"] = await session.recv_pong()
+            while not ros.low_bandwidth_calls:
+                await asyncio.sleep(0.005)
+            box["blocked_pull"] = len(ros.low_bandwidth_calls)
+            gate.set()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: "pong" in box)
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["pong"]["ts_ms"] == 1
+    # The pull happens, and it happens off the receive path: it was still
+    # sitting on the gate when the pong had long since gone out.
+    assert box["blocked_pull"] >= 1
+
+
+def test_a_lever_pull_that_failed_is_retried_on_the_next_tick():
+    """Swallowed, a failed pull leaves the cloud told the mode is on and the
+    backfill gate shut while the cap and the camera are untouched, until a
+    settings change or a reconnect — neither of which a narrow link
+    promises."""
+    clock = Clock()
+    ros = FakeRos()
+    attempts = []
+
+    async def scenario():
+        box = {}
+
+        async def flaky(active, settings):
+            attempts.append((active, settings))
+            if len(attempts) == 1:
+                raise RuntimeError("the executor was busy")
+
+        ros.set_low_bandwidth = flaky
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            box["greeted"] = True
+            await asyncio.sleep(0.1)  # tens of ticks
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: len(attempts) >= 2)
+            box["pending"] = client._levers_pending
+        return box
+
+    box = asyncio.run(scenario())
+    assert len(attempts) >= 2
+    assert box["pending"] is False
+
+
+def test_the_mode_leaves_on_its_own_over_the_wire_and_backfill_resumes():
+    """Every other test leaves the mode by `mode: off`. This one drives the
+    controller's own exit: calm pings for `exit_after_s`, the `recovered`
+    frame on the socket, and the backfill tier opening again behind it."""
+    clock = Clock()
+    ros = FakeRos()
+    ros.low_bandwidth_params_value["enter_after_s"] = 1
+    ros.low_bandwidth_params_value["exit_after_s"] = 1
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            await session.ping(1, latency_ms=50, lag_ms=5000)
+            await session.recv_pong()
+            await clock.advance(0.5)
+            await clock.advance(2.0)
+            box["entered"] = await session.recv_link_mode()
+            # Buffered history, held for as long as the mode is on.
+            ros.backlog.configure("old", True, 10)
+            ros.backlog.push("old", Sample(slug="old", value=1, timestamp_ms=1))
+            await session.ping(2, latency_ms=20, lag_ms=100)
+            await session.recv_pong()
+            await clock.advance(0.5)
+            await clock.advance(2.0)
+            box["left"] = await session.recv_link_mode()
+            box["replayed"] = await session.recv_datapoint()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: "replayed" in box)
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["entered"]["low_bandwidth"] is True
+    assert box["left"]["low_bandwidth"] is False
+    assert box["left"]["reason"] == "recovered"
+    assert box["replayed"]["slug"] == "old" and box["replayed"]["backfill"] is True

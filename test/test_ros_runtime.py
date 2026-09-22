@@ -13,6 +13,7 @@ import asyncio
 import concurrent.futures
 import http.server
 import json
+import logging
 import os
 import posixpath
 import socket
@@ -6955,9 +6956,34 @@ def test_a_dae_over_the_scan_cap_is_uploaded_without_being_read():
                         finally:
                             stop()
 
-                    updates = run(body)
+                    class _ScanCapHandler(logging.Handler):
+                        def __init__(self):
+                            super().__init__(level=logging.DEBUG)
+                            self.messages = []
+
+                        def emit(self, record):
+                            self.messages.append(record.getMessage())
+
+                    watched = logging.getLogger("fleetless_bridge.ros_runtime")
+                    handler = _ScanCapHandler()
+                    previous = watched.level
+                    watched.addHandler(handler)
+                    watched.setLevel(logging.DEBUG)
+                    try:
+                        updates = run(body)
+                    finally:
+                        watched.removeHandler(handler)
+                        watched.setLevel(previous)
                     extract_mock.assert_not_called()
                     upload_mock.assert_called_once()
+                    # The operator's only trace of a texture set nobody
+                    # looked for: once for the file, naming it and the cap.
+                    skipped = [
+                        m for m in handler.messages
+                        if m.startswith("Not scanning") and dae_uri in m
+                    ]
+                    assert len(skipped) == 1
+                    assert str(DAE_SCAN_MAX_BYTES) in skipped[0]
 
     assert updates[-1].state == "finished"
     # Not a failure of any reference: this sync determined nothing about
