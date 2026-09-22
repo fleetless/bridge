@@ -177,6 +177,12 @@ APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID = "low_bandwidth_invalid"
 # 4002 hello timeout, 4003 pong timeout. Only supersede is terminal — it means
 # another bridge now owns this robot, and reconnecting would kick that one off
 # in turn, leaving two bridges trading the robot back and forth forever.
+#
+# **A literal, unlike the two below**, because contracts exports no constant
+# for it: `exportedConstants` carries what a non-TypeScript consumer has to
+# vendor, and supersede is not in it. One number on both sides of the wire
+# with a test pinning it (test_client_reconnect.py), which is the
+# arrangement the other two just left.
 CLOSE_CODE_SUPERSEDED = 4000
 
 # The cloud closes with this when the robot this connection was authenticated
@@ -188,7 +194,7 @@ CLOSE_CODE_SUPERSEDED = 4000
 # someone's shelf whose logs say nothing more useful than "connection
 # closed". Terminal, the same way CLOSE_CODE_SUPERSEDED is: nothing about
 # this process starting over will change the answer.
-CLOSE_CODE_ROBOT_DELETED = 4004
+CLOSE_CODE_ROBOT_DELETED: int = _CONSTANTS["CLOSE_ROBOT_DELETED"]
 
 # The cloud closes with this when this robot's token was rotated in the
 # console: the credential this process holds will be refused from now on,
@@ -199,13 +205,12 @@ CLOSE_CODE_ROBOT_DELETED = 4004
 # operator reading "this robot was deleted" would go looking for the wrong
 # thing. Terminal for the same reason both the others are.
 #
-# **A literal, not read from the vendored constants**, because contracts
-# does not export the close codes: `exportedConstants` carries only what a
-# non-TypeScript consumer has to vendor, and these three have always been
-# hand-kept on both sides with a test pinning each number
-# (test_client_reconnect.py). Same arrangement as 4000 and 4004 above, not
-# a new exception.
-CLOSE_CODE_TOKEN_ROTATED = 4005
+# **Read from the vendored constants, with the one above.** Both were
+# hand-kept literals on either side of the wire until contracts started
+# exporting them, which is the same drift `PROTOCOL_VERSION` was in: two
+# numbers that agree today and a test standing between them and the day
+# they do not.
+CLOSE_CODE_TOKEN_ROTATED: int = _CONSTANTS["CLOSE_TOKEN_ROTATED"]
 
 
 class ApplyError(NamedTuple):

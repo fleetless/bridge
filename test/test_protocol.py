@@ -2,12 +2,15 @@
 """The wire protocol in isolation: what we send, and how we read what arrives."""
 import json
 import pathlib
+import re
 import struct
 
 import pytest
 from jsonschema import ValidationError
 
 from fleetless_bridge.protocol import (
+    CLOSE_CODE_ROBOT_DELETED,
+    CLOSE_CODE_TOKEN_ROTATED,
     FLEETLESS_FORMAT_VERSION,
     LATEST_BRIDGE_VERSION,
     LOW_BANDWIDTH_DEFAULTS,
@@ -77,6 +80,31 @@ def test_the_protocol_version_comes_from_the_vendored_constants():
     assert PROTOCOL_VERSION == constants["PROTOCOL_VERSION"]
     assert PROTOCOL_VERSIONS == constants["PROTOCOL_VERSIONS"]
     assert LATEST_BRIDGE_VERSION == constants["LATEST_BRIDGE_VERSION"]
+
+
+def test_the_terminal_close_codes_come_from_the_vendored_constants():
+    """4004 and 4005 were hand-kept literals on both sides of the wire, with
+    a test pinning each number — the arrangement `PROTOCOL_VERSION` was in
+    until contracts started exporting it. It exports these two now, so there
+    is one value again rather than two that agree today.
+
+    4000 is not among them: contracts exports no constant for supersede, so
+    that one stays a literal and says so where it is defined."""
+    constants = json.loads(
+        (pathlib.Path(__file__).resolve().parents[1] / "fleetless_bridge" / "contracts_constants.json").read_text()
+    )
+    assert CLOSE_CODE_ROBOT_DELETED == constants["CLOSE_ROBOT_DELETED"]
+    assert CLOSE_CODE_TOKEN_ROTATED == constants["CLOSE_TOKEN_ROTATED"]
+
+
+def test_no_close_code_literal_is_left_in_the_package():
+    """The half a value comparison cannot see: both sides agreeing proves
+    nothing if the Python side is still a literal that happens to match."""
+    source = (
+        pathlib.Path(__file__).resolve().parents[1] / "fleetless_bridge" / "protocol.py"
+    ).read_text()
+    assert not re.search(r"=\s*4004\b", source)
+    assert not re.search(r"=\s*4005\b", source)
 
 
 def test_this_bridge_appears_in_the_versions_table():
