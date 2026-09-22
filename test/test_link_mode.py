@@ -267,6 +267,46 @@ def test_reason_starts_from_no_transition_and_a_forced_mode_names_itself():
     assert forced.active and forced.reason == "forced"
 
 
+def test_an_outage_is_not_counted_as_evidence_in_either_direction():
+    """`evaluate` only runs while a session is up, so without this the first
+    tick after a reconnect credits the whole outage to whichever side was
+    counting when the socket dropped."""
+    # Exit side: calm for 30 s, then a 40 s outage. `exit_after_s` is 60, so
+    # the mode must still be on, and must leave 30 s after the gap, not at
+    # the first tick.
+    m = LinkMode(DEFAULTS, now=0.0)
+    m.observe_cloud(3000, 100, 1.0)
+    for t in range(2, 13):
+        m.evaluate(float(t))
+    assert m.active
+    for t in range(13, 43):
+        m.observe_cloud(100, 100, float(t))
+        m.observe_dwell(50.0, float(t))
+        m.evaluate(float(t))
+    m.skip_gap(40.0)
+    m.observe_cloud(100, 100, 83.0)
+    m.observe_dwell(50.0, 83.0)
+    assert m.evaluate(83.0) is None
+    for t in range(84, 113):
+        m.observe_cloud(100, 100, float(t))
+        m.observe_dwell(50.0, float(t))
+        m.evaluate(float(t))
+    m.observe_cloud(100, 100, 113.0)
+    m.observe_dwell(50.0, 113.0)
+    assert m.evaluate(113.0) == Transition(False, "recovered")
+
+    # Enter side: three seconds of lag, then a 20 s outage. The reading is
+    # still inside the 30 s age-out because the gap moved that too, but the
+    # enter timer holds three seconds, not twenty-three.
+    n = LinkMode(DEFAULTS, now=0.0)
+    n.observe_cloud(9000, 100, 1.0)
+    for t in range(2, 5):
+        assert n.evaluate(float(t)) is None
+    n.skip_gap(20.0)
+    assert n.evaluate(24.0) is None
+    assert not n.active
+
+
 def test_a_settings_change_within_auto_reports_nothing():
     m = LinkMode(DEFAULTS, now=0.0)
     tighter = LowBandwidthSettings.resolve({"enter_lag_ms": 300, "exit_lag_ms": 100}, {})

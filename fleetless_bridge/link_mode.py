@@ -180,6 +180,28 @@ class LinkMode:
             return Transition(False, "forced")
         return None
 
+    def skip_gap(self, seconds: float) -> None:
+        """Time passed with nothing observed — do not count it as evidence.
+
+        The timers here are monotonic stamps and `evaluate` only runs while a
+        session is up, so an outage would otherwise be credited to whichever
+        side was counting when it started. Both directions get it wrong and
+        the exit side gets it wrong expensively: a mode that was calm for
+        thirty seconds when the socket dropped would leave on the first tick
+        after a reconnect forty seconds later, sending full-rate telemetry
+        and the whole backlog over a link nothing has measured yet.
+
+        The timers still outlive the session; only the gap is discounted."""
+        if seconds <= 0:
+            return
+        if self._over_since is not None:
+            self._over_since += seconds
+        if self._calm_since is not None:
+            self._calm_since += seconds
+        # The ping reading ages out on wall-clock distance too, and an outage
+        # is exactly when no new one arrives.
+        self._lag_at += seconds
+
     def observe_cloud(self, lag_ms: Optional[int], latency_ms: Optional[int], now: float) -> None:
         """The ping's two numbers. `latency_ms` is kept out of the decision on
         purpose: a long round trip is a far cloud, not a narrow uplink."""
