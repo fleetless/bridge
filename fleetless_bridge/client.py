@@ -1445,35 +1445,41 @@ class BridgeClient:
             )
 
     def _log_transition(self, transition: Transition) -> None:
-        """One line an operator can act on: the two readings that crossed,
-        the threshold they crossed, and what the robot is now doing about
-        it. A `forced` transition names no reading, because none was
-        consulted."""
-        # The lag and the threshold, and deliberately not the queue dwell.
-        # The dwell that decides anything is a p95 over five seconds, which
-        # the controller keeps to itself; printing the last raw sample beside
-        # a threshold would read as the number that crossed it, and one slow
-        # send is exactly what the p95 exists to ignore. `reason` already
-        # says when the dwell was the measure that entered the mode.
+        """One line an operator can act on: what crossed, and what the robot
+        is doing about it."""
         if transition.low_bandwidth:
             log.info(
-                "Low-bandwidth mode on (%s): lag %s against %d ms. Datapoints "
-                "are capped to %g Hz, live video is set to %s and backfill "
-                "waits.",
+                "Low-bandwidth mode on (%s).%s Datapoints are capped to %g Hz "
+                "on average, live video is set to %s and backfill waits.",
                 transition.reason,
-                _ms(self._last_lag_ms),
-                self._lb_settings.enter_lag_ms,
+                self._reading(transition, self._lb_settings.enter_lag_ms),
                 self._lb_settings.datapoint_max_hz,
                 self._lb_settings.camera,
             )
         else:
             log.info(
-                "Low-bandwidth mode off (%s): lag %s against %d ms. Configured "
-                "rates, live video and backfill are back.",
+                "Low-bandwidth mode off (%s).%s Configured rates, live video "
+                "and backfill are back.",
                 transition.reason,
-                _ms(self._last_lag_ms),
-                self._lb_settings.exit_lag_ms,
+                self._reading(transition, self._lb_settings.exit_lag_ms),
             )
+
+    def _reading(self, transition: Transition, threshold_ms: int) -> str:
+        """The measurement that crossed, as a sentence, or nothing.
+
+        Nothing for a `forced` transition: `mode: on` and `mode: off` hold
+        whatever the link is doing, so no reading was consulted and naming
+        one beside a threshold would invite the reader to connect the two.
+
+        The lag and the threshold, and deliberately not the queue dwell. The
+        dwell that decides anything is a p95 over five seconds, which the
+        controller keeps to itself; printing the last raw sample beside a
+        threshold would read as the number that crossed it, and one slow send
+        is exactly what the p95 exists to ignore. `reason` already says when
+        the dwell was the measure that moved the mode."""
+        if transition.reason == "forced":
+            return ""
+        return " Lag {} against {} ms.".format(_ms(self._last_lag_ms), threshold_ms)
 
     def _report_link_mode(self, low_bandwidth: bool, reason: str) -> None:
         """One `link_mode` frame, tier 0 — the tier a pong sits in, because a

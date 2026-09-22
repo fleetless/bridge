@@ -73,8 +73,8 @@ Set them in the launch file or in the environment.
 Some uplinks are only nominally up. When the lag the cloud measures stays
 high, or the bridge's own send queue backs up, the bridge stops pushing a
 full telemetry stream through a pipe that cannot carry it: every datapoint
-is capped to one sample a second, live video is re-encoded smaller or
-ended, new streams are refused, and buffered history waits. It leaves once
+is held to one sample a second on average, live video is re-encoded smaller
+or ended, new streams are refused, and buffered history waits. It leaves once
 both measurements have been calm for a minute, and tells the cloud each
 time it crosses, so the console can say why a robot went quiet.
 
@@ -85,7 +85,7 @@ time it crosses, so the console can say why a robot went quiet.
 | `low_bandwidth.enter_after_s` | `10` | How long that has to hold. A spike is not a narrow link. |
 | `low_bandwidth.exit_lag_ms` | `500` | Lag and dwell both at or below this leave the mode. |
 | `low_bandwidth.exit_after_s` | `60` | How long that has to hold. |
-| `low_bandwidth.datapoint_max_hz` | `1.0` | The ceiling for every datapoint in the mode, unless it says `low_bandwidth: keep`. |
+| `low_bandwidth.datapoint_max_hz` | `1.0` | What every datapoint is held to in the mode, unless it says `low_bandwidth: keep`. A long-run rate, not a minimum gap: after a quiet spell two samples may go out close together. |
 | `low_bandwidth.camera` | `reduce` | `reduce` re-encodes a running stream smaller; `stop` ends it. New streams are refused either way. |
 | `low_bandwidth.camera_bitrate_kbps` | `300` | What `reduce` re-encodes at. |
 

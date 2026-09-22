@@ -1545,9 +1545,10 @@ class RosRuntime:
         if configured_hz and configured_hz <= self._lb_max_hz:
             return None
         # An average, not a minimum gap: this ceiling is applied to what
-        # `entry.rate` has already admitted, and a minimum gap asked about a
-        # grid only slightly coarser than itself settles at half the rate it
-        # was given. See `AverageHzPolicy`.
+        # `entry.rate` has already admitted, and a minimum gap asked about
+        # such a grid settles at half the rate it was given — a 0.2 s
+        # interval against arrivals every 0.18 s is never quite due, so it
+        # takes every second one. See `AverageHzPolicy`.
         return sampling.AverageHzPolicy(self._lb_max_hz)
 
     async def _apply_camera_lever(self) -> None:

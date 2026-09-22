@@ -237,10 +237,10 @@ def test_the_cap_is_an_average_and_not_a_minimum_gap():
     """The one decision that keeps the live rate on the ceiling.
 
     The configured rate gates the record, so the cap is applied to a stream
-    that is already thinned — and a minimum gap asked about a grid only
-    slightly coarser than itself is never quite due, so it skips every second
-    arrival and settles at half the rate it was given. An average holds the
-    rate over any grid.
+    that is already thinned — and a minimum gap asked about such a grid is
+    never quite due: a 0.2 s interval against arrivals every 0.18 s takes
+    every second one and settles at half the rate it was given. An average
+    holds the rate whatever the spacing.
 
     Pinned here, where the choice is made, because the difference is
     invisible to any check of the form "at most the ceiling". What the two

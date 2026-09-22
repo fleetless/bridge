@@ -10,10 +10,18 @@ Three independent concerns live here:
   also covers `builtin_interfaces/Time` and `Duration`, whose only fields are
   `sec`/`nanosec` ints, so `{sec, nanosec}` falls out of the generic nested
   message rule with no special case).
-- `RatePolicy`: a `rate_throttle_hz` ceiling (drop samples faster than
-  `1/hz`), or, when there is none, drop samples equal to the last one sent —
-  the bridge is the only place that rate-limits, so every subscriber of a
-  slug sees the same rate.
+- `RatePolicy` and its three implementations. The bridge is the only place
+  that rate-limits, so every subscriber of a slug sees the same rate.
+  - `MaxHzPolicy`: what `rate_throttle_hz` asks for. A minimum gap — drop a
+    sample arriving less than `1/hz` after the last one sent.
+  - `SendEveryPolicy`: what an absent or zero `rate_throttle_hz` asks for.
+    Drops nothing at all, including a sample equal to the last one sent; see
+    its own docstring for why "no throttling" cannot quietly mean
+    deduplication.
+  - `AverageHzPolicy`: `hz` per second on average rather than a minimum gap,
+    for a ceiling applied on top of one of the above — low-bandwidth mode's
+    `datapoint_max_hz`. A minimum gap applied to an already-thinned stream
+    lands at half the rate it was given.
 """
 from __future__ import annotations
 

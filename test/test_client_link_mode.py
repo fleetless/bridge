@@ -15,6 +15,7 @@ itself — and a fast `tick`. Real time would buy the same assertions at ten
 seconds apiece.
 """
 import asyncio
+import contextlib
 import logging
 
 from fake_cloud import FakeCloud, accepts, sequence
@@ -157,9 +158,8 @@ def test_a_forced_yaml_section_turns_the_mode_on_and_the_cloud_is_told():
         return box
 
     box = asyncio.run(scenario())
-    assert box["link_mode"] == {
-        **box["link_mode"], "low_bandwidth": True, "reason": "forced",
-    }
+    assert box["link_mode"]["low_bandwidth"] is True
+    assert box["link_mode"]["reason"] == "forced"
     assert box["applied"]["ok"] is True and box["applied"]["errors"] == []
 
 
@@ -577,12 +577,23 @@ class _CapturingHandler(logging.Handler):
         self.messages.append(record.getMessage())
 
 
+@contextlib.contextmanager
 def _capturing_client_log():
+    """Collect client.py's log lines for the duration of a `with`.
+
+    A context manager rather than a pair to unwind by hand: the level has to
+    go back too, and a test that left this logger at DEBUG would leave it
+    there for every test after it in the same process."""
     handler = _CapturingHandler()
     watched = logging.getLogger("fleetless_bridge.client")
+    previous = watched.level
     watched.addHandler(handler)
     watched.setLevel(logging.DEBUG)
-    return handler, watched
+    try:
+        yield handler
+    finally:
+        watched.removeHandler(handler)
+        watched.setLevel(previous)
 
 
 def test_the_transition_log_line_carries_the_numbers_that_caused_it():
@@ -592,7 +603,6 @@ def test_the_transition_log_line_carries_the_numbers_that_caused_it():
     clock = Clock()
     ros = FakeRos()
     ros.low_bandwidth_params_value["enter_after_s"] = 1
-    handler, watched = _capturing_client_log()
 
     async def scenario():
         box = {}
@@ -613,10 +623,8 @@ def test_the_transition_log_line_carries_the_numbers_that_caused_it():
             await run_until(client, lambda: "entered" in box)
         return box
 
-    try:
+    with _capturing_client_log() as handler:
         asyncio.run(scenario())
-    finally:
-        watched.removeHandler(handler)
 
     on = [m for m in handler.messages if m.startswith("Low-bandwidth mode on")]
     assert len(on) == 1
@@ -682,8 +690,47 @@ def test_the_greeting_after_a_reconnect_names_the_measure_that_entered_the_mode(
         return box
 
     box = asyncio.run(scenario())
-    assert box["entered"] == {**box["entered"], "low_bandwidth": True, "reason": "dwell"}
+    assert box["entered"]["low_bandwidth"] is True
+    assert box["entered"]["reason"] == "dwell"
     # The second session restates the mode it is still in, with the reason it
     # actually has.
     assert box["greeting"]["low_bandwidth"] is True
     assert box["greeting"]["reason"] == "dwell"
+
+
+def test_a_forced_transition_logs_no_reading():
+    """The line reports what was consulted. A forced mode consulted nothing —
+    `mode: on` holds whatever the link is doing — so naming a lag and a
+    threshold beside it would invite the reader to connect the two."""
+    clock = Clock()
+    ros = FakeRos()
+
+    async def scenario():
+        box = {}
+
+        async def behavior(session):
+            await session.recv_hello()
+            await session.accept()
+            await session.recv_link_mode()
+            # A reading arrives first, so the line has one to print if it
+            # is going to.
+            await session.ping(1, latency_ms=50, lag_ms=4000)
+            await session.recv_pong()
+            await session.send_config(1, {}, low_bandwidth={"mode": "on"})
+            box["link_mode"] = await session.recv_link_mode()
+            await session.recv_config_applied()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = _client(cloud, clock, ros)
+            await run_until(client, lambda: "link_mode" in box)
+        return box
+
+    with _capturing_client_log() as handler:
+        box = asyncio.run(scenario())
+
+    assert box["link_mode"]["reason"] == "forced"
+    on = [m for m in handler.messages if m.startswith("Low-bandwidth mode on")]
+    assert len(on) == 1
+    assert "(forced)" in on[0]
+    assert "lag" not in on[0] and "4000" not in on[0]
