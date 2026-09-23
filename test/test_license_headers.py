@@ -30,6 +30,10 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from internal_markers import public_file_set  # noqa: E402
 
 HEADER = "# SPDX-License-Identifier: Apache-2.0"
+#: `.github/release/*.mjs` writes the same line as a JS comment, not a `#`
+#: one -- a shebang line still opens `#!`, so `_carries_a_comment_header`
+#: catches it by extension instead of by that accident.
+JS_HEADER = "// SPDX-License-Identifier: Apache-2.0"
 
 #: Below the real count (61 at the time of writing) and far above what any
 #: partial walk would produce. A floor rather than an equality so that adding a
@@ -58,13 +62,17 @@ def _first_line(path):
 
 
 def _carries_a_comment_header(rel):
-    """Does this file take a `#` comment header at all?
+    """Does this file take a comment header at all?
 
-    Extension for the two languages this package writes (`.py`, `.sh`), and a
-    shebang for everything else -- which is what catches `debian/rules` (make)
-    and `debian/postinst` (sh), neither of which has an extension and both of
-    which ship. Written over what dpkg and the reader actually see, not over a
-    list of names somebody has to remember to extend.
+    Extension for the two languages this package writes as source (`.py`,
+    `.sh`), and a shebang for everything else -- which is what catches
+    `debian/rules` (make), `debian/postinst` (sh), neither of which has an
+    extension, and the two vendored `.mjs` entry points, which do carry a
+    shebang for `node`. A bare `.mjs` extension is deliberately not enough:
+    `tools/live-proof/`'s two entry points already write their SPDX line
+    inside a `/** */` block past line 2, a shape this guard does not parse,
+    and widening the net by extension alone would fail them for a header
+    they already carry rather than one they lack.
     """
     return rel.endswith((".py", ".sh")) or _first_line(ROOT / rel).startswith("#!")
 
@@ -85,7 +93,8 @@ def test_every_source_file_in_the_public_set_carries_the_spdx_header():
         # there and nowhere further down: a licence line ten lines into a file
         # is not what a tool looking for one reads.
         head = (ROOT / f).read_text().split("\n")[:2]
-        if not any(line.strip() == HEADER for line in head):
+        wanted = JS_HEADER if f.endswith(".mjs") else HEADER
+        if not any(line.strip() == wanted for line in head):
             missing.append(f)
     assert missing == [], "{} file(s) without an SPDX header: {}".format(len(missing), missing)
 
@@ -111,6 +120,9 @@ def test_the_set_reaches_past_the_package_directory():
         "run-tests.sh",
         "run-bridge.sh",
         "run-fake-robot.sh",
+        # The vendored release library: `//`, not `#`, is the header shape
+        # that reaches into `.github/` too.
+        ".github/release/release.mjs",
     ]:
         assert f in HEADER_FILES, "{} is outside the scanned set".format(f)
 

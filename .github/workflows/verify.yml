@@ -5,12 +5,16 @@
 # own site directory. The matrix is held against tools/distros.sh by
 # test/test_ci_workflows.py.
 #
-# **The packages on every push, not only on a tag.** ci/package.sh builds all
-# three and installs each from a throwaway repository, so a packaging break is
-# found by the commit that made it rather than by the release after it.
+# **The packages on every push, not only on a release.** ci/package.sh builds
+# all three and installs each from a throwaway repository, so a packaging
+# break is found by the commit that made it rather than by the release after
+# it.
 #
-# release.yml calls this on a tag and gets the tests only: it packages the
-# tag's tree itself, once, and those are the bytes it releases.
+# release.yml never calls this file. Its release branch and its release PR
+# trigger this workflow the ordinary way (push, pull_request), and the
+# required `verify` check below is what release.mjs's merge-pr waits on
+# before merging and tagging. The release job then packages the merged
+# commit itself, once, and those are the bytes it releases.
 #
 # **Hosted runners, because the bridge is public.** A pull request is a
 # stranger's code, and a build runner on private hardware would run it inside
@@ -40,15 +44,23 @@ jobs:
 
   package:
     needs: test
-    # A branch push packages; release.yml's call, which is always a tag,
-    # does not. Not a boolean input: on a push `inputs` is empty, and GitHub
-    # compares `null != false` as `0 != 0`, which skipped this job on every
-    # push.
-    if: github.ref_type != 'tag'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - run: ./ci/package.sh
+
+  # The release logic's own tests (release.mjs, the shared list every copy
+  # must pass, and bridge-version.mjs, the bridge's own). Node, not ROS: the
+  # release runs them on the hosted runner, not in a distribution container.
+  release-logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - run: node --test '.github/release/*.test.mjs'
 
   # One check name a branch rule can require. The matrix's own checks are
   # `test (humble)`, `test (jazzy)`, `test (lyrical)` — they are named after
@@ -56,7 +68,7 @@ jobs:
   # protecting the distribution it can no longer find, and covers nothing for
   # one that arrives. This name does not move.
   verify:
-    needs: [test, package]
+    needs: [test, package, release-logic]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -64,18 +76,22 @@ jobs:
         env:
           TEST: ${{ needs.test.result }}
           PACKAGE: ${{ needs.package.result }}
+          RELEASE_LOGIC: ${{ needs.release-logic.result }}
         run: |
           set -euo pipefail
-          echo "test=$TEST package=$PACKAGE"
+          echo "test=$TEST package=$PACKAGE release-logic=$RELEASE_LOGIC"
           # `if: always()` above is the load-bearing half. Without it this job
           # is *skipped* when a dependency fails, and GitHub counts a skipped
           # required check as satisfied — this would report green exactly when
           # it must not. Which is why the results are read here by hand rather
           # than left to `needs:`.
           [ "$TEST" = success ] || { echo "the suite did not pass" >&2; exit 1; }
-          # `package` skips itself on a tag by design (see its own `if:`);
-          # anything other than that or success is a packaging break.
+          # `package` skips itself when `test` fails; anything other than
+          # that or success is a packaging break.
           case "$PACKAGE" in
             success | skipped) ;;
             *) echo "the packages did not build" >&2; exit 1 ;;
           esac
+          # `release-logic` needs nothing else, so it never skips: anything
+          # but success is the release logic itself, not a knock-on failure.
+          [ "$RELEASE_LOGIC" = success ] || { echo "the release logic's own tests did not pass" >&2; exit 1; }
