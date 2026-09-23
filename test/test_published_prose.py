@@ -74,16 +74,12 @@ DETECTORS = detectors()
 #: more file this guard would have quietly stopped reading.
 EXEMPT = {
     "scripts/internal_markers.py": "the detectors and their fixtures are spelt out here",
-    # The shared release library: copied byte for byte from every repository
-    # that carries a Release button, so a hit here is fixed upstream, never in
-    # this checkout. Both hits are the library's own writing style, read as
-    # something it is not: a doc comment naming an expected behaviour in
-    # parentheses, which this detector's citation shape mistakes for the
-    # design document, and a diff-fixture pair whose second half spells an
-    # ordinal as a digit on purpose, which this detector's numbering shape
-    # mistakes for a coordinate in a plan.
-    ".github/release/release.mjs": "a parenthetical behaviour note read as a document citation",
-    ".github/release/bridge-version.mjs": "same doc-comment shape as release.mjs",
+    # The shared release library's test suite: copied byte for byte from
+    # every repository that carries a Release button, so a hit here is fixed
+    # upstream, never in this checkout. Its recipe-gate fixture pair spells
+    # an ordinal as a digit on the second half on purpose, to prove a diff
+    # notices it -- which this detector's numbering shape mistakes for a
+    # coordinate in a plan.
     ".github/release/release.test.mjs": "a fixture pair whose ordinal-as-digit rewrite reads as a numbered coordinate",
 }
 
@@ -292,8 +288,6 @@ def test_every_scanned_file_has_a_scope_and_its_bytes_were_read():
 
 def test_every_exemption_is_named_and_still_hides_something():
     assert sorted(EXEMPT) == [
-        ".github/release/bridge-version.mjs",
-        ".github/release/release.mjs",
         ".github/release/release.test.mjs",
         "scripts/internal_markers.py",
     ]
