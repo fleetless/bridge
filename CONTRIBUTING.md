@@ -5,14 +5,15 @@ Thanks for showing up. This is how to build it, test it, and get it merged.
 ## Where the work happens
 
 The canonical repository is
-[github.com/fleetless/bridge](https://github.com/fleetless/bridge) — private
-until the public release. **Pull requests are welcome** — we read them,
-review them, land them.
+[github.com/fleetless/bridge](https://github.com/fleetless/bridge) — public.
+**Pull requests are welcome** — we read them, review them, land them.
 
-**There is no CI.** Nothing runs automatically against a pull request: no
-pipeline, no check, no bot. Every check this project has is a command in
-this file, run by a person — the first person to run it should be you.
-The checks:
+**CI runs the suite, the packaging and the release logic's own tests on
+every push and every pull request** (`.github/workflows/verify.yml`, three
+ROS distributions in parallel). That doesn't make running them yourself
+optional — a red pipeline ten minutes after you pushed is a worse loop than
+a red test on your own machine, and the pipeline runs the same commands
+this file does. The checks:
 
 | What | Command |
 |---|---|
@@ -102,6 +103,16 @@ and wrong (exit 1). See `apt/README.md`.
 
 `apt/README.md` describes what happens to the `.deb` afterwards.
 
+## Releasing
+
+**Release**, in the Actions tab, releases `main`: the version comes from the
+Conventional Commits since the last tag, a release PR writes it into
+`fleetless_bridge/__init__.py`, `package.xml` and a new `debian/changelog.in`
+entry, and merging it tags, packages and publishes to apt through the ops
+repository. A robot takes the new version within minutes of that publish.
+Nobody runs this by hand outside the button — see
+`.github/workflows/release.yml` for what it does and in what order.
+
 ## Commit messages
 
 [Conventional Commits](https://www.conventionalcommits.org/), in English:
@@ -109,6 +120,11 @@ and wrong (exit 1). See `apt/README.md`.
 ```
 fix(camera): a stalled V4L2 read no longer blocks teardown
 ```
+
+**The Debian changelog entry a release writes is your commit subjects,
+verbatim, one bullet each.** A subject that would read strangely as a
+release note — "wip", "fix typo", "address review" — reads exactly as
+strangely to whoever runs `apt install` and checks what changed.
 
 `scripts/verify_commit_messages.py` checks the messages you're about to push
 and refuses anything that names something a reader of the public history

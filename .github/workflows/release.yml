@@ -1,56 +1,199 @@
-# A vX.Y.Z tag is a release: the tag is checked, the suite runs on every
-# distribution, the tag's tree is packaged once, and those files become a
-# GitHub release with SHA256SUMS.
+# Release: this repository's `main`, as the next version, published to apt.
 #
-# **It stops there.** Publishing to the apt repository is a separate, deliberate
-# dispatch of the apt publishing workflow, which fetches exactly these assets,
-# refuses them unless this workflow uploaded them and their sums match, and
-# signs them. reprepro will not take a second build of a version, and a robot
-# running `apt upgrade` takes a new one within minutes -- so a tag is allowed
-# to be a mistake, and a publish is not.
+# Press "Run workflow" on main. The version comes from the Conventional
+# Commits since the last tag (.github/release/release.mjs). A release PR
+# writes it into the three places that must agree — __version__,
+# package.xml, and a new top entry in debian/changelog.in listing the commit
+# subjects (bridge-version.mjs) — and merges itself once the required
+# `verify` check, the suite on every distribution, passes. The merge commit
+# is tagged and packaged once. ci/package.sh already installs every package
+# in its own distribution's container, and proves the other suites refuse it
+# (apt/verify-suites.sh), so the build is checked before anything is
+# published. The packages and SHA256SUMS become the GitHub release, uploaded
+# with this workflow's GITHUB_TOKEN, because the ops repository refuses any
+# other uploader. Then the ops repository is asked to publish them to apt.
+#
+# That publish is no longer a separate decision. A robot takes a new version
+# within minutes, and reprepro refuses a second build of a version, so the
+# check that used to be a person looking at the release is now the install
+# check above. publish-apt.yml installs from the served suite afterwards, as
+# before.
+#
+# A run that failed can be started again: an open release PR is reused, a
+# merged release commit is tagged, a tag already on HEAD continues that
+# release, and a release with only some of its packages is completed.
 name: release
 
 on:
-  push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
-
-permissions:
-  contents: write
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: auto, from the commits; an override only raises it
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
 
 concurrency:
   group: release
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
-  check:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tagged: ${{ steps.version.outputs.tagged }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - run: ./ci/release-check.sh "$GITHUB_REF_NAME"
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: main, and nothing but main
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "Release runs on main, not $GITHUB_REF" >&2; exit 1; }
+          git fetch -q origin main
+          [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] || { echo "main moved after this run started; run it again" >&2; exit 1; }
+      - name: the version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          tag="$(node .github/release/release.mjs tag-at-head)"
+          if [ -n "$tag" ]; then
+            echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+            echo "HEAD already carries $tag: continuing that release"
+          else
+            echo "version=$(node .github/release/release.mjs next --bump "$BUMP")" >> "$GITHUB_OUTPUT"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
 
-  test:
-    needs: check
-    uses: ./.github/workflows/verify.yml
-
-  release:
-    needs: test
+  release-commit:
+    needs: prepare
     runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.commit.outputs.commit }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAGGED: ${{ needs.prepare.outputs.tagged }}
     steps:
       - uses: actions/checkout@v5
-      - name: package the tag's tree
-        run: ./ci/package.sh
-      - name: the release
+        with:
+          fetch-depth: 0
+          # A persisted credential would push the branch as
+          # github-actions[bot], and no check would ever run on the PR.
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ secrets.FLEETLESS_APP_ID }}
+          private-key: ${{ secrets.FLEETLESS_APP_PRIVATE_KEY }}
+          owner: fleetless
+          repositories: bridge
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+      - name: the release commit, through a pull request
+        id: commit
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./ci/github-release.sh "$GITHUB_REF_NAME"
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          if [ "$TAGGED" = true ]; then
+            echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          merged="$(node .github/release/release.mjs release-commit --version "$VERSION")"
+          if [ -n "$merged" ]; then
+            echo "commit=$merged" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          branch="release/$VERSION"
+          number="$(node .github/release/release.mjs release-pr --version "$VERSION" --branch "$branch" --find-only)"
+          if [ -z "$number" ]; then
+            git switch -q -c "$branch"
+            node .github/release/bridge-version.mjs write --version "$VERSION"
+            git -c user.name="fleetless-release[bot]" -c user.email="fleetless-release[bot]@users.noreply.github.com" \
+              commit -q -am "chore(release): $VERSION"
+            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+            GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+              git push -q --force origin "HEAD:refs/heads/$branch"
+            number="$(node .github/release/release.mjs release-pr --version "$VERSION" --branch "$branch")"
+          fi
+          echo "release PR #$number"
+          # Three distributions, then the packaging: longer than the default.
+          echo "commit=$(node .github/release/release.mjs merge-pr --number "$number" --timeout-minutes 60)" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: [prepare, release-commit]
+    runs-on: ubuntu-latest
+    permissions:
+      # The GitHub release is uploaded with GITHUB_TOKEN; the tag and the
+      # dispatch go out as the App.
+      contents: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      COMMIT: ${{ needs.release-commit.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-commit.outputs.commit }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: actions/create-github-app-token@v2
+        id: app
+        with:
+          app-id: ${{ secrets.FLEETLESS_APP_ID }}
+          private-key: ${{ secrets.FLEETLESS_APP_PRIVATE_KEY }}
+          owner: fleetless
+          repositories: bridge,fleetless
+          permission-contents: write
+      - name: tag
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: node .github/release/release.mjs create-tag --version "$VERSION" --sha "$COMMIT"
+      - name: the tag, the version and main agree
+        run: |
+          set -euo pipefail
+          git fetch -q --tags origin main
+          ./ci/release-check.sh "v$VERSION"
+      - name: package, and install every package in its own distribution
+        run: ./ci/package.sh
+      - name: the GitHub release, uploaded as this workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          node .github/release/bridge-version.mjs notes > "$RUNNER_TEMP/notes.md"
+          node .github/release/release.mjs github-release --version "$VERSION" --dir dist --notes-file "$RUNNER_TEMP/notes.md"
+      - name: ask the ops repository to publish it to apt
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: node .github/release/release.mjs dispatch --component bridge --version "$VERSION" --commit "$COMMIT"
       - name: summary
+        if: always()
         run: |
           {
-            echo "### ${GITHUB_REF_NAME} released — not published"
+            echo "### bridge v$VERSION — ${{ job.status }}"
             echo
-            echo '```'; cat dist/SHA256SUMS; echo '```'
-            echo
-            echo "Publish with the apt publishing workflow, input \`bridge_tag=${GITHUB_REF_NAME}\`."
+            echo "- release commit: \`$COMMIT\`"
+            echo '```'
+            cat dist/SHA256SUMS 2>/dev/null || echo "no SHA256SUMS: packaging did not finish"
+            echo '```'
+            echo "- dispatched \`bridge-release\` to the ops repository: publish-apt.yml publishes, then installs from the served suite"
           } >> "$GITHUB_STEP_SUMMARY"
