@@ -144,9 +144,9 @@ export function changelogSection(text, version) {
 
 /**
  * A pre-release for a branch that consumers pin before the final version
- * exists (spec: "Depending on unpublished contracts or sdk"). It is the
- * version Release would give this branch now, with the next free `-next.N`
- * that npm does not hold yet.
+ * exists: they pin `X.Y.Z-next.N` so their CI is green, and re-pin the final
+ * version before they merge. It is the version Release would give this
+ * branch now, with the next free `-next.N` that npm does not hold yet.
  */
 export function prereleaseVersion(next, published) {
   parseVersion(next)

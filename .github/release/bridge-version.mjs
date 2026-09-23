@@ -40,7 +40,7 @@ export function debianDate(date) {
  * A new top entry for `version`, in the shape of the ones before it: the same
  * package line, one bullet per commit subject in the range, and the
  * maintainer line of the entry below it. The release writes subjects, not
- * prose (spec: "the Debian entry lists the commit subjects in the range").
+ * prose: a commit subject is the release note, so it should read like one.
  * A top entry already at `version` (a re-run) returns the text unchanged.
  */
 export function debianEntry(text, { version, subjects, date }) {
