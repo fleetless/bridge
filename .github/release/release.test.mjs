@@ -11,15 +11,17 @@ import { test } from 'node:test'
 import {
   ReleaseError,
   addUnreleased,
+  autoMerge,
   changelogSection,
+  checkPassed,
   checkPin,
   commitBump,
+  continuationVersion,
   createTag,
   dispatchPayload,
   dispatchTarget,
   github,
   main,
-  mergePr,
   nextVersion,
   npmState,
   npmWait,
@@ -216,6 +218,18 @@ test('github: the dispatch path cannot report success on a 404', async () => {
     (e) => e instanceof ReleaseError,
   )
 })
+test('github: a GraphQL refusal (a 200 with errors) is a ReleaseError, not a silent success', async () => {
+  await assert.rejects(
+    github('POST', '/graphql', { token: 't', graphql: true, body: { query: 'x' }, fetchImpl: fetchFake(200, JSON.stringify({ errors: [{ message: 'nope' }] })) }),
+    (e) => e instanceof ReleaseError && /nope/.test(e.message),
+  )
+})
+test('github: a GraphQL success answers its data', async () => {
+  assert.deepEqual(
+    await github('POST', '/graphql', { token: 't', graphql: true, body: { query: 'x' }, fetchImpl: fetchFake(200, JSON.stringify({ data: { ok: true } })) }),
+    { ok: true },
+  )
+})
 
 test('createTag: an absent tag is created as an annotated tag by the App', async () => {
   const { api, calls } = fake([
@@ -345,68 +359,134 @@ test('releasePr: find-only answers null when there is none', async () => {
   assert.equal(await releasePr({ repo: 'fleetless/docs', version: '0.23.0', branch: 'release/0.23.0', findOnly: true, api }), null)
 })
 
-const noSleep = async () => {}
-test('mergePr: clean → merged with a rebase, main\'s commit answered', async () => {
-  let merged = false
-  const { api, calls } = fake([
-    [/^GET .*\/pulls\/5$/, () => (merged ? { merged: true, merge_commit_sha: SHA } : { state: 'open', mergeable_state: 'clean', head: { sha: OTHER } })],
-    [/^PUT .*\/pulls\/5\/merge$/, () => ((merged = true), {})],
-  ])
-  assert.equal(await mergePr({ repo: 'fleetless/docs', number: '5', api, sleep: noSleep }), SHA)
-  assert.deepEqual(calls.find((x) => x.method === 'PUT').body, { merge_method: 'rebase' })
+// ── auto-merge, and the merge that ends the button run ───────────────────
+
+const PR_HEAD = 'h'.repeat(40)
+const PR_NODE = 'PR_kwDOExample'
+
+test('autoMerge: a PR merged already answers merged, without GraphQL', async () => {
+  const { api, calls } = fake([[/^GET .*\/pulls\/5$/, { merged: true, merge_commit_sha: SHA }]])
+  assert.equal(await autoMerge({ repo: 'fleetless/docs', number: '5', api }), 'merged')
+  assert.equal(calls.length, 1)
 })
-test('mergePr: the PUT response\'s sha is answered, not a stale re-GET\'s', async () => {
-  // A re-GET right after the PUT can still answer the pre-merge test-merge
-  // sha for a moment. Trusting the PUT's own answer — and never re-GETting
-  // at all once it has one — is what keeps create-tag from tagging that
-  // stale commit forever.
-  let gets = 0
-  const { api } = fake([
-    [/^GET .*\/pulls\/5$/, () => (gets++, gets === 1 ? { state: 'open', mergeable_state: 'clean', head: { sha: OTHER } } : { merged: false, merge_commit_sha: OTHER })],
-    [/^PUT .*\/pulls\/5\/merge$/, { sha: SHA, merged: true }],
-  ])
-  assert.equal(await mergePr({ repo: 'fleetless/docs', number: '5', api, sleep: noSleep }), SHA)
+test('autoMerge: a closed, unmerged PR is refused', async () => {
+  const { api } = fake([[/^GET .*\/pulls\/5$/, { state: 'closed', merged: false }]])
+  await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', api }), /closed without merging/)
 })
-test('mergePr: a PUT response with no sha falls back to a re-GET, but only once it reports merged', async () => {
-  const { api } = fake([
-    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'clean', head: { sha: OTHER }, merged: false, merge_commit_sha: OTHER }],
-    [/^PUT .*\/pulls\/5\/merge$/, {}],
-  ])
-  await assert.rejects(mergePr({ repo: 'fleetless/docs', number: '5', api, sleep: noSleep }), /did not report a commit sha, and a re-read does not show it merged/)
+test('autoMerge: a PR behind main is refused: run Release again', async () => {
+  const { api } = fake([[/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'behind', head: { sha: PR_HEAD } }]])
+  await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', api }), /main moved; run Release again/)
 })
-test('mergePr: a failed required check is refused at once, named', async () => {
+test('autoMerge: a failed required check is refused at once, named', async () => {
   const { api } = fake([
-    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'blocked', head: { sha: OTHER } }],
+    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'blocked', node_id: PR_NODE, head: { sha: PR_HEAD } }],
     [/^GET .*\/check-runs$/, { check_runs: [{ name: 'site', status: 'completed', conclusion: 'failure' }] }],
   ])
-  await assert.rejects(mergePr({ repo: 'fleetless/docs', number: '5', api, sleep: noSleep }), /check site failed/)
+  await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', check: 'site', api }), /check site failed/)
 })
-test('mergePr: a PR that fell behind main is refused: run Release again', async () => {
-  const { api } = fake([[/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'behind', head: { sha: OTHER } }]])
-  await assert.rejects(mergePr({ repo: 'fleetless/docs', number: '5', api, sleep: noSleep }), /main moved; run Release again/)
-})
-test('mergePr: a closed PR is refused', async () => {
-  const { api } = fake([[/^GET .*\/pulls\/5$/, { state: 'closed', merged: false }]])
-  await assert.rejects(mergePr({ repo: 'fleetless/docs', number: '5', api, sleep: noSleep }), /closed without merging/)
-})
-test('mergePr: still pending at the deadline is refused', async () => {
-  let t = 0
-  const { api } = fake([
-    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'blocked', head: { sha: OTHER } }],
+test('autoMerge: a pending check turns auto-merge on, rebase, for that node', async () => {
+  const { api, calls } = fake([
+    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'blocked', node_id: PR_NODE, head: { sha: PR_HEAD } }],
     [/^GET .*\/check-runs$/, { check_runs: [{ name: 'site', status: 'in_progress', conclusion: null }] }],
+    [/^POST \/graphql$/, {}],
   ])
-  await assert.rejects(mergePr({ repo: 'fleetless/docs', number: '5', api, sleep: noSleep, timeoutMs: 1000, now: () => (t += 600) }), /not mergeable within/)
+  assert.equal(await autoMerge({ repo: 'fleetless/docs', number: '5', check: 'site', api }), 'enabled')
+  const call = calls.find((x) => x.path === '/graphql')
+  assert.equal(call.method, 'POST')
+  assert.equal(call.body.variables.id, PR_NODE)
+  assert.match(call.body.query, /enablePullRequestAutoMerge/)
+  assert.match(call.body.query, /REBASE/)
+})
+test('autoMerge: a clean-status PR whose check succeeded is merged here', async () => {
+  const { api, calls } = fake([
+    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'clean', node_id: PR_NODE, head: { sha: PR_HEAD } }],
+    [/^GET .*\/check-runs$/, { check_runs: [{ name: 'site', status: 'completed', conclusion: 'success' }] }],
+    [/^POST \/graphql$/, () => { throw new ReleaseError('Pull request is in clean status') }],
+    [/^PUT .*\/pulls\/5\/merge$/, { sha: SHA, merged: true }],
+  ])
+  assert.equal(await autoMerge({ repo: 'fleetless/docs', number: '5', check: 'site', api }), 'merged')
+  assert.deepEqual(calls.find((x) => x.method === 'PUT').body, { merge_method: 'rebase' })
+})
+test('autoMerge: a clean-status PR whose check has not succeeded is refused, no merge call', async () => {
+  const { api, calls } = fake([
+    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'clean', node_id: PR_NODE, head: { sha: PR_HEAD } }],
+    [/^GET .*\/check-runs$/, { check_runs: [{ name: 'site', status: 'in_progress', conclusion: null }] }],
+    [/^POST \/graphql$/, () => { throw new ReleaseError('Pull request is in clean status') }],
+  ])
+  await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', check: 'site', api }), /clean but its site check has not succeeded/)
+  assert.equal(calls.filter((x) => x.method === 'PUT').length, 0)
+})
+test('autoMerge: auto-merge turned off on the repository is refused, naming the setting', async () => {
+  const { api } = fake([
+    [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'blocked', node_id: PR_NODE, head: { sha: PR_HEAD } }],
+    [/^GET .*\/check-runs$/, { check_runs: [{ name: 'verify', status: 'in_progress', conclusion: null }] }],
+    [/^POST \/graphql$/, () => { throw new ReleaseError('Auto merge is not allowed for this repository') }],
+  ])
+  await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', api }), /allow_auto_merge/)
+})
+
+// ── the continuation: which merged PR carries on a release ───────────────
+
+const EVENT = (pr) => ({
+  repository: { full_name: 'fleetless/docs' },
+  pull_request: {
+    merged: true,
+    merged_by: { login: 'fleetless-release[bot]' },
+    head: { ref: 'release/0.23.1', repo: { full_name: 'fleetless/docs' } },
+    ...pr,
+  },
+})
+
+test('continuation: the App merging release/X.Y.Z of this repository continues it', () => {
+  assert.equal(continuationVersion(EVENT({})), '0.23.1')
+})
+test('continuation: a pull request that was not merged is nothing, not an error', () => {
+  assert.equal(continuationVersion(EVENT({ merged: false })), null)
+})
+test('continuation: a normal branch closed is nothing', () => {
+  assert.equal(continuationVersion(EVENT({ head: { ref: 'fix/22-something', repo: { full_name: 'fleetless/docs' } } })), null)
+})
+test('continuation: a release branch merged by a person is refused', () => {
+  assert.throws(() => continuationVersion(EVENT({ merged_by: { login: 'ade21' } })), /merged by ade21, not fleetless-release\[bot\]/)
+})
+test('continuation: a release branch from a fork is refused', () => {
+  assert.throws(() => continuationVersion(EVENT({ head: { ref: 'release/0.23.1', repo: { full_name: 'someone/docs' } } })), /came from someone\/docs/)
+})
+test('continuation: release/1.2 is not a version and is refused', () => {
+  assert.throws(() => continuationVersion(EVENT({ head: { ref: 'release/1.2', repo: { full_name: 'fleetless/docs' } } })), /is not release\/X\.Y\.Z/)
+})
+
+// ── the belt and braces before the tag ───────────────────────────────────
+
+test('checkPassed: a successful required check on the commit passes', async () => {
+  const { api } = fake([[/^GET .*\/check-runs$/, { check_runs: [{ name: 'verify', status: 'completed', conclusion: 'success' }] }]])
+  assert.equal(await checkPassed({ repo: 'fleetless/contracts', sha: SHA, check: 'verify', api }), true)
+})
+test('checkPassed: failure, neutral, in progress, another name and none are all refused', async () => {
+  const cases = [
+    [{ name: 'verify', status: 'completed', conclusion: 'failure' }],
+    [{ name: 'verify', status: 'completed', conclusion: 'neutral' }],
+    [{ name: 'verify', status: 'in_progress', conclusion: null }],
+    [{ name: 'other', status: 'completed', conclusion: 'success' }],
+    [],
+  ]
+  for (const check_runs of cases) {
+    const { api } = fake([[/^GET .*\/check-runs$/, { check_runs }]])
+    await assert.rejects(checkPassed({ repo: 'fleetless/contracts', sha: SHA, check: 'verify', api }), /no successful verify check run/)
+  }
 })
 
 // ── the CLI itself ──────────────────────────────────────────────────────
 
-test('CLI merge-pr: a non-numeric --number is a usage error before any network call reaches a URL path', async () => {
-  // '1/../x' is the shape that matters: it is exactly what a path-traversal
+test('CLI auto-merge: a non-numeric --number is a usage error before any network call', async () => {
+  // '1/../x' is the shape that matters: exactly what a path-traversal
   // attempt through `/pulls/${number}` looks like, and neither GH_TOKEN nor
-  // GITHUB_REPOSITORY is set for this test — if the check ran late, this
-  // would fail on "GITHUB_REPOSITORY is not set" instead, which is not the
-  // guarantee this test makes.
-  await assert.rejects(main(['merge-pr', '--number', '1/../x']), (e) => e instanceof ReleaseError && e.code === 2 && /--number '1\/\.\.\/x' is not a plain number/.test(e.message))
+  // GITHUB_REPOSITORY is set for this test — a late check would fail on
+  // "GITHUB_REPOSITORY is not set" instead.
+  await assert.rejects(main(['auto-merge', '--number', '1/../x']), (e) => e instanceof ReleaseError && e.code === 2 && /--number '1\/\.\.\/x' is not a plain number/.test(e.message))
+})
+test('CLI merge-pr: gone (usage exit 2)', async () => {
+  await assert.rejects(main(['merge-pr', '--number', '5']), (e) => e.code === 2)
 })
 
 // ── B2: the changelog entry a workflow writes, and a release's notes ────
