@@ -48,7 +48,10 @@ on:
     branches: [main]
 
 concurrency:
-  group: release
+  # Only a release joins the `release` group. Every pull request that closes
+  # starts this workflow too, and a run queued in a group cancels the one
+  # already pending there: a no-op close must never cancel a pending release.
+  group: ${{ (github.event_name != 'pull_request' || (startsWith(github.event.pull_request.head.ref, 'release/') && github.event.pull_request.head.repo.full_name == github.repository)) && 'release' || format('release-noop-{0}', github.run_id) }}
   cancel-in-progress: false
 
 permissions:
