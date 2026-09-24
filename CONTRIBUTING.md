@@ -126,6 +126,11 @@ verbatim, one bullet each.** A subject that would read strangely as a
 release note — "wip", "fix typo", "address review" — reads exactly as
 strangely to whoever runs `apt install` and checks what changed.
 
+Not every subject: the types `chore`, `ci`, `build`, `test` and `style`, and
+anything scoped `release`, are left out. They describe the work on this
+repository rather than the package a robot installs. A release with nothing
+else left refuses rather than announce an empty list.
+
 `scripts/verify_commit_messages.py` checks the messages you're about to push
 and refuses anything that names something a reader of the public history
 can't resolve. Run it before you push:

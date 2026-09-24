@@ -20,9 +20,10 @@
 # check above. publish-apt.yml installs from the served suite afterwards, as
 # before.
 #
-# A run that failed can be started again: an open release PR is reused, a
-# merged release commit is tagged, a tag already on HEAD continues that
-# release, and a release with only some of its packages is completed --
+# A run that failed can be started again: an open release PR is reused and
+# rebuilt on the current `main`, a merged release commit is tagged, a tag
+# already on HEAD continues that release, and a release with only some of its
+# packages is completed --
 # safe because fetch-bridge-release.sh on the ops side wants exactly three
 # `.deb` files plus SHA256SUMS, so a release short a package was never
 # published to apt in the meantime, only sitting on GitHub incomplete.
@@ -76,7 +77,10 @@ jobs:
             echo "tagged=true" >> "$GITHUB_OUTPUT"
             echo "HEAD already carries $tag: continuing that release"
           else
-            echo "version=$(node .github/release/release.mjs next --bump "$BUMP")" >> "$GITHUB_OUTPUT"
+            # Assign, then echo: under `set -e`, a command substitution that
+            # fails inside `echo` leaves echo's own exit status, which is 0.
+            version="$(node .github/release/release.mjs next --bump "$BUMP")"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
             echo "tagged=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -123,22 +127,32 @@ jobs:
             echo "commit=$merged" >> "$GITHUB_OUTPUT"; exit 0
           fi
           branch="release/$VERSION"
-          number="$(node .github/release/release.mjs release-pr --version "$VERSION" --branch "$branch" --find-only)"
-          if [ -z "$number" ]; then
-            git switch -q -c "$branch"
-            node .github/release/bridge-version.mjs write --version "$VERSION"
-            git -c user.name="fleetless-release[bot]" -c user.email="fleetless-release[bot]@users.noreply.github.com" \
-              commit -q -am "chore(release): $VERSION"
-            auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-            GIT_CONFIG_COUNT=1 \
-            GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
-            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
-              git push -q --force origin "HEAD:refs/heads/$branch"
-            number="$(node .github/release/release.mjs release-pr --version "$VERSION" --branch "$branch")"
-          fi
+          # Past the two early exits the branch is rebuilt every time on this
+          # job's HEAD, which is current main. A failed run leaves a release PR
+          # that main soon moves past, or one carrying a red check, and
+          # merge-pr refuses both for ever -- reusing such a PR untouched makes
+          # every later run fail the same way. The force-push puts it back on
+          # today's main and restarts its required check.
+          git switch -q -c "$branch"
+          node .github/release/bridge-version.mjs write --version "$VERSION"
+          git -c user.name="fleetless-release[bot]" -c user.email="fleetless-release[bot]@users.noreply.github.com" \
+            commit -q -am "chore(release): $VERSION"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git push -q --force origin "HEAD:refs/heads/$branch"
+          # Without --find-only this answers the open PR's number when there is
+          # one, and opens a PR when there is not.
+          number="$(node .github/release/release.mjs release-pr --version "$VERSION" --branch "$branch")"
           echo "release PR #$number"
-          # Three distributions, then the packaging: longer than the default.
-          echo "commit=$(node .github/release/release.mjs merge-pr --number "$number" --timeout-minutes 60)" >> "$GITHUB_OUTPUT"
+          # Three distributions, then the packaging: longer than the default,
+          # and under the 60 minutes the App token minted in this job lives --
+          # a wait that outlived the token would fail on the merge call itself.
+          # Assign, then echo: a failing substitution inside `echo` leaves
+          # echo's own exit status, which is 0.
+          commit="$(node .github/release/release.mjs merge-pr --number "$number" --timeout-minutes 45)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
 
   release:
     needs: [prepare, release-commit]
