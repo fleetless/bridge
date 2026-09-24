@@ -22,7 +22,10 @@
 #
 # A run that failed can be started again: an open release PR is reused, a
 # merged release commit is tagged, a tag already on HEAD continues that
-# release, and a release with only some of its packages is completed.
+# release, and a release with only some of its packages is completed --
+# safe because fetch-bridge-release.sh on the ops side wants exactly three
+# `.deb` files plus SHA256SUMS, so a release short a package was never
+# published to apt in the meantime, only sitting on GitHub incomplete.
 name: release
 
 on:
@@ -183,11 +186,17 @@ jobs:
           node .github/release/bridge-version.mjs notes > "$RUNNER_TEMP/notes.md"
           node .github/release/release.mjs github-release --version "$VERSION" --dir dist --notes-file "$RUNNER_TEMP/notes.md"
       - name: ask the ops repository to publish it to apt
+        id: dispatch
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
-        run: node .github/release/release.mjs dispatch --component bridge --version "$VERSION" --commit "$COMMIT"
+        run: |
+          set -euo pipefail
+          node .github/release/release.mjs dispatch --component bridge --version "$VERSION" --commit "$COMMIT"
+          echo "dispatched=true" >> "$GITHUB_OUTPUT"
       - name: summary
         if: always()
+        env:
+          DISPATCHED: ${{ steps.dispatch.outputs.dispatched }}
         run: |
           {
             echo "### bridge v$VERSION — ${{ job.status }}"
@@ -196,5 +205,9 @@ jobs:
             echo '```'
             cat dist/SHA256SUMS 2>/dev/null || echo "no SHA256SUMS: packaging did not finish"
             echo '```'
-            echo "- dispatched \`bridge-release\` to fleetless/fleetless: publish-apt.yml publishes, then installs from the served suite"
+            if [ "$DISPATCHED" = true ]; then
+              echo "- dispatched \`bridge-release\` to fleetless/fleetless: publish-apt.yml publishes, then installs from the served suite"
+            else
+              echo "- not dispatched: the run did not reach the ask-the-ops-repository step"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
