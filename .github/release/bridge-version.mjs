@@ -37,8 +37,20 @@ export function debianDate(date) {
 }
 
 /**
+ * Whether a commit subject is worth telling a robot owner about. These bullets
+ * become the Debian changelog, the GitHub release notes and the apt changelog,
+ * all read by people who install the package rather than by people who work on
+ * it: the housekeeping types and anything scoped `release` describe the release
+ * machinery, not the bridge. `chore(release): X.Y.Z`, the release's own commit,
+ * is the case that made this rule; the rest are the same thing.
+ */
+export function isUserFacing(subject) {
+  return !/^(chore|ci|build|test|style)(\([^)]*\))?!?:/.test(subject) && !/^[a-z]+\(release\)!?:/.test(subject)
+}
+
+/**
  * A new top entry for `version`, in the shape of the ones before it: the same
- * package line, one bullet per commit subject in the range, and the
+ * package line, one bullet per user-facing commit subject in the range, and the
  * maintainer line of the entry below it. The release writes subjects, not
  * prose: a commit subject is the release note, so it should read like one.
  * A top entry already at `version` (a re-run) returns the text unchanged.
@@ -51,9 +63,12 @@ export function debianEntry(text, { version, subjects, date }) {
   if (head[2].split('-')[0] === version) return text
   const maintainer = /^ -- (.+?>) {2}/m.exec(text)
   if (!maintainer) throw new ReleaseError('debian/changelog.in has no " -- Name <email>  date" line to copy')
-  const listed = subjects.filter((s) => !/^chore\(release\):/.test(s))
-  if (listed.length === 0) throw new ReleaseError('no commit subjects to list: nothing to release')
-  const revision = head[2].slice(head[2].indexOf('-'))
+  const listed = subjects.filter(isUserFacing)
+  if (listed.length === 0) throw new ReleaseError('no user-facing commit since the last release: nothing for apt to announce')
+  // The Debian revision is optional. Without a `-`, indexOf returns -1 and a
+  // plain slice would cut the last character off the version instead.
+  const dash = head[2].indexOf('-')
+  const revision = dash === -1 ? '' : head[2].slice(dash)
   return [
     `${head[1]} (${version}${revision}) ${head[3]}`,
     '',
