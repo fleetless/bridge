@@ -531,7 +531,7 @@ const RELEASE_BRANCH = /^release\/(\d+\.\d+\.\d+)$/
 /**
  * The version a merged release PR continues, from the `pull_request` event
  * that closed it. Only the App's merge of the strict `release/X.Y.Z` branch
- * of this repository continues a release. A normal pull request closed
+ * of the same repository continues a release. A normal pull request closed
  * answers null (nothing to do, not an error); anything else that names a
  * release is refused, loudly.
  */
@@ -543,7 +543,7 @@ export function continuationVersion(event) {
   const match = RELEASE_BRANCH.exec(ref)
   if (!match) throw new ReleaseError(`the merged head '${ref}' is not release/X.Y.Z`)
   if (pr.head?.repo?.full_name !== event.repository?.full_name)
-    throw new ReleaseError(`the merged release branch ${ref} came from ${pr.head?.repo?.full_name ?? 'a fork'}, not ${event.repository?.full_name ?? 'this repository'}`)
+    throw new ReleaseError(`the merged release branch ${ref} came from ${pr.head?.repo?.full_name ?? 'a fork'}, not ${event.repository?.full_name ?? 'the repository'}`)
   if (pr.merged_by?.login !== 'fleetless-release[bot]')
     throw new ReleaseError(`the release PR was merged by ${pr.merged_by?.login ?? 'unknown'}, not fleetless-release[bot]`)
   return match[1]
