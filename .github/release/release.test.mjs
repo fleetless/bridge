@@ -420,7 +420,7 @@ test('autoMerge: auto-merge turned off on the repository is refused, naming the 
   const { api } = fake([
     [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'blocked', node_id: PR_NODE, head: { sha: PR_HEAD } }],
     [/^GET .*\/check-runs$/, { check_runs: [{ name: 'verify', status: 'in_progress', conclusion: null }] }],
-    [/^POST \/graphql$/, () => { throw new ReleaseError('Auto merge is not allowed for this repository') }],
+    [/^POST \/graphql$/, () => { throw new ReleaseError('Auto merge is not allowed for the repository') }],
   ])
   await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', api }), /allow_auto_merge/)
 })
@@ -437,7 +437,7 @@ const EVENT = (pr) => ({
   },
 })
 
-test('continuation: the App merging release/X.Y.Z of this repository continues it', () => {
+test('continuation: the App merging release/X.Y.Z of the same repository continues it', () => {
   assert.equal(continuationVersion(EVENT({})), '0.23.1')
 })
 test('continuation: a pull request that was not merged is nothing, not an error', () => {
