@@ -62,10 +62,15 @@ def test_every_workflow_run_block_is_valid_bash(where, script):
 def _runs_on_by_job():
     """Every job's `runs-on:`, across every workflow file.
 
-    A job that calls a local reusable workflow (`uses: ./.github/workflows/
-    verify.yml`) sets no `runs-on` of its own -- the called file is globbed
-    here too, and its jobs are checked directly. Skipping it is not a hole:
-    it is the other half of the same walk.
+    A job that calls a reusable workflow (`uses: <workflow>`) sets no
+    `runs-on` of its own, so it is skipped here rather than reported as a
+    job with no runner. Nothing calls one that way today -- release.yml
+    used to call verify.yml as a reusable workflow on a tag push; it no
+    longer does, and verify.yml dropped the `workflow_call:` trigger that
+    made that possible. The branch stays because a local call is a shape
+    this walk must not misreport if one returns: a called file is globbed
+    here too, so its own jobs are still checked directly, and skipping the
+    caller is not a hole.
     """
     for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
         workflow = yaml.safe_load(path.read_text())

@@ -31,8 +31,13 @@ from internal_markers import public_file_set  # noqa: E402
 
 HEADER = "# SPDX-License-Identifier: Apache-2.0"
 #: `.github/release/*.mjs` writes the same line as a JS comment, not a `#`
-#: one -- a shebang line still opens `#!`, so `_carries_a_comment_header`
-#: catches it by extension instead of by that accident.
+#: one. `_carries_a_comment_header` catches `release.mjs` and
+#: `bridge-version.mjs` by their `node` shebang, the same accident that
+#: catches `debian/rules` and `debian/postinst` -- not by `.mjs` extension,
+#: which it deliberately does not check (see that function's docstring).
+#: The two `*.test.mjs` files have no shebang, so this header shape is
+#: checked on exactly the two files that need it and left unchecked on the
+#: two that don't carry a shebang either.
 JS_HEADER = "// SPDX-License-Identifier: Apache-2.0"
 
 #: Below the real count (61 at the time of writing) and far above what any
