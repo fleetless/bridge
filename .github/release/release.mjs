@@ -25,7 +25,9 @@
 //   release.mjs dispatch --component C --version X.Y.Z --commit SHA [--ref R] [--contracts-pin P]
 //                        [--schema S] [--contracts-bump] [--asset-name N]   GH_TOKEN (the App)
 //   release.mjs release-pr --version X.Y.Z --branch B [--find-only]    GH_TOKEN (the App), GITHUB_REPOSITORY
-//   release.mjs merge-pr --number N [--timeout-minutes 30]              GH_TOKEN (the App), GITHUB_REPOSITORY
+//   release.mjs auto-merge --number N [--check NAME]                    GH_TOKEN (the App), GITHUB_REPOSITORY
+//   release.mjs continuation --event FILE                               prints the merged release's X.Y.Z
+//   release.mjs check-passed --sha SHA --check NAME                     GH_TOKEN (the App), GITHUB_REPOSITORY
 //
 // Exit codes: 0 ok, 1 refused (the reason on stderr), 2 usage.
 
@@ -271,7 +273,7 @@ export function releaseCommitOnMain(version) {
  * dispatch, the tag object or the merge never happened, so it is a refusal
  * like any other failed response, not a null the caller might mistake for success.
  */
-export async function github(method, path, { body, raw, base = 'https://api.github.com', token = process.env.GH_TOKEN, fetchImpl = globalThis.fetch } = {}) {
+export async function github(method, path, { body, raw, base = 'https://api.github.com', token = process.env.GH_TOKEN, fetchImpl = globalThis.fetch, graphql = false } = {}) {
   if (!token) throw new ReleaseError('GH_TOKEN is not set', 2)
   const headers = { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'x-github-api-version': '2022-11-28' }
   if (raw) headers['content-type'] = 'application/octet-stream'
@@ -279,7 +281,14 @@ export async function github(method, path, { body, raw, base = 'https://api.gith
   const res = await fetchImpl(`${base}${path}`, { method, headers, body: raw ?? (body ? JSON.stringify(body) : undefined) })
   if (res.status === 404 && (method === 'GET' || method === 'DELETE')) return null
   if (!res.ok) throw new ReleaseError(`${method} ${path}: ${res.status} ${await res.text()}`)
-  return res.status === 204 ? {} : res.json()
+  if (res.status === 204) return {}
+  const json = await res.json()
+  // A GraphQL refusal is a 200 with an `errors` array, not an HTTP error.
+  // Throw so no caller can mistake it for success; autoMerge catches and
+  // recognises the two names it handles (clean status, auto-merge not
+  // allowed) and refuses the rest. A success answers its `data`.
+  if (graphql && json.errors?.length) throw new ReleaseError(json.errors.map((e) => e.message).join('; '))
+  return graphql ? json.data : json
 }
 
 /** A release tag, created by the App. An existing tag is reused, never moved. */
@@ -464,38 +473,93 @@ export async function releasePr({ repo, version, branch, findOnly = false, api =
   return pr.number
 }
 
+const ENABLE_AUTO_MERGE = 'mutation($id:ID!){ enablePullRequestAutoMerge(input:{pullRequestId:$id, mergeMethod:REBASE}){ pullRequest{ number } } }'
+
 /**
- * Wait for the required checks, then merge with a rebase and answer the
- * commit main now carries. A failed check or a PR that fell behind main is
- * refused at once — a release that waits thirty minutes for a red check is a
- * release nobody is watching.
+ * Turn on GitHub auto-merge (rebase) on a release pull request and end. No
+ * job waits for the required check any more: in docs, `release-commit` and
+ * the PR's `site` check both need the single build runner, so a job that
+ * waits deadlocks every release. GitHub merges the PR once its required
+ * check passes; that merge starts `release.yml` again, which tags and
+ * publishes.
+ *
+ * `merged` answers a PR that is merged already, or one GitHub let us merge
+ * here because it was in clean status; `enabled` answers one left to
+ * GitHub. A PR that fell behind main is refused at once: the strict rule
+ * keeps it unmerged, and the next Release press rebuilds it.
  */
-export async function mergePr({ repo, number, timeoutMs = 30 * 60 * 1000, intervalMs = 20_000, api = github, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = Date.now }) {
-  const deadline = now() + timeoutMs
-  for (;;) {
-    const pr = await api('GET', `/repos/${repo}/pulls/${number}`)
-    if (!pr) throw new ReleaseError(`no pull request #${number} in ${repo}`)
-    if (pr.merged) return pr.merge_commit_sha
-    if (pr.state === 'closed') throw new ReleaseError(`the release PR #${number} was closed without merging`)
-    if (pr.mergeable_state === 'clean') {
+export async function autoMerge({ repo, number, check = 'verify', api = github }) {
+  const pr = await api('GET', `/repos/${repo}/pulls/${number}`)
+  if (!pr) throw new ReleaseError(`no pull request #${number} in ${repo}`)
+  if (pr.merged) return 'merged'
+  if (pr.state === 'closed') throw new ReleaseError(`the release PR #${number} was closed without merging`)
+  if (pr.mergeable_state === 'behind' || pr.mergeable_state === 'dirty')
+    throw new ReleaseError(`the release PR #${number} is ${pr.mergeable_state}: main moved; run Release again`)
+  const runs = await api('GET', `/repos/${repo}/commits/${pr.head.sha}/check-runs`)
+  const checkRuns = runs?.check_runs ?? []
+  const failed = checkRuns.filter((r) => r.status === 'completed' && ['failure', 'cancelled', 'timed_out'].includes(r.conclusion))
+  if (failed.length) throw new ReleaseError(`the release PR #${number}'s check ${failed.map((r) => r.name).join(', ')} failed`)
+  try {
+    await api('POST', '/graphql', { graphql: true, body: { query: ENABLE_AUTO_MERGE, variables: { id: pr.node_id } } })
+    return 'enabled'
+  } catch (error) {
+    if (!(error instanceof ReleaseError)) throw error
+    const message = error.message
+    // GitHub refuses auto-merge on a PR it could merge now ("Pull request is
+    // in clean status"). Merge it here instead, but only on a check that has
+    // already succeeded: the App is a bypass actor, and a merge without one
+    // would publish bytes no required check ever saw.
+    if (/clean status|already mergeable/i.test(message)) {
+      const passed = checkRuns.some((r) => r.name === check && r.status === 'completed' && r.conclusion === 'success')
+      if (!passed) throw new ReleaseError(`the release PR #${number} is clean but its ${check} check has not succeeded: refusing to merge it here`)
       const result = await api('PUT', `/repos/${repo}/pulls/${number}/merge`, { body: { merge_method: 'rebase' } })
-      if (result && result.sha) return result.sha
-      // The PUT answered without a sha: a stale re-GET's merge_commit_sha can
-      // still be the pre-merge test-merge commit, which create-tag would tag
-      // forever and verify-dispatch would refuse as not on main. Trust it
-      // only once the PR itself reports merged.
+      if (result && result.sha) return 'merged'
+      // As mergePr did: a stale re-GET can still answer the pre-merge
+      // test-merge commit, so trust it only once the PR reports merged.
       const merged = await api('GET', `/repos/${repo}/pulls/${number}`)
       if (!merged || merged.merged !== true) throw new ReleaseError(`the release PR #${number}'s merge did not report a commit sha, and a re-read does not show it merged`)
-      return merged.merge_commit_sha
+      return 'merged'
     }
-    if (pr.mergeable_state === 'behind' || pr.mergeable_state === 'dirty')
-      throw new ReleaseError(`the release PR #${number} is ${pr.mergeable_state}: main moved; run Release again`)
-    const runs = await api('GET', `/repos/${repo}/commits/${pr.head.sha}/check-runs`)
-    const failed = (runs?.check_runs ?? []).filter((r) => r.status === 'completed' && ['failure', 'cancelled', 'timed_out'].includes(r.conclusion))
-    if (failed.length) throw new ReleaseError(`the release PR #${number}'s check ${failed.map((r) => r.name).join(', ')} failed`)
-    if (now() > deadline) throw new ReleaseError(`the release PR #${number} was not mergeable within ${Math.round(timeoutMs / 60000)} minutes (state: ${pr.mergeable_state})`)
-    await sleep(intervalMs)
+    if (/auto.?merge/i.test(message) && /not (allowed|enabled)|disabled|repository/i.test(message))
+      throw new ReleaseError(`auto-merge is not allowed on ${repo}: turn on "Allow auto-merge" (allow_auto_merge) in the repository settings`)
+    throw new ReleaseError(`enabling auto-merge on the release PR #${number} failed: ${message}`)
   }
+}
+
+const RELEASE_BRANCH = /^release\/(\d+\.\d+\.\d+)$/
+
+/**
+ * The version a merged release PR continues, from the `pull_request` event
+ * that closed it. Only the App's merge of the strict `release/X.Y.Z` branch
+ * of this repository continues a release. A normal pull request closed
+ * answers null (nothing to do, not an error); anything else that names a
+ * release is refused, loudly.
+ */
+export function continuationVersion(event) {
+  const pr = event?.pull_request
+  if (!pr || pr.merged !== true) return null
+  const ref = pr.head?.ref ?? ''
+  if (!ref.startsWith('release/')) return null
+  const match = RELEASE_BRANCH.exec(ref)
+  if (!match) throw new ReleaseError(`the merged head '${ref}' is not release/X.Y.Z`)
+  if (pr.head?.repo?.full_name !== event.repository?.full_name)
+    throw new ReleaseError(`the merged release branch ${ref} came from ${pr.head?.repo?.full_name ?? 'a fork'}, not ${event.repository?.full_name ?? 'this repository'}`)
+  if (pr.merged_by?.login !== 'fleetless-release[bot]')
+    throw new ReleaseError(`the release PR was merged by ${pr.merged_by?.login ?? 'unknown'}, not fleetless-release[bot]`)
+  return match[1]
+}
+
+/**
+ * Belt and braces before the tag: the App is a bypass actor on every
+ * `main`, so GitHub would merge a release PR without its check if the
+ * ruleset ever changed. The continuation refuses to tag a commit whose
+ * required check did not complete successfully.
+ */
+export async function checkPassed({ repo, sha, check, api = github }) {
+  const runs = await api('GET', `/repos/${repo}/commits/${sha}/check-runs`)
+  const ok = (runs?.check_runs ?? []).some((r) => r.name === check && r.status === 'completed' && r.conclusion === 'success')
+  if (!ok) throw new ReleaseError(`no successful ${check} check run on ${sha}`)
+  return true
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────
@@ -633,11 +697,22 @@ export async function main(argv) {
       const number = await releasePr({ repo: repository(), version: need(flags, 'version'), branch: need(flags, 'branch'), findOnly: flags['find-only'] === true })
       return number === null ? '' : String(number)
     }
-    case 'merge-pr': {
+    case 'auto-merge': {
       const number = need(flags, 'number')
       if (!/^\d+$/.test(number)) throw new ReleaseError(`--number '${number}' is not a plain number`, 2)
-      const minutes = Number(flags['timeout-minutes'] ?? 30)
-      return mergePr({ repo: repository(), number, timeoutMs: minutes * 60 * 1000 })
+      const outcome = await autoMerge({ repo: repository(), number, check: typeof flags.check === 'string' ? flags.check : 'verify' })
+      console.error(`release PR #${number}: ${outcome}`)
+      return outcome
+    }
+    case 'continuation': {
+      const event = JSON.parse(readFileSync(need(flags, 'event'), 'utf8'))
+      return continuationVersion(event) ?? ''
+    }
+    case 'check-passed': {
+      const sha = need(flags, 'sha')
+      if (!/^[0-9a-f]{40}$/.test(sha)) throw new ReleaseError(`--sha '${sha}' is not a 40-hex commit`, 2)
+      await checkPassed({ repo: repository(), sha, check: need(flags, 'check') })
+      return ''
     }
     default:
       throw new ReleaseError(`unknown command '${command ?? ''}'`, 2)
