@@ -5,14 +5,17 @@
 # Commits since the last tag (.github/release/release.mjs). A release PR
 # writes it into the three places that must agree — __version__,
 # package.xml, and a new top entry in debian/changelog.in listing the commit
-# subjects (bridge-version.mjs) — and merges itself once the required
-# `verify` check, the suite on every distribution, passes. The merge commit
-# is tagged and packaged once. ci/package.sh already installs every package
-# in its own distribution's container, and proves the other suites refuse it
-# (apt/verify-suites.sh), so the build is checked before anything is
-# published. The packages and SHA256SUMS become the GitHub release, uploaded
-# with this workflow's GITHUB_TOKEN, because the ops repository refuses any
-# other uploader. Then the ops repository is asked to publish them to apt.
+# subjects (bridge-version.mjs) — and the button run turns on GitHub
+# auto-merge and ends. GitHub runs the required `verify` check, the suite on
+# every distribution, and merges the PR once it passes; that merge starts
+# this workflow again (the `pull_request: closed` trigger), which tags the
+# merged commit and packages once. ci/package.sh already installs every
+# package in its own distribution's container, and proves the other suites
+# refuse it (apt/verify-suites.sh), so the build is checked before anything
+# is published. The packages and SHA256SUMS become the GitHub release,
+# uploaded with this workflow's GITHUB_TOKEN, because the ops repository
+# refuses any other uploader. Then the ops repository is asked to publish
+# them to apt.
 #
 # That publish is no longer a separate decision. A robot takes a new version
 # within minutes, and reprepro refuses a second build of a version, so the
@@ -21,9 +24,9 @@
 # before.
 #
 # A run that failed can be started again: an open release PR is reused and
-# rebuilt on the current `main`, a merged release commit is tagged, a tag
-# already on HEAD continues that release, and a release with only some of its
-# packages is completed --
+# rebuilt on the current `main` (auto-merge enabled again), a merged release
+# commit is tagged, a tag already on HEAD continues that release, and a
+# release with only some of its packages is completed --
 # safe because fetch-bridge-release.sh on the ops side wants exactly three
 # `.deb` files plus SHA256SUMS, so a release short a package was never
 # published to apt in the meantime, only sitting on GitHub incomplete.
@@ -37,6 +40,12 @@ on:
         type: choice
         options: [auto, patch, minor, major]
         default: auto
+  # The second half of a release: the App merged the release PR, so this run
+  # tags and packages. A normal pull request closed ends green and does
+  # nothing (continuation answers nothing).
+  pull_request:
+    types: [closed]
+    branches: [main]
 
 concurrency:
   group: release
@@ -51,15 +60,18 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tagged: ${{ steps.version.outputs.tagged }}
+      continue: ${{ steps.version.outputs.continue }}
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.event_name == 'pull_request' && 'main' || github.sha }}
           fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
           node-version: 22
           package-manager-cache: false
       - name: main, and nothing but main
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
           [ "$GITHUB_REF" = refs/heads/main ] || { echo "Release runs on main, not $GITHUB_REF" >&2; exit 1; }
@@ -71,10 +83,30 @@ jobs:
           BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The merge that starts this run. `continuation` refuses a
+            # release branch from a fork or merged by a person; a normal
+            # pull request closed prints nothing and every later job skips.
+            version="$(node .github/release/release.mjs continuation --event "$GITHUB_EVENT_PATH")"
+            if [ -z "$version" ]; then
+              echo "continue=false" >> "$GITHUB_OUTPUT"
+              echo "version=" >> "$GITHUB_OUTPUT"
+              echo "tagged=false" >> "$GITHUB_OUTPUT"
+              echo "a pull request closed; nothing to release"
+              exit 0
+            fi
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "continue=true" >> "$GITHUB_OUTPUT"
+            tag="$(node .github/release/release.mjs tag-at-head)"
+            if [ -n "$tag" ]; then echo "tagged=true" >> "$GITHUB_OUTPUT"; else echo "tagged=false" >> "$GITHUB_OUTPUT"; fi
+            echo "$version continues from the merged release PR"
+            exit 0
+          fi
           tag="$(node .github/release/release.mjs tag-at-head)"
           if [ -n "$tag" ]; then
             echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
             echo "tagged=true" >> "$GITHUB_OUTPUT"
+            echo "continue=true" >> "$GITHUB_OUTPUT"
             echo "HEAD already carries $tag: continuing that release"
           else
             # Assign, then echo: under `set -e`, a command substitution that
@@ -82,19 +114,23 @@ jobs:
             version="$(node .github/release/release.mjs next --bump "$BUMP")"
             echo "version=$version" >> "$GITHUB_OUTPUT"
             echo "tagged=false" >> "$GITHUB_OUTPUT"
+            echo "continue=true" >> "$GITHUB_OUTPUT"
           fi
 
   release-commit:
     needs: prepare
+    if: ${{ needs.prepare.outputs.continue == 'true' }}
     runs-on: ubuntu-latest
     outputs:
       commit: ${{ steps.commit.outputs.commit }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
       TAGGED: ${{ needs.prepare.outputs.tagged }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: ${{ github.event_name == 'pull_request' && 'main' || github.sha }}
           fetch-depth: 0
           # A persisted credential would push the branch as
           # github-actions[bot], and no check would ever run on the PR.
@@ -112,6 +148,8 @@ jobs:
           repositories: bridge
           permission-contents: write
           permission-pull-requests: write
+          # auto-merge reads the release PR's check runs, and check-passed
+          # reads them again before the continuation tags.
           permission-checks: read
       - name: the release commit, through a pull request
         id: commit
@@ -119,6 +157,18 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
         run: |
           set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            # The continuation: the merge already happened, so the release
+            # commit is on main. Belt and braces before the tag: the merged
+            # head passed its required check.
+            commit="$(node .github/release/release.mjs release-commit --version "$VERSION")"
+            if [ -z "$commit" ]; then
+              echo "the merged release commit for $VERSION is not on main" >&2; exit 1
+            fi
+            node .github/release/release.mjs check-passed --sha "$PR_HEAD_SHA" --check verify
+            echo "commit=$commit" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$TAGGED" = true ]; then
             echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"; exit 0
           fi
@@ -130,7 +180,7 @@ jobs:
           # Past the two early exits the branch is rebuilt every time on this
           # job's HEAD, which is current main. A failed run leaves a release PR
           # that main soon moves past, or one carrying a red check, and
-          # merge-pr refuses both for ever -- reusing such a PR untouched makes
+          # auto-merge refuses both for ever -- reusing such a PR untouched makes
           # every later run fail the same way. The force-push puts it back on
           # today's main and restarts its required check.
           git switch -q -c "$branch"
@@ -146,16 +196,23 @@ jobs:
           # one, and opens a PR when there is not.
           number="$(node .github/release/release.mjs release-pr --version "$VERSION" --branch "$branch")"
           echo "release PR #$number"
-          # Three distributions, then the packaging: longer than the default,
-          # and under the 60 minutes the App token minted in this job lives --
-          # a wait that outlived the token would fail on the merge call itself.
-          # Assign, then echo: a failing substitution inside `echo` leaves
-          # echo's own exit status, which is 0.
-          commit="$(node .github/release/release.mjs merge-pr --number "$number" --timeout-minutes 45)"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          # Auto-merge ends this run at the open PR: no job waits for the
+          # check any more. The merge starts this workflow again.
+          outcome="$(node .github/release/release.mjs auto-merge --number "$number")"
+          if [ "$outcome" = merged ]; then
+            commit="$(node .github/release/release.mjs release-commit --version "$VERSION")"
+            echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "### release PR #$number — $VERSION"
+              echo
+              echo "Auto-merge $outcome; the release continues when it merges: https://github.com/$GITHUB_REPOSITORY/pull/$number"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   release:
     needs: [prepare, release-commit]
+    if: ${{ needs.release-commit.outputs.commit != '' }}
     runs-on: ubuntu-latest
     permissions:
       # The GitHub release is uploaded with GITHUB_TOKEN; the tag and the
