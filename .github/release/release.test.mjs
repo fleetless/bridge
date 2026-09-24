@@ -377,6 +377,10 @@ test('autoMerge: a PR behind main is refused: run Release again', async () => {
   const { api } = fake([[/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'behind', head: { sha: PR_HEAD } }]])
   await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', api }), /main moved; run Release again/)
 })
+test('autoMerge: a dirty PR (a conflict) is refused the same way', async () => {
+  const { api } = fake([[/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'dirty', head: { sha: PR_HEAD } }]])
+  await assert.rejects(autoMerge({ repo: 'fleetless/docs', number: '5', api }), /main moved; run Release again/)
+})
 test('autoMerge: a failed required check is refused at once, named', async () => {
   const { api } = fake([
     [/^GET .*\/pulls\/5$/, { state: 'open', mergeable_state: 'blocked', node_id: PR_NODE, head: { sha: PR_HEAD } }],
