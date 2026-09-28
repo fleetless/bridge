@@ -330,23 +330,25 @@ def test_a_job_update_queued_during_a_disconnect_is_delivered_on_reconnect():
     assert box["update"]["result"] == {"sequence": [0, 1, 1, 2, 3]}
 
 
-def test_a_chatty_backlog_queued_during_a_disconnect_delivers_only_the_latest_feedback_and_the_result():
-    """2m, deliberately overturning what this test used to assert.
+def test_a_chatty_backlog_that_finishes_while_disconnected_delivers_only_the_result():
+    """2m, deliberately overturning what this test used to assert a second
+    time.
 
-    An earlier version pushed these same five updates and asserted **all
-    five** arrived — the whole feedback history delivered late rather than
-    summarized away, per `JobUpdateQueue`'s own drop-nothing-for-everything
-    rationale. True of *results*, false of *feedback*: a chatty action
-    publishing at 10 Hz through a long outage grows that queue without
-    bound — `MAX_TRACKED_JOBS` counts jobs, not updates per job, and never
-    catches it.
-
-    The fix trades completeness for a bound: only the **latest** non-terminal
-    update per job is queued; the ones it replaces are genuinely gone, not
-    merely summarized — this is not a bug to "fix back" by restoring full
-    feedback fidelity. Only the terminal update stays drop-nothing, which is
-    why `i in (0, 1, 2)` never reach the wire and `i in (3, 4)` — the latest
-    feedback and the result — both do."""
+    2m's version of this test (see
+    `test_non_terminal_updates_for_the_same_job_coalesce_to_the_latest` in
+    test_jobs.py) pushed these same five updates and asserted **two**
+    arrived — the latest coalesced "running" frame (i=3) and the terminal
+    result (i=4). That was already an improvement over an earlier version
+    that delivered all five, but it is still one frame more than the
+    outcome carries any information for: once the job's real result is
+    known, the "running" frame immediately ahead of it says nothing the
+    result does not already say better, and a caller watching the wire
+    would see the job reported "still running" for one frame, immediately
+    contradicted by the frame right behind it. The fix
+    (`JobUpdateQueue._push` in jobs.py) makes a job's terminal update
+    collapse its own still-pending non-terminal marker, not just future
+    non-terminal arrivals — so `i in (0, 1, 2, 3)` never reach the wire and
+    only `i == 4`, the terminal result, does."""
     fake_ros = FakeRos()
     box = {"updates": []}
 
@@ -371,22 +373,93 @@ def test_a_chatty_backlog_queued_during_a_disconnect_delivers_only_the_latest_fe
     async def second_connection(session):
         await session.recv_hello()
         await session.accept()
-        for _ in range(2):
-            box["updates"].append(await session.recv_job_update())
+        box["updates"].append(await session.recv_job_update())
         await session.drain()
 
     async def scenario():
         async with FakeCloud(sequence(first_connection, second_connection)) as cloud:
             client = make_client(cloud, ros=fake_ros)
-            await run_until(client, lambda: len(box["updates"]) >= 2)
+            await run_until(client, lambda: len(box["updates"]) >= 1)
 
     asyncio.run(scenario())
-    # Only the latest of the four "running" frames (i=3) and the terminal
-    # result (i=4) — i=0,1,2 were coalesced away, on purpose.
-    assert [u["timestamp_ms"] for u in box["updates"]] == [3, 4]
-    assert box["updates"][0]["state"] == "running"
-    assert box["updates"][0]["feedback"] == {"step": 3}
-    assert box["updates"][-1]["state"] == "succeeded"
+    # Only the terminal result (i=4) — i=0..3, including the latest
+    # coalesced "running" frame, were collapsed away, on purpose.
+    assert [u["timestamp_ms"] for u in box["updates"]] == [4]
+    assert box["updates"][0]["state"] == "succeeded"
+    assert box["updates"][0]["result"] == {"ok": True}
+
+
+def test_a_job_that_finishes_during_a_disconnect_delivers_only_its_terminal_update():
+    """Dead-zone collapsing (jobs.py), at the wire level: a job that
+    heartbeats a couple of times while disconnected and then genuinely
+    finishes must deliver **one** `job_update` on reconnect — its terminal
+    outcome — never the stale `running` marker first, contradicted by the
+    real result right behind it. Sibling to the "chatty backlog" test
+    above, which proves the coalescing of *several* non-terminal updates;
+    this one proves a *terminal* update collapses whatever non-terminal
+    marker was still pending for the same job, not merely future
+    non-terminal arrivals."""
+    fake_ros = FakeRos()
+    box = {"updates": []}
+
+    async def first_connection(session):
+        await session.recv_hello()
+        await session.accept()
+        await session.close(1000)
+        loop = asyncio.get_event_loop()
+        fake_ros.jobs.updates.put_threadsafe(
+            loop,
+            JobUpdate(
+                job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+                slug="drive_to",
+                state="running",
+                timestamp_ms=1,
+                progress=0.4,
+            ),
+        )
+        fake_ros.jobs.updates.put_threadsafe(
+            loop,
+            JobUpdate(
+                job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+                slug="drive_to",
+                state="running",
+                timestamp_ms=2,
+                progress=0.8,
+            ),
+        )
+        fake_ros.jobs.updates.put_threadsafe(
+            loop,
+            JobUpdate(
+                job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+                slug="drive_to",
+                state="succeeded",
+                timestamp_ms=3,
+                result={"ok": True},
+            ),
+        )
+
+    async def second_connection(session):
+        await session.recv_hello()
+        await session.accept()
+        box["updates"].append(await session.recv_job_update())
+        # Same pattern as the sibling tests above: hold the connection open
+        # (tolerant of anything else that might land, e.g. a link_mode
+        # frame) rather than asserting silence with a timing-sensitive
+        # timeout — the real proof that there is exactly one `job_update`
+        # is the assertion on `box["updates"]`'s length below, backed by
+        # `JobUpdateQueue`'s own guarantee (test_jobs.py) that a terminal
+        # update retires its job's pending non-terminal marker.
+        await session.drain()
+
+    async def scenario():
+        async with FakeCloud(sequence(first_connection, second_connection)) as cloud:
+            client = make_client(cloud, ros=fake_ros)
+            await run_until(client, lambda: len(box["updates"]) >= 1)
+
+    asyncio.run(scenario())
+    assert len(box["updates"]) == 1
+    assert box["updates"][0]["state"] == "succeeded"
+    assert box["updates"][0]["timestamp_ms"] == 3
 
 
 def test_terminal_updates_for_different_jobs_stay_drop_nothing_and_in_order():

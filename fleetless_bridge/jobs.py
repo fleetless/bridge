@@ -96,6 +96,20 @@ class JobUpdateQueue:
     already holding a marker overwrites `_pending_feedback[job_id]` in
     place rather than queuing a second position.
 
+    **A job's terminal update also retires its own pending marker, the
+    moment it is queued** — not only later non-terminal arrivals collapse
+    into one another, a *terminal* arrival collapses whatever non-terminal
+    marker was already waiting for that job into itself. Without this, a
+    job that produced a heartbeat or two while
+    disconnected and then genuinely finished would queue *both*: the stale
+    `running` marker and the real outcome, delivered in that order on
+    reconnect — a caller watching the wire would see the job "still
+    running" for one frame, immediately contradicted by the frame right
+    behind it. `requeue_front` closes the same gap for a send that failed
+    and is being retried: a stale non-terminal `update` handed back to it
+    must not jump back in front of a terminal update for the same job that
+    arrived while the failed send was in flight.
+
     `on_put` is the optional wake hook `ros_runtime.SampleQueue` documents,
     for the same reason and with the same rule: a settable attribute, never
     an import, so nothing here knows the writer exists."""
@@ -111,6 +125,18 @@ class JobUpdateQueue:
 
     def _push(self, update: JobUpdate) -> None:
         if update.state in _TERMINAL_STATES:
+            # A job that just reached its outcome must deliver that outcome
+            # alone — not a stale `running` marker immediately ahead of it,
+            # which would say nothing the outcome does not already say
+            # better. If this job still has a pending
+            # non-terminal marker sitting in `_items`, its *position* is
+            # retired here too, not merely its `_pending_feedback` entry —
+            # leaving the bare job_id behind in the deque would let
+            # `_resolve` pop from a `_pending_feedback` this line already
+            # emptied, and (worse) would still hand out a `running` frame
+            # ahead of the terminal one it was meant to collapse into.
+            if self._pending_feedback.pop(update.job_id, None) is not None:
+                self._items.remove(update.job_id)
             self._items.append(update)
         elif update.job_id not in self._pending_feedback:
             # First non-terminal update pending for this job — claim a
@@ -162,13 +188,25 @@ class JobUpdateQueue:
         either double-deliver or silently drop the newer one on the next
         `get()`. The fresher update already **is** the correct thing to
         resend, so the stale one is dropped instead: exactly the coalescing
-        this queue does for a first arrival, applied to a retry."""
+        this queue does for a first arrival, applied to a retry.
+
+        The same drop applies, for a different reason, when this job's
+        *terminal* update landed while the failed send was in flight: `get()`
+        already removed job_id's marker and `_pending_feedback` entry before
+        `_push` ran for the terminal update, so the "superseded" check just
+        below finds nothing there and would otherwise let this stale
+        `running` copy jump back in *ahead of* the terminal update `_push`
+        already appended — exactly the stale-frame-before-the-real-result
+        case the dead-zone collapse (`_push`) exists to rule out, reopened
+        here if this method did not also check for it."""
         if update.state in _TERMINAL_STATES:
             self._items.appendleft(update)
             self._not_empty.set()
             return
         if update.job_id in self._pending_feedback:
             return  # superseded while the failed send was in flight — drop the stale copy
+        if any(isinstance(item, JobUpdate) and item.job_id == update.job_id for item in self._items):
+            return  # this job's terminal update is already queued — see docstring above
         self._items.appendleft(update.job_id)
         self._pending_feedback[update.job_id] = update
         self._not_empty.set()
@@ -218,6 +256,19 @@ class JobManager:
         the defensive busy-guard both key off this."""
         with self._lock:
             return self._by_slug.get(slug)
+
+    def slug_for(self, job_id: str) -> Optional[str]:
+        """The slug `job_id` is running on, or `None` if this manager is not
+        holding it (already delivered, or never started) — the inverse of
+        `running_job_id`, for callers that only have a `job_id` to start
+        from. `ros_runtime.py`'s heartbeat and action-server-liveness ticks
+        both walk `_active_goals` (job_id -> goal handle) and need each
+        job's slug to reach its `_ActionEntry`; `_active_goals` itself does
+        not carry one, so this is where that lookup happens instead of a
+        second, shadow copy of the same fact kept in step by hand."""
+        with self._lock:
+            record = self._jobs.get(job_id)
+            return record.slug if record is not None else None
 
     def tracked_count(self) -> int:
         """How many jobs `_jobs` currently holds — every job not yet

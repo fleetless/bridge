@@ -39,6 +39,23 @@ def test_a_fresh_manager_has_no_active_jobs():
     assert JobManager().active_jobs() == []
 
 
+def test_slug_for_names_the_slug_of_a_held_job():
+    jobs = JobManager()
+    jobs.start("job-1", "drive_to", "action")
+    assert jobs.slug_for("job-1") == "drive_to"
+
+
+def test_slug_for_of_an_unknown_job_id_is_none():
+    assert JobManager().slug_for("no-such-job") is None
+
+
+def test_slug_for_of_a_delivered_job_is_none():
+    jobs = JobManager()
+    jobs.start("job-1", "drive_to", "action")
+    jobs.finish("job-1", "succeeded")
+    assert jobs.slug_for("job-1") is None
+
+
 def test_tracked_count_reflects_every_job_still_held():
     """`tracked_count()` bounds `RosRuntime`'s admission guard — a
     terminal-but-undelivered job (still owed a report) counts the same as
@@ -254,6 +271,94 @@ def test_non_terminal_updates_for_the_same_job_coalesce_to_the_latest():
     received = asyncio.run(scenario())
     assert received.timestamp_ms == 49
     assert received.feedback == {"step": 49}
+
+
+def test_a_terminal_update_collapses_a_pending_non_terminal_marker_for_the_same_job():
+    """The dead-zone-collapse fix: a job that heartbeats a few times while
+    disconnected and then genuinely finishes must deliver its terminal
+    update alone on reconnect — not the stale `running` marker first,
+    contradicted by the real outcome right behind it."""
+
+    async def scenario():
+        jobs = JobManager()
+        loop = asyncio.get_event_loop()
+        jobs.updates.put_threadsafe(
+            loop,
+            JobUpdate(job_id="job-1", slug="drive_to", state="running", timestamp_ms=1, progress=0.3),
+        )
+        jobs.updates.put_threadsafe(
+            loop,
+            JobUpdate(job_id="job-1", slug="drive_to", state="running", timestamp_ms=2, progress=0.6),
+        )
+        jobs.updates.put_threadsafe(
+            loop,
+            JobUpdate(job_id="job-1", slug="drive_to", state="succeeded", timestamp_ms=3),
+        )
+        await asyncio.sleep(0)  # let every threadsafe callback land before get()
+        received = await jobs.updates.get()
+        assert jobs.updates.empty()  # exactly one job_update — the terminal one
+        return received
+
+    received = asyncio.run(scenario())
+    assert received.state == "succeeded"
+    assert received.timestamp_ms == 3
+
+
+def test_a_terminal_update_for_one_job_does_not_touch_another_jobs_marker():
+    """The collapse is per-job — a second job's own pending non-terminal
+    marker must survive a first job's terminal update landing beside it."""
+
+    async def scenario():
+        jobs = JobManager()
+        loop = asyncio.get_event_loop()
+        jobs.updates.put_threadsafe(
+            loop, JobUpdate(job_id="job-1", slug="drive_to", state="running", timestamp_ms=1)
+        )
+        jobs.updates.put_threadsafe(
+            loop, JobUpdate(job_id="job-2", slug="dock", state="running", timestamp_ms=2)
+        )
+        jobs.updates.put_threadsafe(
+            loop, JobUpdate(job_id="job-1", slug="drive_to", state="succeeded", timestamp_ms=3)
+        )
+        await asyncio.sleep(0)
+        received = [await jobs.updates.get() for _ in range(2)]
+        assert jobs.updates.empty()
+        return received
+
+    received = asyncio.run(scenario())
+    by_job = {u.job_id: u for u in received}
+    assert by_job["job-1"].state == "succeeded"
+    assert by_job["job-2"].state == "running"
+
+
+def test_requeue_front_of_a_stale_non_terminal_update_is_dropped_if_a_terminal_superseded_it():
+    """The other half of the collapse race `requeue_front` has to resolve:
+    `get()` already removed job-1's marker and dict entry, so a *terminal*
+    update for the same job landing before the failed send is requeued
+    finds nothing to collapse against in `_push` and is queued plainly.
+    Requeuing the stale `running` copy afterward must not let it jump back
+    in front of that terminal update."""
+
+    async def scenario():
+        jobs = JobManager()
+        loop = asyncio.get_event_loop()
+        jobs.updates.put_threadsafe(
+            loop, JobUpdate(job_id="job-1", slug="drive_to", state="running", timestamp_ms=1)
+        )
+        stale = await jobs.updates.get()  # the send for this one "fails"
+        # The job's real outcome lands for real while the failed send is in flight.
+        jobs.updates.put_threadsafe(
+            loop, JobUpdate(job_id="job-1", slug="drive_to", state="succeeded", timestamp_ms=2)
+        )
+        await asyncio.sleep(0)  # let the threadsafe callback land
+        jobs.updates.requeue_front(stale)
+        received = await jobs.updates.get()
+        assert jobs.updates.empty()  # the stale running copy did not also queue itself
+        return received
+
+    received = asyncio.run(scenario())
+    assert received.state == "succeeded"
+    assert received.timestamp_ms == 2
 
 
 def test_requeue_front_of_a_terminal_update_puts_it_back_ahead_of_the_rest():
