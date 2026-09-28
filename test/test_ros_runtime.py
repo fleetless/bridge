@@ -1791,14 +1791,32 @@ def test_an_action_server_vanishing_for_3s_straight_settles_lost_and_frees_the_s
     for the acceptance gap."""
 
     async def body(rt):
-        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        stop_server = _start_fibonacci_server(steps=60, step_delay=0.05)
         await rt.apply_actions(by_slug([_action_cfg("count")]))
         await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
         first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
         assert first.state == "running"  # accepted — now genuinely in flight
 
-        stop_server()  # the action server vanishes mid-goal, deliberately
+        # Confirmed ready, not merely accepted: goal acceptance only needs the
+        # goal-service entity matched, and the liveness check's own debounce
+        # deliberately does not start counting until server_is_ready() has
+        # read True at least once (see `_action_liveness_confirmed_ready`'s
+        # doc comment) — server_is_ready() additionally waits on the
+        # cancel/result services and the feedback/status topics, which can
+        # take an unpredictable extra stretch to finish matching on a loaded
+        # machine. Seeded directly rather than polled for real: this test is
+        # about the debounce once a job is known ready, not about how long
+        # real discovery happens to take on whatever machine runs the suite.
+        rt._action_liveness_confirmed_ready.add("job-1")
+
+        # Started here, not after stop_server() returns: a node destroyed
+        # while its callback thread is mid-`time.sleep` (the
+        # execute_callback loop above) can take a couple of real seconds to
+        # actually tear down — counting only the time after that teardown
+        # completes would undercount the debounce by however long teardown
+        # itself took.
         settle_started = time.monotonic()
+        stop_server()  # the action server vanishes mid-goal, deliberately
         updates = await _drain_until_terminal(rt, timeout=10.0)
         elapsed = time.monotonic() - settle_started
         rt.jobs.mark_delivered(updates[-1])
@@ -1833,19 +1851,43 @@ def test_an_action_server_that_recovers_within_1s_is_never_declared_lost():
     debounce could ever expire, so nothing about job-1 may say `lost`."""
 
     async def body(rt):
-        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        stop_server = _start_fibonacci_server(steps=60, step_delay=0.05)
         await rt.apply_actions(by_slug([_action_cfg("count")]))
         await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
         first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
         assert first.state == "running"
 
+        # Confirmed ready first — see the sibling test above for why: the
+        # debounce does not start counting until this has read True once.
+        # Seeded directly rather than polled for real — real discovery of
+        # every entity server_is_ready() waits on can take an unpredictable
+        # multi-second stretch on a loaded machine, and this test is about
+        # the debounce surviving a short outage, not about real discovery
+        # timing.
+        rt._action_liveness_confirmed_ready.add("job-1")
+
+        # Started here, not after stop_server() returns — see the sibling
+        # test above: a node destroyed while its callback thread is
+        # mid-`time.sleep` can itself take a couple of real seconds to tear
+        # down. Sleeping a *fixed* 1.0s after that teardown would let the
+        # real outage run well past the 3s debounce purely on teardown time;
+        # topping up to 1.0s *total* since the outage began keeps this test's
+        # own "about 1s, a third of the debounce" premise true regardless of
+        # how long stop_server() itself takes.
+        outage_started = time.monotonic()
         stop_server()
-        await asyncio.sleep(1.0)  # well short of the 3s debounce
-        stop_new_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        remaining = 1.0 - (time.monotonic() - outage_started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        stop_new_server = _start_fibonacci_server(steps=60, step_delay=0.05)
         try:
-            wait_until(lambda: rt._actions["count"].client.server_is_ready())
-            # A couple more watchdog ticks to (not) act on the now-ready server.
-            await asyncio.sleep(0.3)
+            # A couple more watchdog ticks to (not) act on the now-recovered
+            # server — not waiting on real server_is_ready() here either, for
+            # the same reason as above; the fixed watchdog cadence
+            # (`FAILSAFE_CHECK_INTERVAL_S`) is what this test's own debounce
+            # logic actually reacts to, and this comfortably outlasts several
+            # ticks of it either way.
+            await asyncio.sleep(0.5)
             pending = []
             while True:
                 update = rt.jobs.updates.try_get()
@@ -1870,11 +1912,15 @@ def test_a_late_result_after_action_server_lost_is_silently_ignored():
     raise or reconstruct a second frame."""
 
     async def body(rt):
-        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        stop_server = _start_fibonacci_server(steps=60, step_delay=0.05)
         await rt.apply_actions(by_slug([_action_cfg("count")]))
         await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
         first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
         assert first.state == "running"
+
+        # Confirmed ready first — see the vanishing-server test above for why
+        # (seeded directly, not polled for real — same reasoning there).
+        rt._action_liveness_confirmed_ready.add("job-1")
 
         stop_server()
         updates = await _drain_until_terminal(rt, timeout=10.0)
@@ -1921,6 +1967,12 @@ def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job
         await rt.apply_actions(by_slug([_action_cfg("count")]))
         rt.jobs.start("job-1", "count", "action")
         rt._active_goals["job-1"] = object()
+        # This test injects the job directly rather than through a real
+        # invoke, so it never earns a real `server_is_ready() == True`
+        # observation on its own — seeded here to stand in for that, since
+        # the debounce does not start counting until a job has been
+        # confirmed ready at least once (`_action_liveness_confirmed_ready`).
+        rt._action_liveness_confirmed_ready.add("job-1")
 
         def _raise():
             raise RuntimeError("synthetic server_is_ready failure")
