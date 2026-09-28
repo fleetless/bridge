@@ -91,9 +91,9 @@ than what this bridge's own serializer produces (`strict=False`).
 ## Which version these came from
 
     Source: @fleetless/contracts@3.0.0
-            at commit 08b5fe4
+            at commit 8d49656
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
-            Next release: 4.1.0 (unreleased; the release chore records the tag)
+            Next release: 4.0.0 (unreleased; pre-release 4.0.0-next.1 is 08b5fe4)
 
 **This pin is provisional and currently names a version these bytes did not
 come from.** They were vendored from the contracts checkout that carries
@@ -103,7 +103,7 @@ touched bridge wire schemas, which is why the pin below had stayed at
 `3.0.0` unchanged since that release). The sync test compares against
 whatever `$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own
 `package.json` version against this line, so a pre-release checkout still
-on `3.0.0` agrees with it. **Set this to `4.1.0`, or whatever version the
+on `3.0.0` agrees with it. **Set this to `4.0.0`, or whatever version the
 release chore actually tags, once contracts releases it**, and re-run the
 suite against the published package; until then this line records where
 the bytes came from, not a version anyone else can resolve.
