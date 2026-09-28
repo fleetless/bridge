@@ -57,6 +57,7 @@ from fleetless_bridge.protocol import (
     ServiceConfig,
     bridge_asset_progress_message,
 )
+from fleetless_bridge import ros_runtime
 from fleetless_bridge.ros_runtime import (
     ACTION_SERVER_LIVENESS_DEBOUNCE_S,
     ASSET_UPLOAD_RATE_LIMIT_MAX_RETRIES,
@@ -1991,6 +1992,58 @@ def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job
     assert updates[-1].error[0] == "action_server_lost"
     exception_records = [r for r in handler.records if r.exc_info is not None]
     assert len(exception_records) == 1  # once for the whole debounce, not once per tick
+
+
+def test_a_server_never_seen_ready_is_still_declared_lost_after_the_discovery_grace(monkeypatch):
+    """The confirmed-ready gate must not become a way to stay `running`
+    forever. A server that dies (or whose `server_is_ready()` raises) before
+    the liveness check ever saw it ready is the same dead server as one that
+    dies later — and with a 1 Hz heartbeat restating `running`, nothing in
+    the cloud would ever contradict it either. After
+    `ACTION_SERVER_DISCOVERY_GRACE_S` without a single ready reading, the
+    debounce starts counting anyway. Shrunk here so the test does not wait
+    the production grace out."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_DISCOVERY_GRACE_S", 0.5)
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        rt.jobs.start("job-1", "count", "action")
+        rt._active_goals["job-1"] = object()
+        rt._actions["count"].client.server_is_ready = lambda: False
+        started = time.monotonic()
+        updates = await _drain_until_terminal(rt, timeout=10.0)
+        return updates, time.monotonic() - started
+
+    updates, elapsed = run(body)
+    assert updates[-1].state == "lost"
+    assert updates[-1].error[0] == "action_server_lost"
+    assert 0.5 + ACTION_SERVER_LIVENESS_DEBOUNCE_S <= elapsed < 8.0
+
+
+def test_a_job_that_ends_normally_leaves_no_liveness_bookkeeping_behind():
+    """Every accepted goal passes through `_check_action_server_liveness`,
+    so whatever it records per job must go when the job ends by its own
+    result — or the bridge keeps one entry per job it ever ran, for as long
+    as it runs."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=2, step_delay=0.02)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            await rt.invoke("job-1", "count", {"order": 3}, patience_ms=5000)
+            updates = await _drain_until_terminal(rt)
+            await asyncio.sleep(0.1)  # a few more watchdog ticks
+        finally:
+            stop_server()
+        return updates, rt
+
+    updates, rt = run(body)
+    assert updates[-1].state == "succeeded"
+    assert "job-1" not in rt._action_liveness_confirmed_ready
+    assert "job-1" not in rt._action_liveness_since
+    assert "job-1" not in rt._action_liveness_logged
+    assert "job-1" not in rt._action_liveness_first_tick
 
 
 # --- services: apply_services, the diff -----------------------------------------
