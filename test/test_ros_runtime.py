@@ -58,9 +58,11 @@ from fleetless_bridge.protocol import (
     bridge_asset_progress_message,
 )
 from fleetless_bridge.ros_runtime import (
+    ACTION_SERVER_LIVENESS_DEBOUNCE_S,
     ASSET_UPLOAD_RATE_LIMIT_MAX_RETRIES,
     DAE_MAX_INTERNAL_REFERENCES_PER_SYNC,
     DEFAULT_URDF_TOPIC,
+    JOB_HEARTBEAT_INTERVAL_MS,
     MESH_MAX_FAILED_PER_SYNC,
     PARTING_FAILSAFE_ACK_TIMEOUT_S,
     URDF_ASSET_NAME,
@@ -71,6 +73,7 @@ from fleetless_bridge.ros_runtime import (
     RosRuntime,
     UploadResult,
 )
+from fleetless_bridge import sampling
 from schemas import validate_frame
 
 FIBONACCI_TYPE = "example_interfaces/action/Fibonacci"
@@ -1064,10 +1067,22 @@ def test_a_goal_runs_to_completion_even_if_nobody_drains_its_updates():
     """The disconnect-survival guarantee, proven at the ROS level:
     `RosRuntime` never learns whether a websocket exists, so not draining
     `rt.jobs.updates` — what a disconnected bridge looks like from here —
-    must not slow or stop the goal. Everything produced while
-    "disconnected" sits in the queue, in order, until someone looks
-    (`_pump_jobs` on reconnect, tested at the wire level in
-    test_client_jobs.py)."""
+    must not slow or stop the goal (`_pump_jobs` on reconnect, tested at
+    the wire level in test_client_jobs.py).
+
+    Updated: this used to also assert the leading `running` frame survived
+    alongside the terminal one. It no longer does — with the goal's entire
+    lifecycle (acceptance, every feedback frame, the result) running to
+    completion before anything ever calls `get()`, every non-terminal
+    update this job ever produced is still pending, uncollapsed into
+    anything but each other, when the terminal update arrives and
+    collapses that pending marker away too (jobs.py's `JobUpdateQueue._push`)
+    — a redundant frame immediately ahead of the real outcome carries no
+    information the outcome does not already carry, and that applies just
+    as much to "it was accepted" as to any later heartbeat, once a
+    terminal outcome already supersedes it before anyone was listening.
+    `updates == [terminal]` is exactly what "exactly one job_update per
+    job" promises here."""
 
     async def body(rt):
         stop_server = _start_fibonacci_server(steps=8, step_delay=0.03)
@@ -1081,10 +1096,9 @@ def test_a_goal_runs_to_completion_even_if_nobody_drains_its_updates():
             stop_server()
 
     updates = run(body)
-    assert updates[0].state == "running"  # the goal was accepted
+    assert len(updates) == 1  # the leading `running` marker collapsed into the terminal
     assert updates[-1].state == "succeeded"
     assert all(u.job_id == "job-1" for u in updates)
-    # In order — the queue is FIFO, nothing here reorders or drops.
     assert [u.timestamp_ms for u in updates] == sorted(u.timestamp_ms for u in updates)
 
 
@@ -1655,6 +1669,278 @@ def test_a_shorter_patience_ms_times_out_before_a_longer_one_on_the_same_call_sh
     assert long_elapsed > short_elapsed
 
 
+# --- 1 Hz job heartbeat (protocol 4) ----------------------------------------
+
+
+def test_the_heartbeat_restates_the_last_known_feedback_every_second():
+    """`JOB_HEARTBEAT_INTERVAL_MS` (1000, vendored from contracts): once a
+    goal has produced real feedback, every heartbeat tick after it restates
+    that same feedback — with its own, later `timestamp_ms` — for as long
+    as the action itself stays quiet. A slow-stepping Fibonacci (one
+    feedback frame at goal start, then silence for 3s before the next)
+    isolates the heartbeat's own contribution from the action's."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=1, step_delay=3.0)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            await rt.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
+            # acceptance ("running", no feedback yet) + the one real feedback
+            # frame + at least two heartbeats restating it.
+            updates = []
+            while len(updates) < 4:
+                updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=6.0))
+            return updates
+        finally:
+            stop_server()
+
+    updates = run(body)
+    with_feedback = [u for u in updates if u.state == "running" and u.feedback is not None]
+    assert len(with_feedback) >= 3  # the real frame plus at least two heartbeats
+    # Every one of them restates the same real feedback — the heartbeat
+    # never invents new content, only a later capture time for the old.
+    assert all(u.feedback == with_feedback[0].feedback for u in with_feedback)
+    timestamps = [u.timestamp_ms for u in with_feedback]
+    assert timestamps == sorted(timestamps)
+    # At least 1.5 heartbeat intervals elapsed across the frames collected —
+    # loose against real-time jitter, tight enough that it could not pass
+    # merely from the goal's own timing.
+    assert timestamps[-1] - timestamps[0] >= JOB_HEARTBEAT_INTERVAL_MS * 1.5
+
+
+def test_the_heartbeat_nulls_feedback_in_low_bandwidth_mode_but_keeps_progress():
+    """In low-bandwidth mode `feedback` is null and `progress` stays —
+    a direct call to `_emit_job_heartbeats`, not a real ROS
+    action: Fibonacci carries no `progress` field at all
+    (`test_invoking_a_configured_action_runs_a_real_goal_with_feedback_and_result`),
+    so proving "progress stays" needs a feedback shape this suite has no
+    real action type for. `rt._latest_job_feedback`/`rt._active_goals` are
+    populated by hand the same way `_on_action_feedback` would, and
+    `rt._lb_active` is the plain flag `set_low_bandwidth` itself just
+    assigns — settable directly here for the same reason `on_put` hooks
+    are settable elsewhere in this package."""
+
+    async def body(rt):
+        rt.jobs.start("job-1", "count", "action")
+        rt._active_goals["job-1"] = object()  # a dummy goal handle — never touched by the heartbeat
+        rt._latest_job_feedback["job-1"] = ({"waypoint": 3}, 0.75)
+
+        rt._lb_active = True
+        rt._emit_job_heartbeats()
+        low_bandwidth_update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+
+        rt._lb_active = False
+        rt._emit_job_heartbeats()
+        normal_update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+        return low_bandwidth_update, normal_update
+
+    low_bandwidth_update, normal_update = run(body)
+    assert low_bandwidth_update.state == "running"
+    assert low_bandwidth_update.feedback is None
+    assert low_bandwidth_update.progress == pytest.approx(0.75)  # progress stays regardless
+    assert normal_update.feedback == {"waypoint": 3}
+    assert normal_update.progress == pytest.approx(0.75)
+
+
+def test_the_heartbeats_own_timestamp_is_its_own_capture_time_not_the_feedbacks():
+    """`timestamp_ms` is the heartbeat's own capture time — restating an
+    old feedback body must not also restate its old
+    timestamp, or a heartbeat would understate exactly the staleness it
+    exists to be honest about."""
+
+    async def body(rt):
+        rt.jobs.start("job-1", "count", "action")
+        rt._active_goals["job-1"] = object()
+        rt._latest_job_feedback["job-1"] = ({"waypoint": 1}, None)
+        before = sampling.capture_timestamp_ms()
+        await asyncio.sleep(0.05)
+        rt._emit_job_heartbeats()
+        update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+        after = sampling.capture_timestamp_ms()
+        return update, before, after
+
+    update, before, after = run(body)
+    assert before < update.timestamp_ms <= after
+
+
+def test_a_settled_job_gets_no_further_heartbeat():
+    """A job not in `_active_goals` — never accepted, or already settled —
+    has nothing to heartbeat: `_emit_job_heartbeats` walks that dict alone,
+    so a job this bridge no longer believes is running is silently skipped,
+    not restated with whatever feedback it happened to leave behind."""
+
+    async def body(rt):
+        rt.jobs.start("job-1", "count", "action")
+        rt._latest_job_feedback["job-1"] = ({"waypoint": 9}, None)
+        # Deliberately not added to `_active_goals` — as if already settled.
+        rt._emit_job_heartbeats()
+        await asyncio.sleep(0.05)
+        return rt.jobs.updates.try_get()
+
+    assert run(body) is None
+
+
+# --- action server liveness: a vanished action server ends the job (protocol 4) --
+
+
+def test_an_action_server_vanishing_for_3s_straight_settles_lost_and_frees_the_slug():
+    """A goal already accepted gets no
+    timeout, but it does get a liveness check — 3s of `server_is_ready()`
+    reporting `False`, straight, settles the job `lost`/`action_server_lost`
+    and frees the slug for a new invoke, exactly like `goal_timeout` does
+    for the acceptance gap."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+        first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        assert first.state == "running"  # accepted — now genuinely in flight
+
+        stop_server()  # the action server vanishes mid-goal, deliberately
+        settle_started = time.monotonic()
+        updates = await _drain_until_terminal(rt, timeout=10.0)
+        elapsed = time.monotonic() - settle_started
+        rt.jobs.mark_delivered(updates[-1])
+
+        # The point of freeing the slug is that a retry against a server
+        # that has since come back is accepted, not "busy" — same proof
+        # shape as test_a_slug_freed_by_goal_timeout_accepts_a_new_invoke.
+        stop_new_server = _start_fibonacci_server(steps=2, step_delay=0.02)
+        try:
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            await rt.invoke("job-2", "count", {"order": 3}, patience_ms=100)
+            second_updates = await _drain_until_terminal(rt)
+        finally:
+            stop_new_server()
+        return updates, elapsed, second_updates
+
+    updates, elapsed, second_updates = run(body)
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "lost"
+    assert updates[-1].error[0] == "action_server_lost"
+    # At least the debounce itself; a generous ceiling against the shared
+    # watchdog's own cadence and test-machine jitter, not a tight bound.
+    assert ACTION_SERVER_LIVENESS_DEBOUNCE_S <= elapsed < 8.0
+    assert second_updates[-1].job_id == "job-2"
+    assert second_updates[-1].state == "succeeded"
+
+
+def test_an_action_server_that_recovers_within_1s_is_never_declared_lost():
+    """The debounce's whole point: a DDS discovery hiccup must not read as
+    a dead server. The action server here is genuinely gone for about 1s —
+    a third of `ACTION_SERVER_LIVENESS_DEBOUNCE_S` — and back before the
+    debounce could ever expire, so nothing about job-1 may say `lost`."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+        first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        assert first.state == "running"
+
+        stop_server()
+        await asyncio.sleep(1.0)  # well short of the 3s debounce
+        stop_new_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        try:
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            # A couple more watchdog ticks to (not) act on the now-ready server.
+            await asyncio.sleep(0.3)
+            pending = []
+            while True:
+                update = rt.jobs.updates.try_get()
+                if update is None:
+                    break
+                pending.append(update)
+            return pending
+        finally:
+            stop_new_server()
+
+    pending = run(body)
+    assert all(u.state != "lost" for u in pending)
+
+
+def test_a_late_result_after_action_server_lost_is_silently_ignored():
+    """Spec, "Error handling": "a late result after action_server_lost:
+    ignored by the bridge". rclpy still owns the goal handle's own
+    `get_result_async()` callback registration; it may still invoke it
+    after this bridge has already declared the server gone. Called
+    directly here — `_FakeFuture.result()` asserts it is never even
+    reached, proving the ignore check runs before anything that could
+    raise or reconstruct a second frame."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+        first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        assert first.state == "running"
+
+        stop_server()
+        updates = await _drain_until_terminal(rt, timeout=10.0)
+        assert updates[-1].state == "lost"
+        assert updates[-1].error[0] == "action_server_lost"
+
+        class _FakeFuture:
+            def result(self):
+                raise AssertionError("must not be reached — the ignore check returns first")
+
+        rt._on_action_result("job-1", "count", _FakeFuture())  # must not raise
+        await asyncio.sleep(0.1)
+        return rt.jobs.updates.try_get()
+
+    leftover = run(body)
+    assert leftover is None  # no further frame for job-1
+
+
+def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job():
+    """"server_is_ready() raising: treated as not-ready for the debounce,
+    and logged once per job" (spec, "Error handling") — not once per tick,
+    which at `FAILSAFE_CHECK_INTERVAL_S` would be hundreds of log lines for
+    one outage. `server_is_ready` is monkey-patched on the real
+    `ActionClient` instance `apply_actions` already created — an instance
+    attribute shadows the bound method for this object alone, so nothing
+    else in this test's runtime is affected."""
+    import logging
+
+    class _RecordingHandler(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _RecordingHandler()
+    ros_runtime_log = logging.getLogger("fleetless_bridge.ros_runtime")
+    ros_runtime_log.addHandler(handler)
+    original_level = ros_runtime_log.level
+    ros_runtime_log.setLevel(logging.ERROR)
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        rt.jobs.start("job-1", "count", "action")
+        rt._active_goals["job-1"] = object()
+
+        def _raise():
+            raise RuntimeError("synthetic server_is_ready failure")
+
+        rt._actions["count"].client.server_is_ready = _raise
+
+        return await _drain_until_terminal(rt, timeout=10.0)
+
+    try:
+        updates = run(body)
+    finally:
+        ros_runtime_log.removeHandler(handler)
+        ros_runtime_log.setLevel(original_level)
+
+    assert updates[-1].state == "lost"
+    assert updates[-1].error[0] == "action_server_lost"
+    exception_records = [r for r in handler.records if r.exc_info is not None]
+    assert len(exception_records) == 1  # once for the whole debounce, not once per tick
+
+
 # --- services: apply_services, the diff -----------------------------------------
 
 
@@ -1713,6 +1999,16 @@ def test_removing_a_service_slug_destroys_its_client():
 
 
 def test_invoking_a_configured_service_calls_it_and_reports_the_response():
+    """A fast, local Trigger server usually answers before this test ever
+    calls `get()` — so the `running` marker `_invoke_service` emits right
+    after dispatch is still pending, uncollapsed, when the terminal
+    `succeeded` update is queued right behind it, and the
+    dead-zone collapse (jobs.py's `JobUpdateQueue._push`) retires that
+    pending marker into the terminal, the same as it would for an action
+    (see `test_a_goal_runs_to_completion_even_if_nobody_drains_its_updates`).
+    `updates == [terminal]` either way — a service call never had feedback
+    or progress for the collapse to lose anything of."""
+
     async def body(rt):
         stop_server = _start_trigger_server(success=True, message="all good")
         try:
@@ -1723,9 +2019,7 @@ def test_invoking_a_configured_service_calls_it_and_reports_the_response():
             stop_server()
 
     updates = run(body)
-    # running (dispatched) then succeeded (the response) — a service call has
-    # no feedback/progress, just the two.
-    assert [u.state for u in updates] == ["running", "succeeded"]
+    assert updates[-1].state == "succeeded"
     assert updates[-1].result == {"success": True, "message": "all good"}
 
 

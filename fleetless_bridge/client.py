@@ -1876,6 +1876,16 @@ class BridgeClient:
             # not once the pump tasks below have finished unwinding.
             if self._ros is not None:
                 self._ros.set_connected(False)
+                # Deliberately not a `cancel_job` for every job still
+                # running: Fleetless is not a safety layer, and a link drop
+                # is not evidence the robot should stop — the robot's own
+                # reflexes, e-stop and controller timeouts are what a
+                # genuinely uncontrollable robot depends on. A running job
+                # simply keeps running
+                # through a dead zone; only a vanished *action server* ends
+                # one, via `_check_action_server_liveness`, and even that
+                # never cancels (there is no server left to cancel on).
+                #
                 # A dropped connection must not leave the robot publishing
                 # into a room nobody can tell it to stop —
                 # torn down here, in the same breath as set_connected(False),

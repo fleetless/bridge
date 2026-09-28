@@ -171,6 +171,19 @@ DEFAULT_SAMPLE_QUEUE_SIZE = 1000
 # margin of the deadline, never late by more than that.
 FAILSAFE_CHECK_INTERVAL_S = 0.01
 
+# How long `server_is_ready()` must report "not ready" *without a single
+# break* before a running goal's action server is declared gone
+# (`_check_action_server_liveness`, ticked from the same shared watchdog as
+# `_check_goal_timeouts`/`_check_service_timeouts` above). A single missed
+# tick is not evidence of anything: DDS discovery is a real, unsynchronised
+# process between two separate nodes, and a server that is genuinely still
+# there can look briefly unmatched to the client for reasons that have
+# nothing to do with it having died. 3 s is comfortably above any discovery
+# hiccup this package has measured and short enough that a robot whose
+# action server really did crash mid-goal is not left silently "running"
+# for long: a job never stays "running" because nobody ever contradicts it.
+ACTION_SERVER_LIVENESS_DEBOUNCE_S = 3.0
+
 # How long a removed publisher's handle outlives its last failsafe. A
 # reliable writer resends a sample its readers have not acknowledged; a
 # destroyed one resends nothing, so a failsafe dropped on first send and
@@ -282,6 +295,16 @@ with (pathlib.Path(__file__).parent / "contracts_constants.json").open() as _f:
 # conversation is exactly the thing that drifts") this package has been
 # bitten by twice already. Matches `DEFAULT_URDF_TOPIC`'s basename.
 URDF_ASSET_NAME = _CONTRACTS_CONSTANTS["URDF_ASSET_NAME"]
+
+# How often the bridge restates every running job's own last-known state —
+# protocol 4 (contracts' `JOB_HEARTBEAT_INTERVAL_MS`): the cloud's own
+# silence watchdog bounds the heartbeat, not the action, once a goal is
+# accepted, so a healthy action that simply has
+# nothing new to say must not go quiet on the wire even though nothing
+# changed. Read from the vendored constants, not hand-typed, for the same
+# reason every other constant on this page is: two `1000`s agreeing by
+# coincidence is exactly the drift this file exists to rule out.
+JOB_HEARTBEAT_INTERVAL_MS = _CONTRACTS_CONSTANTS["JOB_HEARTBEAT_INTERVAL_MS"]
 
 # The header *names* a `POST` to the cloud's per-sync upload URL carries,
 # from contracts' `ASSET_UPLOAD_HEADERS` — used in `_upload_asset_bytes`
@@ -1103,6 +1126,16 @@ class RosRuntime:
         # job_id -> the rclpy goal handle currently pursuing it — cancel-by-
         # slug looks the job up in `self.jobs` first, then the handle here.
         self._active_goals: Dict[str, object] = {}
+        # job_id -> (feedback_json, progress) last seen for an accepted goal
+        # still in `_active_goals` — written by `_on_action_feedback`, read
+        # by `_emit_job_heartbeats` (1 Hz, protocol 4): the heartbeat has to
+        # restate a job's last known feedback and progress on every tick
+        # whether or not the action said anything new that second, so it
+        # needs somewhere to find "last known" other than the feedback
+        # callback itself, which only ever runs when something *did* arrive.
+        # Popped everywhere `_active_goals` is popped, for the same reason —
+        # a settled job has no "last known" left to restate.
+        self._latest_job_feedback: Dict[str, Tuple[Any, Optional[float]]] = {}
         self._snapshot_max_bytes = snapshot_max_bytes
         # job_id -> (slug, deadline, patience_s) for a goal sent but not yet
         # accepted or rejected — only ever touched on the executor thread
@@ -1141,6 +1174,34 @@ class RosRuntime:
         # of machine-moving-while-platform-reports-idle situation this fix
         # exists to prevent).
         self._timed_out_job_ids: Set[str] = set()
+        # job_ids `_check_action_server_liveness` has already settled
+        # `lost`/`action_server_lost` for — never removed, same "answer a
+        # yes/no question forever" reasoning as `_timed_out_job_ids` just
+        # above, and consulted the same way: by `_on_action_feedback` and
+        # `_on_action_result`, so a late feedback or result callback rclpy
+        # still fires for a goal whose server this bridge has already given
+        # up on is silently ignored rather than re-contradicting a job the
+        # cloud was already told is over (spec, "Error handling": "a late
+        # result after action_server_lost: ignored by the bridge").
+        self._server_lost_job_ids: Set[str] = set()
+        # job_id -> the monotonic time `_check_action_server_liveness` first
+        # found that job's action server not-ready, without a break since —
+        # the debounce state for `ACTION_SERVER_LIVENESS_DEBOUNCE_S`. Popped
+        # the moment a later tick finds the server ready again (a single
+        # missed tick must not count towards the debounce at all, not merely
+        # fail to reach it) and the moment the debounce actually settles the
+        # job, so a job_id here always means "currently mid-debounce", never
+        # a stale watermark from an earlier, already-resolved streak.
+        self._action_liveness_since: Dict[str, float] = {}
+        # job_ids `_check_action_server_liveness` has already logged a
+        # `server_is_ready()` exception for during the *current* not-ready
+        # streak — cleared alongside `_action_liveness_since` the moment a
+        # tick finds the server ready again, so a server that flaps between
+        # raising and answering gets logged once per flap, not merely once
+        # ever. Without this, a server that raises on every tick of a 3 s
+        # debounce (run at `FAILSAFE_CHECK_INTERVAL_S`, i.e. ~300 ticks)
+        # would log 300 times for one outage.
+        self._action_liveness_logged: Set[str] = set()
         # job_ids cancelled before the action server has answered
         # send_goal_async: `_active_goals[job_id]`
         # is only populated once accepted, in `_on_goal_response` — a
@@ -1282,6 +1343,19 @@ class RosRuntime:
         # whole life of the node, whether or not anything is configured yet.
         self._failsafe_timer = self._node.create_timer(
             FAILSAFE_CHECK_INTERVAL_S, self._check_watchdogs
+        )
+        # The 1 Hz job heartbeat (protocol 4) — its own timer, not folded
+        # into `_check_watchdogs`: `JOB_HEARTBEAT_INTERVAL_MS` is a wire
+        # cadence the cloud actually measures against, a hundred times
+        # coarser than the failsafe watchdog's 10ms, and giving it its own
+        # timer keeps that number legible at its own call site instead of
+        # buried behind a tick counter inside a 10ms-cadence method. Same
+        # "permanent for the life of the node" reasoning as the failsafe
+        # timer: a heartbeat with nothing running simply emits nothing
+        # (`_emit_job_heartbeats` walks `_active_goals`, which is empty),
+        # so there is no configuration gate to wire it through.
+        self._job_heartbeat_timer = self._node.create_timer(
+            JOB_HEARTBEAT_INTERVAL_MS / 1000.0, self._emit_job_heartbeats
         )
         # URDF availability detection — permanent for the
         # life of the node, independent of `_apply_*`/exposed configuration
@@ -2330,9 +2404,12 @@ class RosRuntime:
             # one.
             return
         self._active_goals.pop(job_id, None)
+        self._latest_job_feedback.pop(job_id, None)
         self._goal_deadlines.pop(job_id, None)
         self._pending_cancels.discard(job_id)
         self._service_deadlines.pop(job_id, None)
+        self._action_liveness_since.pop(job_id, None)
+        self._action_liveness_logged.discard(job_id)
         self._emit_job(job_id, slug, "lost", error=("config_changed", reason))
 
     # --- actions: apply, runs on the executor thread ------------------------
@@ -2681,21 +2758,29 @@ class RosRuntime:
         )
 
     def _on_action_feedback(self, job_id: str, slug: str, feedback_msg) -> None:
-        if job_id in self._timed_out_job_ids:
+        if job_id in self._timed_out_job_ids or job_id in self._server_lost_job_ids:
             # This goal was accepted after the cloud was already told
             # `goal_timeout` (or, if the corrective cancel was refused,
-            # `lost`) — its `feedback_callback` was registered before that
-            # was known and rclpy keeps invoking it regardless. Reporting
-            # "running" now would contradict what the cloud was already
-            # told, for a job it may believe closed.
+            # `lost`), or its action server has since been declared gone
+            # (`action_server_lost`) — its `feedback_callback` was
+            # registered before either was known and rclpy keeps invoking it
+            # regardless. Reporting "running" now would contradict what the
+            # cloud was already told, for a job it may believe closed.
             return
+        feedback_json = sampling.message_to_json(feedback_msg)
+        progress = self._extract_progress(feedback_msg)
+        # Remembered for `_emit_job_heartbeats`, which has to restate "last
+        # known feedback and progress" on every 1 Hz tick whether or not the
+        # action said anything new that second — this callback is the only
+        # place that ever learns what "last known" is.
+        self._latest_job_feedback[job_id] = (feedback_json, progress)
         timestamp_ms = sampling.capture_timestamp_ms()
         self._emit_job(
             job_id,
             slug,
             "running",
-            feedback=sampling.message_to_json(feedback_msg),
-            progress=self._extract_progress(feedback_msg),
+            feedback=feedback_json,
+            progress=progress,
             timestamp_ms=timestamp_ms,
         )
 
@@ -2721,6 +2806,15 @@ class RosRuntime:
 
     def _on_action_result(self, job_id: str, slug: str, future) -> None:
         self._active_goals.pop(job_id, None)
+        self._latest_job_feedback.pop(job_id, None)
+        if job_id in self._server_lost_job_ids:
+            # This job's action server was already declared gone — the
+            # cloud was told `lost`/`action_server_lost` and the slug was
+            # freed for a new invoke. A result arriving after that is a
+            # late arrival that must be ignored — reporting anything here
+            # now would be a second, contradicting word about a job already
+            # settled, for a slug that may already be running something else.
+            return
         try:
             response = future.result()
         except Exception as exc:  # noqa: BLE001 - reported to the caller, not raised here
@@ -2739,6 +2833,48 @@ class RosRuntime:
                 "failed",
                 result=result_json,
                 error=("action_failed", "the action ended with status {}".format(response.status)),
+            )
+
+    def _emit_job_heartbeats(self) -> None:
+        """Protocol 4's 1 Hz `job_update` heartbeat (`JOB_HEARTBEAT_INTERVAL_MS`):
+        every job still in `_active_goals` — accepted and not
+        yet settled — gets a `running` frame on every tick, carrying its
+        last known `progress`/`feedback` (`_latest_job_feedback`,
+        `_on_action_feedback`) whether or not the action itself said
+        anything new this second. `timestamp_ms` is this tick's own capture
+        time, not the feedback's — a heartbeat's whole job is to tell the
+        cloud "still alive, as of *now*", and dating it to a feedback frame
+        that may be several ticks stale would undersell exactly the
+        liveness this exists to state.
+
+        Silent about jobs that are not in `_active_goals` for any reason
+        (never accepted, already settled, timed out, or lost) — there is
+        nothing to heartbeat for a job this bridge does not currently
+        believe is running, and every one of those paths already sends its
+        own, more specific word about the job."""
+        if not self._active_goals:
+            return
+        timestamp_ms = sampling.capture_timestamp_ms()
+        # In low-bandwidth mode `feedback` is null, `progress` stays — the
+        # mode's whole point is trimming the
+        # bytes-heavy field, not the number that tells an app how far along
+        # a job is.
+        low_bandwidth = self._lb_active
+        for job_id in list(self._active_goals):
+            slug = self.jobs.slug_for(job_id)
+            if slug is None:
+                # Settled (and possibly already delivered) between building
+                # this snapshot and reaching it here — nothing left to
+                # heartbeat for it this tick.
+                continue
+            feedback, progress = self._latest_job_feedback.get(job_id, (None, None))
+            self._emit_job(
+                job_id,
+                slug,
+                "running",
+                feedback=None if low_bandwidth else feedback,
+                progress=progress,
+                timestamp_ms=timestamp_ms,
             )
 
     # --- services: apply, runs on the executor thread ------------------------
@@ -3572,6 +3708,7 @@ class RosRuntime:
         self._check_failsafes()
         self._check_goal_timeouts()
         self._check_service_timeouts()
+        self._check_action_server_liveness()
 
     def _check_failsafes(self) -> None:
         """Ticks every `FAILSAFE_CHECK_INTERVAL_S` regardless of anything
@@ -3679,6 +3816,88 @@ class RosRuntime:
                     "the service did not respond within {:.0f}s".format(patience_s),
                 ),
             )
+
+    def _check_action_server_liveness(self) -> None:
+        """A goal already accepted
+        gets no timeout, but it does get a liveness check — the gap
+        `_check_goal_timeouts` deliberately does not cover, since that one
+        only bounds *acceptance*. For every job still in `_active_goals`,
+        `entry.client.server_is_ready()` says whether *some* server is
+        still matched on the graph for that slug's action name; `False`
+        for `ACTION_SERVER_LIVENESS_DEBOUNCE_S` straight — not merely on
+        the latest tick — settles the job `lost`/`action_server_lost` (see
+        `_settle_action_server_lost`).
+
+        No cancel is attempted anywhere in this method, deliberately: a
+        server this bridge cannot even discover has nothing on the other
+        end of a cancel to receive it, and this is not a gap worth closing —
+        Fleetless is not a
+        safety layer, and the robot's own reflexes, e-stop and controller
+        timeouts are what a genuinely uncontrollable robot depends on, not
+        a cancel this bridge cannot deliver anyway."""
+        now = time.monotonic()
+        for job_id in list(self._active_goals):
+            slug = self.jobs.slug_for(job_id)
+            if slug is None:
+                continue  # settled between building this snapshot and reaching it here
+            entry = self._actions.get(slug)
+            if entry is None or entry.client is None:
+                continue
+            try:
+                ready = entry.client.server_is_ready()
+            except Exception:  # noqa: BLE001 - treated as not-ready; see debounce below
+                ready = False
+                if job_id not in self._action_liveness_logged:
+                    log.exception(
+                        "server_is_ready() raised for job %r (slug %r) — treated as "
+                        "not-ready for the %.0fs liveness debounce",
+                        job_id, slug, ACTION_SERVER_LIVENESS_DEBOUNCE_S,
+                    )
+                    self._action_liveness_logged.add(job_id)
+            if ready:
+                self._action_liveness_since.pop(job_id, None)
+                self._action_liveness_logged.discard(job_id)
+                continue
+            since = self._action_liveness_since.setdefault(job_id, now)
+            if now - since < ACTION_SERVER_LIVENESS_DEBOUNCE_S:
+                continue
+            self._action_liveness_since.pop(job_id, None)
+            self._action_liveness_logged.discard(job_id)
+            self._settle_action_server_lost(job_id, slug)
+
+    def _settle_action_server_lost(self, job_id: str, slug: str) -> None:
+        """The debounce in `_check_action_server_liveness` just expired for
+        `job_id`: its action server has been unreachable for a straight
+        `ACTION_SERVER_LIVENESS_DEBOUNCE_S`, which ends the job
+        `lost`/`action_server_lost` —
+        not `failed`, because nobody here knows whether the robot actually
+        reached its goal before the server vanished, and `lost` is the
+        contract's own "outcome unknown".
+
+        Mirrors `_settle_orphaned_job`'s shape on purpose: popping
+        `_active_goals` (and the debounce/feedback bookkeeping that rides
+        alongside it) and then emitting a terminal update is the whole
+        mechanism that frees the slug — `JobManager.finish()` runs once
+        this update is actually delivered (`mark_delivered`), the same as
+        any other terminal outcome, so there is no second, explicit
+        "free the slug" step to perform here. `job_id` also joins
+        `_server_lost_job_ids` so a feedback or result callback rclpy still
+        fires for this goal later is silently ignored rather than
+        contradicting a job the cloud was already told is over."""
+        self._active_goals.pop(job_id, None)
+        self._latest_job_feedback.pop(job_id, None)
+        self._server_lost_job_ids.add(job_id)
+        self._emit_job(
+            job_id,
+            slug,
+            "lost",
+            error=(
+                "action_server_lost",
+                "the action server for slug {!r} has been unreachable for over {:.0f}s".format(
+                    slug, ACTION_SERVER_LIVENESS_DEBOUNCE_S
+                ),
+            ),
+        )
 
     async def next_snapshot(self, max_bytes: int) -> Optional[bytes]:
         """The wire-ready bytes of the next snapshot that is due, or `None`
