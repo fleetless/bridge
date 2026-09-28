@@ -184,6 +184,18 @@ FAILSAFE_CHECK_INTERVAL_S = 0.01
 # for long: a job never stays "running" because nobody ever contradicts it.
 ACTION_SERVER_LIVENESS_DEBOUNCE_S = 3.0
 
+# How long `_check_action_server_liveness` waits for a job's first
+# `server_is_ready() == True` before it stops treating "not ready" as
+# "still discovering". The debounce above only starts once a job's server
+# was seen ready (see `_action_liveness_confirmed_ready`), because right
+# after acceptance a healthy server can read not-ready for several seconds.
+# Without a ceiling on that, a server that dies — or whose
+# `server_is_ready()` raises — before it was ever seen ready would leave
+# its job `running` forever, kept alive in the cloud by the heartbeat.
+# 30 s is an order of magnitude above an ordinary post-acceptance
+# discovery gap, and bounds that case at grace plus debounce.
+ACTION_SERVER_DISCOVERY_GRACE_S = 30.0
+
 # How long a removed publisher's handle outlives its last failsafe. A
 # reliable writer resends a sample its readers have not acknowledged; a
 # destroyed one resends nothing, so a failsafe dropped on first send and
@@ -1213,10 +1225,16 @@ class RosRuntime:
         # Without this guard, that ordinary post-acceptance gap reads
         # identically to a genuinely vanished server and the debounce fires
         # on a goal that never stopped being healthy. So a job's debounce
-        # only ever starts counting *after* this set has seen it ready once
-        # — before that, "not ready yet" is still-discovering, not evidence
-        # of anything gone. Cleared alongside `_action_liveness_since`.
+        # only starts counting *after* this set has seen it ready once —
+        # before that, "not ready yet" is still-discovering, not evidence
+        # of anything gone — or once `ACTION_SERVER_DISCOVERY_GRACE_S` has
+        # passed without it. Cleared alongside `_action_liveness_since`.
         self._action_liveness_confirmed_ready: Set[str] = set()
+        # job_id -> the monotonic time `_check_action_server_liveness` first
+        # looked at that job — what `ACTION_SERVER_DISCOVERY_GRACE_S` is
+        # measured from for a job never yet confirmed ready. Cleared with
+        # the three above (`_forget_action_liveness`).
+        self._action_liveness_first_tick: Dict[str, float] = {}
         # job_ids cancelled before the action server has answered
         # send_goal_async: `_active_goals[job_id]`
         # is only populated once accepted, in `_on_goal_response` — a
@@ -2423,9 +2441,7 @@ class RosRuntime:
         self._goal_deadlines.pop(job_id, None)
         self._pending_cancels.discard(job_id)
         self._service_deadlines.pop(job_id, None)
-        self._action_liveness_since.pop(job_id, None)
-        self._action_liveness_logged.discard(job_id)
-        self._action_liveness_confirmed_ready.discard(job_id)
+        self._forget_action_liveness(job_id)
         self._emit_job(job_id, slug, "lost", error=("config_changed", reason))
 
     # --- actions: apply, runs on the executor thread ------------------------
@@ -2823,6 +2839,7 @@ class RosRuntime:
     def _on_action_result(self, job_id: str, slug: str, future) -> None:
         self._active_goals.pop(job_id, None)
         self._latest_job_feedback.pop(job_id, None)
+        self._forget_action_liveness(job_id)
         if job_id in self._server_lost_job_ids:
             # This job's action server was already declared gone — the
             # cloud was told `lost`/`action_server_lost` and the slug was
@@ -3856,7 +3873,10 @@ class RosRuntime:
         from a genuinely vanished server would settle a goal that never
         stopped being healthy — so a `False` reading before this job's
         server was ever confirmed ready is silently ignored, still
-        discovering rather than lost.
+        discovering rather than lost — for at most
+        `ACTION_SERVER_DISCOVERY_GRACE_S` after this check first saw the
+        job. Past that, the debounce counts regardless: a server that never
+        once answered ready is as gone as one that stopped.
 
         No cancel is attempted anywhere in this method, deliberately: a
         server this bridge cannot even discover has nothing on the other
@@ -3873,6 +3893,7 @@ class RosRuntime:
             entry = self._actions.get(slug)
             if entry is None or entry.client is None:
                 continue
+            first_tick = self._action_liveness_first_tick.setdefault(job_id, now)
             try:
                 ready = entry.client.server_is_ready()
             except Exception:  # noqa: BLE001 - treated as not-ready; see debounce below
@@ -3889,15 +3910,25 @@ class RosRuntime:
                 self._action_liveness_since.pop(job_id, None)
                 self._action_liveness_logged.discard(job_id)
                 continue
-            if job_id not in self._action_liveness_confirmed_ready:
+            if (
+                job_id not in self._action_liveness_confirmed_ready
+                and now - first_tick < ACTION_SERVER_DISCOVERY_GRACE_S
+            ):
                 continue  # never yet seen ready — still discovering, not evidence of anything gone
             since = self._action_liveness_since.setdefault(job_id, now)
             if now - since < ACTION_SERVER_LIVENESS_DEBOUNCE_S:
                 continue
-            self._action_liveness_since.pop(job_id, None)
-            self._action_liveness_logged.discard(job_id)
-            self._action_liveness_confirmed_ready.discard(job_id)
             self._settle_action_server_lost(job_id, slug)
+
+    def _forget_action_liveness(self, job_id: str) -> None:
+        """Drops everything `_check_action_server_liveness` keeps per job.
+        Called wherever a job leaves `_active_goals` for good — its own
+        result, a config change, the liveness settle itself — so none of it
+        outlives the job."""
+        self._action_liveness_since.pop(job_id, None)
+        self._action_liveness_logged.discard(job_id)
+        self._action_liveness_confirmed_ready.discard(job_id)
+        self._action_liveness_first_tick.pop(job_id, None)
 
     def _settle_action_server_lost(self, job_id: str, slug: str) -> None:
         """The debounce in `_check_action_server_liveness` just expired for
@@ -3920,6 +3951,7 @@ class RosRuntime:
         contradicting a job the cloud was already told is over."""
         self._active_goals.pop(job_id, None)
         self._latest_job_feedback.pop(job_id, None)
+        self._forget_action_liveness(job_id)
         self._server_lost_job_ids.add(job_id)
         self._emit_job(
             job_id,
