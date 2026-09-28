@@ -1,29 +1,3 @@
-ros-@ROS_DISTRO@-fleetless-bridge (4.1.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
-
-  * **Protocol 4.** A running job now gets a heartbeat: once a goal is
-    accepted, `job_update` restates its last known state once a second
-    whether or not the action itself said anything new, so the cloud's own
-    silence watchdog can bound the heartbeat instead of the action — a
-    healthy action that runs a long time with no feedback no longer risks
-    being declared lost for going quiet.
-  * **A vanished action server ends its job.** Once a goal is accepted,
-    the bridge now watches whether its action server is still reachable.
-    Three seconds of it being unreachable, straight, settles the job
-    `lost` with `action_server_lost` and frees the slug for a new
-    invoke — before this, a dead action server left the slug wedged
-    (`busy`) until the bridge itself restarted, because nothing else ever
-    contradicted the goal that never finished. No goal is ever cancelled
-    by this: there is no server left to cancel it on, and a robot's own
-    reflexes and controller timeouts are what a genuinely uncontrollable
-    machine depends on, not this bridge.
-  * **A dead zone now delivers exactly one `job_update` per job on
-    reconnect** — its terminal outcome if the job ended while
-    disconnected, otherwise only its newest running state. A stale
-    "still running" frame immediately followed by the real result no
-    longer reaches the wire.
-
- -- Andre Dehne <andre@dehne-robotik.de>  Mon, 28 Sep 2026 12:00:00 +0200
-
 ros-@ROS_DISTRO@-fleetless-bridge (4.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * **Low-bandwidth mode.** The cloud measures the lag, the bridge measures

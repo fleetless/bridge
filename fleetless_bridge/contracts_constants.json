@@ -14,12 +14,12 @@
     },
     {
       "version": 4,
-      "bridge_from": "4.1.0",
+      "bridge_from": "5.0.0",
       "deprecated_at": null
     }
   ],
   "PROTOCOL_SUNSET_DAYS": 90,
-  "LATEST_BRIDGE_VERSION": "4.1.0",
+  "LATEST_BRIDGE_VERSION": "5.0.0",
   "CLOSE_ROBOT_DELETED": 4004,
   "CLOSE_TOKEN_ROTATED": 4005,
   "JOB_HEARTBEAT_INTERVAL_MS": 1000,

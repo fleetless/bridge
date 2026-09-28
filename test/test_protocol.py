@@ -110,11 +110,22 @@ def test_no_close_code_literal_is_left_in_the_package():
 def test_this_bridge_appears_in_the_versions_table():
     """The window says which bridge version first spoke the protocol version
     this package sends. A package older than its own `bridge_from` would be
-    claiming a version it predates."""
+    claiming a version it predates.
+
+    With one exception: the branch that moves the bridge onto a new protocol.
+    The Release button writes `__version__` (and package.xml and
+    debian/changelog.in) in its own release PR, so until then the source
+    still carries the last released version, and `bridge_from` names the
+    release about to be cut. It may only be the very next one — a patch,
+    minor or major step from `__version__` — and the release PR, which runs
+    this suite with the written version, has to satisfy the strict form."""
     from fleetless_bridge import __version__
 
     entry = next(e for e in PROTOCOL_VERSIONS if e["version"] == PROTOCOL_VERSION)
-    assert _semver(entry["bridge_from"]) <= _semver(__version__)
+    major, minor, patch = _semver(__version__)
+    next_releases = {(major, minor, patch + 1), (major, minor + 1, 0), (major + 1, 0, 0)}
+    bridge_from = _semver(entry["bridge_from"])
+    assert bridge_from <= _semver(__version__) or bridge_from in next_releases
 
 
 def test_hello_carries_the_token_the_version_and_the_protocol():
