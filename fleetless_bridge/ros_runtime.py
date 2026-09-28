@@ -1202,6 +1202,21 @@ class RosRuntime:
         # debounce (run at `FAILSAFE_CHECK_INTERVAL_S`, i.e. ~300 ticks)
         # would log 300 times for one outage.
         self._action_liveness_logged: Set[str] = set()
+        # job_ids `_check_action_server_liveness` has observed
+        # `server_is_ready()` answer `True` for at least once.
+        # `server_is_ready()` on the same `ActionClient` can still read
+        # `False` for several seconds right after a goal is accepted — goal
+        # acceptance only needs the goal-service entity matched, and
+        # `server_is_ready()` additionally waits on the cancel/result
+        # services and the feedback/status topics, which can each finish
+        # matching independently and later, especially on a loaded machine.
+        # Without this guard, that ordinary post-acceptance gap reads
+        # identically to a genuinely vanished server and the debounce fires
+        # on a goal that never stopped being healthy. So a job's debounce
+        # only ever starts counting *after* this set has seen it ready once
+        # — before that, "not ready yet" is still-discovering, not evidence
+        # of anything gone. Cleared alongside `_action_liveness_since`.
+        self._action_liveness_confirmed_ready: Set[str] = set()
         # job_ids cancelled before the action server has answered
         # send_goal_async: `_active_goals[job_id]`
         # is only populated once accepted, in `_on_goal_response` — a
@@ -2410,6 +2425,7 @@ class RosRuntime:
         self._service_deadlines.pop(job_id, None)
         self._action_liveness_since.pop(job_id, None)
         self._action_liveness_logged.discard(job_id)
+        self._action_liveness_confirmed_ready.discard(job_id)
         self._emit_job(job_id, slug, "lost", error=("config_changed", reason))
 
     # --- actions: apply, runs on the executor thread ------------------------
@@ -3828,6 +3844,20 @@ class RosRuntime:
         the latest tick — settles the job `lost`/`action_server_lost` (see
         `_settle_action_server_lost`).
 
+        **The debounce only starts once this job's server has been seen
+        ready at least once** (`_action_liveness_confirmed_ready`). Right
+        after a goal is accepted, `server_is_ready()` on the very same
+        `ActionClient` can still read `False` for several seconds —
+        acceptance only needs the goal-service entity matched,
+        `server_is_ready()` additionally waits on the cancel/result
+        services and the feedback/status topics, and those can each finish
+        matching independently and later, especially on a loaded machine.
+        Treating that ordinary post-acceptance gap as indistinguishable
+        from a genuinely vanished server would settle a goal that never
+        stopped being healthy — so a `False` reading before this job's
+        server was ever confirmed ready is silently ignored, still
+        discovering rather than lost.
+
         No cancel is attempted anywhere in this method, deliberately: a
         server this bridge cannot even discover has nothing on the other
         end of a cancel to receive it, and this is not a gap worth closing —
@@ -3855,14 +3885,18 @@ class RosRuntime:
                     )
                     self._action_liveness_logged.add(job_id)
             if ready:
+                self._action_liveness_confirmed_ready.add(job_id)
                 self._action_liveness_since.pop(job_id, None)
                 self._action_liveness_logged.discard(job_id)
                 continue
+            if job_id not in self._action_liveness_confirmed_ready:
+                continue  # never yet seen ready — still discovering, not evidence of anything gone
             since = self._action_liveness_since.setdefault(job_id, now)
             if now - since < ACTION_SERVER_LIVENESS_DEBOUNCE_S:
                 continue
             self._action_liveness_since.pop(job_id, None)
             self._action_liveness_logged.discard(job_id)
+            self._action_liveness_confirmed_ready.discard(job_id)
             self._settle_action_server_lost(job_id, slug)
 
     def _settle_action_server_lost(self, job_id: str, slug: str) -> None:
