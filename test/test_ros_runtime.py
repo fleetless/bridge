@@ -1191,12 +1191,24 @@ def test_a_second_invoke_of_a_running_slug_is_refused_busy():
             await rt.apply_actions(by_slug([_action_cfg("count")]))
             await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
             await rt.invoke("job-2", "count", {"order": 5}, patience_ms=15000)
+            # job-2's busy refusal arrives almost immediately, but job-1 is
+            # still genuinely executing on the server at that point —
+            # destroying the server (stop_server(), below) while it is
+            # would race its own get_result callback against
+            # ActionServer.destroy(), observed as a spurious "action
+            # server pointer is invalid" exception on the server's own
+            # spin thread. Draining until job-1 also reaches its own
+            # terminal state avoids the race.
             updates = []
-            while True:
-                update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+            pending = {"job-1", "job-2"}
+            while pending:
+                update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=10.0)
                 updates.append(update)
-                if update.job_id == "job-2":
-                    return updates
+                if update.job_id in pending and update.state in (
+                    "succeeded", "failed", "cancelled", "lost",
+                ):
+                    pending.discard(update.job_id)
+            return updates
         finally:
             stop_server()
 
@@ -3498,7 +3510,16 @@ def test_retargeting_an_armed_publisher_fires_the_failsafe_on_the_old_topic():
                 [_publisher_cfg("drive", topic="/cmd_vel2", timeout_ms=50)]
             ))
             assert rt._publishers["drive"].last_activity_at is None  # the new topic starts dormant
-            await asyncio.sleep(0.2)
+            # Polled, not a fixed sleep: the same class of flake
+            # test_a_removed_armed_publisher_is_destroyed_once_its_failsafe_is_acknowledged
+            # already documents ("loses the race often enough to go red
+            # on a busy runner") and fixes the same way. Bounded well
+            # inside PARTING_FAILSAFE_ACK_TIMEOUT_S -- gone because it
+            # was acknowledged, not because the bound ran out -- and it
+            # keeps watching the new topic for at least as long a
+            # stretch as the fixed sleep did, never a shorter one, so
+            # "new topic stays silent" is no less rigorously checked.
+            wait_until(lambda: len(old_received) == 2, timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S / 2)
         finally:
             stop_old()
             stop_new()
