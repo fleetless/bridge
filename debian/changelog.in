@@ -1,3 +1,12 @@
+ros-@ROS_DISTRO@-fleetless-bridge (5.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(sampling): a non-finite float becomes null on the wire
+  * feat(jobs)!: a job never stays running because nobody contradicts it
+  * fix(jobs): the liveness debounce only starts once a job's server was seen ready
+  * fix(jobs): a server never seen ready is still declared lost
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Tue, 29 Sep 2026 11:01:10 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (4.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * **Low-bandwidth mode.** The cloud measures the lag, the bridge measures
