@@ -65,7 +65,7 @@ the console decides what it exposes; the bridge only follows.
 |---|---|---|---|
 | `FLEETLESS_TOKEN` | yes | — | The robot's token, created once in the console. It binds this bridge to exactly one robot. |
 | `FLEETLESS_CLOUD_URL` | no | `wss://api.fleetless.dev/bridge` | The cloud endpoint. |
-| `FLEETLESS_STATE_DIR` | no | `~/.local/state/fleetless-bridge` | Where the bridge persists its own job ↔ goal mapping across a restart. Never `/tmp`. |
+| `FLEETLESS_STATE_DIR` | no | `~/.local/state/fleetless-bridge` | Where the bridge persists its own job ↔ goal mapping across a restart. Never `/tmp`. If it cannot be written, jobs still run, but a restart finds their goals as external ones (a warning is logged). |
 
 Set them in the launch file or in the environment.
 

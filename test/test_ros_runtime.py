@@ -2310,6 +2310,38 @@ def test_a_flapping_external_goal_between_two_ticks_is_never_reported():
     assert running is None
 
 
+def test_an_unwritable_state_directory_neither_kills_the_executor_nor_the_job():
+    """The persisted mapping is a restart-survival aid, not a precondition
+    for running a goal: a state directory that cannot be written (full
+    disk, read-only mount, a file where the directory should be) must not
+    refuse the invoke, and above all must not raise out of an executor
+    callback — that kills the ROS executor thread and with it every
+    subscription, publisher failsafe and job on the robot. The job runs
+    without restart survival; a restart then finds the goal through the
+    external-goal path instead."""
+    blocker = pathlib.Path(tempfile.mkdtemp()) / "not-a-directory"
+    blocker.write_text("")
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=3, step_delay=0.02)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            await rt.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
+            updates = await _drain_until_terminal(rt, timeout=10.0)
+            # One more round trip through the executor: a thread that died
+            # in the terminal update's callback would time this out.
+            await rt.job_query(["job-1"])
+            return updates, rt._thread.is_alive()
+        finally:
+            stop_server()
+
+    updates, executor_alive = run(body, goal_state_dir=blocker / "state")
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "succeeded"
+    assert executor_alive
+
+
 # --- restart reconciliation: the persisted job/goal mapping survives a
 # process restart --------------------------------------------------------
 

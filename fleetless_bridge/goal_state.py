@@ -85,13 +85,28 @@ def load_mapping(path: pathlib.Path) -> Dict[str, Tuple[str, str]]:
 
 
 def save_mapping(path: pathlib.Path, mapping: Dict[str, Tuple[str, str]]) -> None:
-    """Atomic: write to a temp file in the same directory, then
-    `os.replace` — a reader (this process's own next startup) never sees a
-    half-written file, whether the write is interrupted by a crash or a
-    power loss."""
+    """Atomic and durable: write to a temp file in the same directory,
+    fsync it, `os.replace` it over the old file, then fsync the directory —
+    a reader (this process's own next startup) never sees a half-written
+    file, whether the write is interrupted by a crash or a power loss.
+    Without the two fsyncs the rename alone is only atomic against a crash
+    of this process: after a power loss the directory entry can reach the
+    disk before the bytes it points at.
+
+    Raises `OSError` for a directory it cannot create or a file it cannot
+    write — the caller (`RosRuntime._save_goal_mapping`) decides what a
+    failed write means, since only it knows whether it runs on the
+    executor thread."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
     payload = {job_id: [slug, goal_id] for job_id, (slug, goal_id) in mapping.items()}
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
     os.replace(tmp_path, path)
+    dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
