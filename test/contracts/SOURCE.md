@@ -90,23 +90,15 @@ than what this bridge's own serializer produces (`strict=False`).
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@3.0.0
-            at commit 8d49656
+    Source: @fleetless/contracts@4.0.0
+            at commit c8c323b (tag v4.0.0)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
-            Next release: 4.0.0 (unreleased; pre-release 4.0.0-next.1 is 08b5fe4)
 
-**This pin is provisional and currently names a version these bytes did not
-come from.** They were vendored from the contracts checkout that carries
-protocol 4 — the 1 Hz job heartbeat and the optional `error` on `job_lost` —
-on top of its already-published `3.0.0` (a REST-only major that never
-touched bridge wire schemas, which is why the pin below had stayed at
-`3.0.0` unchanged since that release). The sync test compares against
-whatever `$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own
-`package.json` version against this line, so a pre-release checkout still
-on `3.0.0` agrees with it. **Set this to `4.0.0`, or whatever version the
-release chore actually tags, once contracts releases it**, and re-run the
-suite against the published package; until then this line records where
-the bytes came from, not a version anyone else can resolve.
+These bytes are the 4.0.0 release: protocol 4, the 1 Hz job heartbeat, the
+optional `error` on `job_lost`, and protocol 3's sunset moved to its actual
+deprecation date. The sync test compares against whatever
+`$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version
+against this line, so only a checkout or a tarball of 4.0.0 agrees with it.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a
