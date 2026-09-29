@@ -91,11 +91,13 @@ from fleetless_bridge.protocol import (
     CloudCameraStop,
     CloudCancel,
     CloudInvoke,
+    CloudJobQuery,
     CloudPublish,
     Config,
     HelloError,
     HelloOk,
     IntrospectRequest,
+    JobStatusEntry,
     Ping,
     TypeRequest,
     bridge_asset_progress_message,
@@ -105,6 +107,7 @@ from fleetless_bridge.protocol import (
     datapoint_message,
     hello_message,
     introspect_message,
+    job_status_message,
     job_update_message,
     link_mode_message,
     parse_cloud_message,
@@ -995,6 +998,8 @@ class _JobSource:
             update.slug,
             update.state,
             timestamp_ms=update.timestamp_ms,
+            origin=update.origin,
+            goal_id=update.goal_id,
             feedback=update.feedback,
             progress=update.progress,
             result=update.result,
@@ -1787,6 +1792,13 @@ class BridgeClient:
                 if isinstance(message, HelloOk):
                     greeted = True
                     self.robot_id = message.robot_id
+                    if self._ros is not None:
+                        # The goal tracker's external-job ids are derived
+                        # from `(robot_id, slug, goal_id)` — the cloud
+                        # only ever learns this robot's id from `hello_ok`,
+                        # same as this session does, so this is the first
+                        # point either side can name one.
+                        self._ros.set_robot_id(message.robot_id)
                     # Only a handshake that actually succeeded proves the cloud is
                     # healthy, so only that resets the backoff.
                     self._backoff.reset()
@@ -1852,7 +1864,7 @@ class BridgeClient:
                     # this must overtake whatever bulk is queued rather
                     # than wait its turn behind it.
                     writer.enqueue(_TIER_SESSION, pong_message(message.ts_ms))
-                elif isinstance(message, (Config, IntrospectRequest, TypeRequest)):
+                elif isinstance(message, (Config, IntrospectRequest, TypeRequest, CloudJobQuery)):
                     # Queued, never awaited here: see `_pump_control`.
                     control_queue.put_nowait(message)
                 elif isinstance(message, CloudInvoke):
@@ -2036,9 +2048,11 @@ class BridgeClient:
         """Applies configs and answers introspection out of the receive
         loop's way.
 
-        These three frames are the only ones whose work the bridge has to
-        finish before it can answer them, and all three used to be awaited
-        inline in `_converse`'s loop. An apply that takes longer than the
+        These four frames are the only ones whose work the bridge has to
+        finish before it can answer them (`job_query` joined the original
+        three in protocol 5 — the cloud asking about a specific job
+        while connected instead of guessing), and all of them used to be
+        awaited inline in `_converse`'s loop. An apply that takes longer than the
         cloud's pong deadline therefore cost the whole session: the `ping`
         waiting behind it was never read, so no `pong` was sent and the
         cloud closed the socket. Since the cloud re-sends the config on
@@ -2085,12 +2099,14 @@ class BridgeClient:
                     await self._handle_introspect_request(writer, message)
                 elif isinstance(message, TypeRequest):
                     await self._handle_type_request(writer, message)
+                elif isinstance(message, CloudJobQuery):
+                    await self._handle_job_query(writer, message)
                 else:
-                    # Unreachable: `_converse` queues exactly the three
+                    # Unreachable: `_converse` queues exactly the four
                     # types above. Named rather than folded into the last
-                    # branch so that adding a fourth to the queue without
+                    # branch so that adding a fifth to the queue without
                     # adding it here is a log line, not a frame silently
-                    # answered as if it were a type request.
+                    # answered as if it were a job query.
                     log.error(
                         "The control queue was handed a %s, which it cannot "
                         "answer", type(message).__name__,
@@ -2274,6 +2290,28 @@ class BridgeClient:
         writer.enqueue(
             _TIER_TOOLING,
             type_definitions_message(message.request_id, definitions, unresolved),
+        )
+
+    async def _handle_job_query(
+        self, writer: PrioritizedWriter, message: CloudJobQuery
+    ) -> None:
+        """Answers the cloud's `job_query`: what this process currently knows
+        about each named job — own or external — right now, without
+        waiting for the next heartbeat tick. Tier 1 (`_TIER_OUTCOME`), the
+        same tier `job_update` itself uses (`_JobSource`), so this reply
+        cannot be starved by telemetry queued ahead of it.
+
+        Without a ROS runtime (tests, or a misconfigured launch) there is
+        nothing to ask — every id comes back `unknown_job_ids`, exactly
+        what `self._ros.job_query` itself answers when it cannot find a
+        job."""
+        if self._ros is not None:
+            jobs, unknown_job_ids = await self._ros.job_query(message.job_ids)
+        else:
+            jobs, unknown_job_ids = [], list(message.job_ids)
+        writer.enqueue(
+            _TIER_OUTCOME,
+            job_status_message(message.request_id, jobs, unknown_job_ids),
         )
 
     def _reason_for_close(self, code: Optional[int]) -> Optional[StopReason]:

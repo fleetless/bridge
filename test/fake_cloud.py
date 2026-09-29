@@ -216,6 +216,9 @@ class Session:
         self._cloud.job_lost.append(payload)
         return payload
 
+    async def recv_job_status(self) -> dict:
+        return validate_frame("bridge-job-status", await self.recv())
+
     async def accept(
         self,
         robot_id: str = ROBOT_ID,
@@ -330,6 +333,12 @@ class Session:
         # this slug", today's behaviour, and the meaning every existing
         # caller of this helper already relies on.
         await self._send("cloud-cancel", {"type": "cancel", "slug": slug, "job_id": job_id})
+
+    async def send_job_query(self, request_id: str, job_ids: list) -> None:
+        await self._send(
+            "cloud-job-query",
+            {"type": "job_query", "request_id": request_id, "job_ids": job_ids},
+        )
 
     async def send_publish(self, slug: str, message: dict) -> None:
         await self._send(

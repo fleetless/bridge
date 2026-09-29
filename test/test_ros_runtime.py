@@ -15,6 +15,7 @@ import http.server
 import json
 import logging
 import os
+import pathlib
 import posixpath
 import socket
 import struct
@@ -23,19 +24,21 @@ import threading
 import time
 import urllib.error
 import urllib.parse
+import uuid
 from unittest import mock
 
 import cv2
 import numpy as np
 import pytest
 import rclpy
+from action_msgs.msg import GoalStatus
 from example_interfaces.action import Fibonacci
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from conftest import wait_until
 from helpers import by_slug
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
-from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import BatteryState, Image
@@ -73,6 +76,7 @@ from fleetless_bridge.ros_runtime import (
     DAE_SCAN_MAX_BYTES,
     RosRuntime,
     UploadResult,
+    external_job_id,
 )
 from fleetless_bridge import sampling
 from schemas import validate_frame
@@ -137,6 +141,26 @@ def _action_cfg(
     )
 
 
+def _fake_feedback(**fields):
+    """A duck-typed ROS feedback message — `get_fields_and_field_types()`
+    plus plain attributes, what `sampling.message_to_json`/
+    `RosRuntime._extract_progress` need — for heartbeat tests that inject
+    a goal's feedback directly into `GoalTracker._feedback` rather than
+    through a real action server. A fresh class per call, since
+    `get_fields_and_field_types()` is looked up on the *type*: real ROS
+    message types are fixed-shape, and this mimics that per fake instance
+    rather than sharing one shape across every caller (e.g. Fibonacci's
+    real Feedback has no `progress` field at all, which some of these
+    tests need)."""
+    field_types = {
+        name: ("float64" if isinstance(value, float) else "int32")
+        for name, value in fields.items()
+    }
+    namespace = dict(fields)
+    namespace["get_fields_and_field_types"] = classmethod(lambda cls: dict(field_types))
+    return type("_FakeFeedback", (), namespace)()
+
+
 def _start_fibonacci_server(
     *,
     action_name="/count",
@@ -145,6 +169,7 @@ def _start_fibonacci_server(
     accept=True,
     accept_delay=0.0,
     honor_cancel=True,
+    own_context=False,
 ):
     """A real Fibonacci action server on its own spinning node, so the
     bridge's real `ActionClient` drives a genuine goal lifecycle: feedback
@@ -157,14 +182,25 @@ def _start_fibonacci_server(
     answering — lets the goal-acceptance-timeout tests arrange a goal
     accepted *after* the bridge has already given up on it.
 
+    `own_context`: a restart test needs the server to outlive
+    `RosRuntime.stop()`'s `rclpy.shutdown()`, which tears down the whole
+    default context every node in this suite otherwise shares — the same
+    reasoning `_start_independent_subscriber`'s `own_context` and
+    `test_stop_fires_the_failsafe_for_an_armed_publisher_before_shutting_
+    down`'s observer node already use.
+
     `MultiThreadedExecutor`, not `SingleThreadedExecutor`: rclpy's
     `ActionServer` runs `execute_callback` synchronously on the executor's
     own thread. A single-threaded executor blocked in this callback's
     `time.sleep()` cannot also process an incoming cancel until the callback
     returns — by which point the goal has already finished. Same for a real
     robot's action server: this is rclpy, not a test shortcut."""
-    node = rclpy.create_node("test_action_server_{}".format(id(object())))
-    executor = MultiThreadedExecutor()
+    context = None
+    if own_context:
+        context = rclpy.Context()
+        rclpy.init(context=context, args=[])
+    node = rclpy.create_node("test_action_server_{}".format(id(object())), context=context)
+    executor = MultiThreadedExecutor(context=context)
     executor.add_node(node)
     thread = threading.Thread(target=executor.spin, daemon=True)
     thread.start()
@@ -214,11 +250,44 @@ def _start_fibonacci_server(
         server.destroy()
         executor.shutdown()
         node.destroy_node()
+        if context is not None:
+            rclpy.shutdown(context=context)
         thread.join(timeout=5.0)
 
     stop.cancel_requests = cancel_requests
 
     return stop
+
+
+def _send_goal_directly(action_name="/count", order=5):
+    """Sends a real Fibonacci goal from a client this bridge never created
+    or knows about — this is what makes a goal external: accepted by the
+    same action server, but never sent through `RosRuntime._invoke_action`.
+    Blocks until accepted (`server_is_ready()`/`send_future.done()` are
+    polled with `wait_until`, since rclpy's own `Future.result()` never
+    blocks — it only ever returns whatever is already set). Returns
+    `(goal_id, goal_handle, stop)`."""
+    node = rclpy.create_node("test_external_client_{}".format(id(object())))
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread.start()
+    client = ActionClient(node, Fibonacci, action_name)
+    wait_until(lambda: client.server_is_ready())
+    goal = Fibonacci.Goal()
+    goal.order = order
+    send_future = client.send_goal_async(goal)
+    wait_until(lambda: send_future.done())
+    goal_handle = send_future.result()
+    assert goal_handle.accepted
+
+    def stop():
+        client.destroy()
+        executor.shutdown()
+        node.destroy_node()
+        thread.join(timeout=5.0)
+
+    return str(uuid.UUID(bytes=bytes(goal_handle.goal_id.uuid))), goal_handle, stop
 
 
 def _service_cfg(slug, ros_name="/do_it", type_=TRIGGER_TYPE, parameters=None, message=None):
@@ -342,6 +411,14 @@ async def _drain_until_terminal(rt, timeout=5.0):
 
 
 async def _with_runtime(body, **runtime_kwargs):
+    # B3: every test gets its own, empty persisted-goal-mapping directory
+    # unless it names its own — countless tests below reuse the same
+    # slugs and job ids ("count"/"job-1"), and without this they would all
+    # share the real default (`~/.local/state/fleetless-bridge/`) and read
+    # back each other's stale entries, reconciling a goal id from a
+    # *previous* test's already-torn-down action server as "gone"
+    # (`job_unknown_to_bridge`) before the test's own invoke ever runs.
+    runtime_kwargs.setdefault("goal_state_dir", pathlib.Path(tempfile.mkdtemp()))
     rt = RosRuntime(node_name="test_runtime_{}".format(id(body)), **runtime_kwargs)
     rt.start(asyncio.get_event_loop())
     # Tests default to "a session is connected", matching what every test
@@ -1007,7 +1084,11 @@ def test_a_genuinely_running_job_still_settles_lost_on_a_config_change():
 
 def test_invoking_a_configured_action_runs_a_real_goal_with_feedback_and_result():
     async def body(rt):
-        stop_server = _start_fibonacci_server(steps=3)
+        # Protocol 5 (B4): feedback only ever reaches the wire through the
+        # 1 Hz heartbeat now, not immediately per callback — slow enough
+        # that the goal outlives at least one tick, or there would be
+        # nothing but the acceptance and the terminal result to see.
+        stop_server = _start_fibonacci_server(steps=3, step_delay=0.4)
         try:
             assert await rt.apply_actions(by_slug([_action_cfg("count")])) == []
             await rt.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
@@ -1177,10 +1258,19 @@ def test_cancel_by_the_matching_job_id_issues_a_real_ros_goal_cancel():
     assert updates[-1].state == "cancelled"
 
 
-def test_cancel_by_a_non_matching_job_id_cancels_nothing_and_never_falls_back_to_the_slug():
-    """A caller who names an id has ruled out "whatever is
-    running" as the answer. Falling back to the slug would stop a machine
-    the caller did not name — the exact bug this field exists to close."""
+def test_cancel_by_a_non_matching_job_id_falls_back_to_whatever_is_actually_active():
+    """Protocol 4's rule was stricter: a caller who named an id had ruled
+    out "whatever is running" as the answer, full stop. Protocol 5 carves
+    out one exception: the tracker has no way to tell
+    "a genuinely wrong id" apart from "the id of an old, now-stale job
+    whose slug is occupied by a different goal since" — an `unknown` job
+    superseded by a rediscovered or external goal on the same action is
+    exactly that second case, and the console's cancel button for it must
+    still reach whatever is actually running, not fail silently. So a
+    named id the tracker has no active goal for falls back to cancelling
+    every goal currently active on the slug's action instead of refusing
+    — see `test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug`
+    for the boundary that *does* still hold."""
 
     async def body(rt):
         stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
@@ -1191,14 +1281,40 @@ def test_cancel_by_a_non_matching_job_id_cancels_nothing_and_never_falls_back_to
             while len([u for u in updates if u.state == "running"]) < 2:
                 updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0))
             await rt.cancel_job("count", "some-other-job-id")
-            # No cancel was issued — give the (non-existent) effect a real
-            # chance to show up before concluding it did not.
+            updates += await _drain_until_terminal(rt)
+            return updates
+        finally:
+            stop_server()
+
+    updates = run(body)
+    assert updates[-1].state == "cancelled"
+
+
+def test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug():
+    """The fallback above is scoped to the *named* slug's own action —
+    a stale/wrong job_id must never reach across to a different slug's
+    goal, which is a machine the caller did not name in any sense."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            updates = []
+            while len([u for u in updates if u.state == "running"]) < 2:
+                updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0))
+            # Names a slug that is not running anything at all — the
+            # fallback is scoped to *this* slug's own active goals (none),
+            # so this must stay the ordinary idle no-op, not reach over to
+            # "count", which is where the mismatched job_id actually came
+            # from.
+            await rt.cancel_job("idle-slug-nothing-here", "job-1")
             await asyncio.sleep(0.2)
             return rt.jobs.running_job_id("count")
         finally:
             stop_server()
 
-    assert run(body) == "job-1"  # still running — untouched
+    assert run(body) == "job-1"  # "count" untouched
 
 
 def test_a_non_matching_job_id_and_an_idle_slug_are_logged_distinguishably():
@@ -1715,16 +1831,24 @@ def test_the_heartbeat_nulls_feedback_in_low_bandwidth_mode_but_keeps_progress()
     action: Fibonacci carries no `progress` field at all
     (`test_invoking_a_configured_action_runs_a_real_goal_with_feedback_and_result`),
     so proving "progress stays" needs a feedback shape this suite has no
-    real action type for. `rt._latest_job_feedback`/`rt._active_goals` are
-    populated by hand the same way `_on_action_feedback` would, and
-    `rt._lb_active` is the plain flag `set_low_bandwidth` itself just
-    assigns — settable directly here for the same reason `on_put` hooks
-    are settable elsewhere in this package."""
+    real action type for (`_fake_feedback`). The goal tracker's state is
+    populated by hand the same way its own `_action/status`/`_action/
+    feedback` subscriptions would (own and external goals are
+    enumerated the same way, by goal id), and `rt._lb_active` is the plain
+    flag `set_low_bandwidth` itself just assigns — settable directly here
+    for the same reason `on_put` hooks are settable elsewhere in this
+    package."""
 
     async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        entry = rt._actions["count"]
         rt.jobs.start("job-1", "count", "action")
-        rt._active_goals["job-1"] = object()  # a dummy goal handle — never touched by the heartbeat
-        rt._latest_job_feedback["job-1"] = ({"waypoint": 3}, 0.75)
+        rt._job_goal_ids["job-1"] = "11111111-1111-4111-8111-111111111111"
+        entry.tracker.register_own_goal("11111111-1111-4111-8111-111111111111", "job-1")
+        entry.tracker._status["11111111-1111-4111-8111-111111111111"] = GoalStatus.STATUS_EXECUTING
+        entry.tracker._feedback["11111111-1111-4111-8111-111111111111"] = _fake_feedback(
+            waypoint=3, progress=0.75
+        )
 
         rt._lb_active = True
         rt._emit_job_heartbeats()
@@ -1739,7 +1863,7 @@ def test_the_heartbeat_nulls_feedback_in_low_bandwidth_mode_but_keeps_progress()
     assert low_bandwidth_update.state == "running"
     assert low_bandwidth_update.feedback is None
     assert low_bandwidth_update.progress == pytest.approx(0.75)  # progress stays regardless
-    assert normal_update.feedback == {"waypoint": 3}
+    assert normal_update.feedback == {"waypoint": 3, "progress": 0.75}
     assert normal_update.progress == pytest.approx(0.75)
 
 
@@ -1750,9 +1874,13 @@ def test_the_heartbeats_own_timestamp_is_its_own_capture_time_not_the_feedbacks(
     exists to be honest about."""
 
     async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        entry = rt._actions["count"]
         rt.jobs.start("job-1", "count", "action")
-        rt._active_goals["job-1"] = object()
-        rt._latest_job_feedback["job-1"] = ({"waypoint": 1}, None)
+        rt._job_goal_ids["job-1"] = "11111111-1111-4111-8111-111111111111"
+        entry.tracker.register_own_goal("11111111-1111-4111-8111-111111111111", "job-1")
+        entry.tracker._status["11111111-1111-4111-8111-111111111111"] = GoalStatus.STATUS_EXECUTING
+        entry.tracker._feedback["11111111-1111-4111-8111-111111111111"] = _fake_feedback(waypoint=1)
         before = sampling.capture_timestamp_ms()
         await asyncio.sleep(0.05)
         rt._emit_job_heartbeats()
@@ -1765,15 +1893,17 @@ def test_the_heartbeats_own_timestamp_is_its_own_capture_time_not_the_feedbacks(
 
 
 def test_a_settled_job_gets_no_further_heartbeat():
-    """A job not in `_active_goals` — never accepted, or already settled —
-    has nothing to heartbeat: `_emit_job_heartbeats` walks that dict alone,
-    so a job this bridge no longer believes is running is silently skipped,
+    """A job with no goal id currently active on the tracker — never
+    accepted, or already settled — has nothing to heartbeat:
+    `_emit_job_heartbeats` walks `GoalTracker.active_goal_ids()` alone, so
+    a job this bridge no longer believes is running is silently skipped,
     not restated with whatever feedback it happened to leave behind."""
 
     async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
         rt.jobs.start("job-1", "count", "action")
-        rt._latest_job_feedback["job-1"] = ({"waypoint": 9}, None)
-        # Deliberately not added to `_active_goals` — as if already settled.
+        # Deliberately not registered with the tracker at all — as if
+        # already settled (`forget_own_goal` already ran).
         rt._emit_job_heartbeats()
         await asyncio.sleep(0.05)
         return rt.jobs.updates.try_get()
@@ -1801,14 +1931,15 @@ def test_an_action_server_vanishing_for_3s_straight_settles_lost_and_frees_the_s
         # Confirmed ready, not merely accepted: goal acceptance only needs the
         # goal-service entity matched, and the liveness check's own debounce
         # deliberately does not start counting until server_is_ready() has
-        # read True at least once (see `_action_liveness_confirmed_ready`'s
-        # doc comment) — server_is_ready() additionally waits on the
+        # read True at least once (see `_ActionEntry.liveness_confirmed_
+        # ready`'s doc comment) — server_is_ready() additionally waits on the
         # cancel/result services and the feedback/status topics, which can
         # take an unpredictable extra stretch to finish matching on a loaded
         # machine. Seeded directly rather than polled for real: this test is
-        # about the debounce once a job is known ready, not about how long
-        # real discovery happens to take on whatever machine runs the suite.
-        rt._action_liveness_confirmed_ready.add("job-1")
+        # about the debounce once the action is known ready, not about how
+        # long real discovery happens to take on whatever machine runs the
+        # suite.
+        rt._actions["count"].liveness_confirmed_ready = True
 
         # Started here, not after stop_server() returns: a node destroyed
         # while its callback thread is mid-`time.sleep` (the
@@ -1865,7 +1996,7 @@ def test_an_action_server_that_recovers_within_1s_is_never_declared_lost():
         # multi-second stretch on a loaded machine, and this test is about
         # the debounce surviving a short outage, not about real discovery
         # timing.
-        rt._action_liveness_confirmed_ready.add("job-1")
+        rt._actions["count"].liveness_confirmed_ready = True
 
         # Started here, not after stop_server() returns — see the sibling
         # test above: a node destroyed while its callback thread is
@@ -1921,7 +2052,7 @@ def test_a_late_result_after_action_server_lost_is_silently_ignored():
 
         # Confirmed ready first — see the vanishing-server test above for why
         # (seeded directly, not polled for real — same reasoning there).
-        rt._action_liveness_confirmed_ready.add("job-1")
+        rt._actions["count"].liveness_confirmed_ready = True
 
         stop_server()
         updates = await _drain_until_terminal(rt, timeout=10.0)
@@ -1966,19 +2097,23 @@ def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job
 
     async def body(rt):
         await rt.apply_actions(by_slug([_action_cfg("count")]))
+        entry = rt._actions["count"]
         rt.jobs.start("job-1", "count", "action")
-        rt._active_goals["job-1"] = object()
+        rt._job_goal_ids["job-1"] = "11111111-1111-4111-8111-111111111111"
+        entry.tracker.register_own_goal("11111111-1111-4111-8111-111111111111", "job-1")
+        entry.tracker._status["11111111-1111-4111-8111-111111111111"] = GoalStatus.STATUS_EXECUTING
         # This test injects the job directly rather than through a real
         # invoke, so it never earns a real `server_is_ready() == True`
         # observation on its own — seeded here to stand in for that, since
-        # the debounce does not start counting until a job has been
-        # confirmed ready at least once (`_action_liveness_confirmed_ready`).
-        rt._action_liveness_confirmed_ready.add("job-1")
+        # the debounce does not start counting until the action has been
+        # confirmed ready at least once (`_ActionEntry.liveness_confirmed_
+        # ready`).
+        entry.liveness_confirmed_ready = True
 
         def _raise():
             raise RuntimeError("synthetic server_is_ready failure")
 
-        rt._actions["count"].client.server_is_ready = _raise
+        entry.client.server_is_ready = _raise
 
         return await _drain_until_terminal(rt, timeout=10.0)
 
@@ -2007,9 +2142,12 @@ def test_a_server_never_seen_ready_is_still_declared_lost_after_the_discovery_gr
 
     async def body(rt):
         await rt.apply_actions(by_slug([_action_cfg("count")]))
+        entry = rt._actions["count"]
         rt.jobs.start("job-1", "count", "action")
-        rt._active_goals["job-1"] = object()
-        rt._actions["count"].client.server_is_ready = lambda: False
+        rt._job_goal_ids["job-1"] = "11111111-1111-4111-8111-111111111111"
+        entry.tracker.register_own_goal("11111111-1111-4111-8111-111111111111", "job-1")
+        entry.tracker._status["11111111-1111-4111-8111-111111111111"] = GoalStatus.STATUS_EXECUTING
+        entry.client.server_is_ready = lambda: False
         started = time.monotonic()
         updates = await _drain_until_terminal(rt, timeout=10.0)
         return updates, time.monotonic() - started
@@ -2022,9 +2160,10 @@ def test_a_server_never_seen_ready_is_still_declared_lost_after_the_discovery_gr
 
 def test_a_job_that_ends_normally_leaves_no_liveness_bookkeeping_behind():
     """Every accepted goal passes through `_check_action_server_liveness`,
-    so whatever it records per job must go when the job ends by its own
-    result — or the bridge keeps one entry per job it ever ran, for as long
-    as it runs."""
+    so whatever it records must go when the job ends by its own result —
+    this state lives on the `_ActionEntry` (one per action, not one
+    per job, since several goals can now share an action), and it must
+    reset there the same way once nothing is active any more."""
 
     async def body(rt):
         stop_server = _start_fibonacci_server(steps=2, step_delay=0.02)
@@ -2036,14 +2175,395 @@ def test_a_job_that_ends_normally_leaves_no_liveness_bookkeeping_behind():
             await asyncio.sleep(0.1)  # a few more watchdog ticks
         finally:
             stop_server()
-        return updates, rt
+        # Captured here, before `_with_runtime`'s `finally: rt.stop()` tears
+        # the whole runtime (and `_actions` with it) down.
+        entry = rt._actions["count"]
+        bookkeeping = {
+            "job_goal_ids_has_job_1": "job-1" in rt._job_goal_ids,
+            "tracker_still_knows_the_goal": entry.tracker.job_id_for(updates[0].goal_id) is not None,
+            "liveness_since": entry.liveness_since,
+            "liveness_confirmed_ready": entry.liveness_confirmed_ready,
+            "liveness_first_tick": entry.liveness_first_tick,
+            "liveness_logged": entry.liveness_logged,
+        }
+        return updates, bookkeeping
 
-    updates, rt = run(body)
+    updates, bookkeeping = run(body)
     assert updates[-1].state == "succeeded"
-    assert "job-1" not in rt._action_liveness_confirmed_ready
-    assert "job-1" not in rt._action_liveness_since
-    assert "job-1" not in rt._action_liveness_logged
-    assert "job-1" not in rt._action_liveness_first_tick
+    assert bookkeeping == {
+        "job_goal_ids_has_job_1": False,
+        "tracker_still_knows_the_goal": False,
+        "liveness_since": None,
+        "liveness_confirmed_ready": False,
+        "liveness_first_tick": None,
+        "liveness_logged": False,
+    }
+
+
+# --- external goals: a goal this bridge never sent, discovered on the same
+# action (protocol 5) ------------------------------------------------------
+
+
+def test_a_directly_sent_goal_is_discovered_as_an_external_job():
+    """A goal accepted by the same action server, but never sent through
+    `RosRuntime._invoke_action`, becomes a job of its own — `origin:
+    'external'` — the moment the 1 Hz tick notices it active, with an id
+    deterministic in robot id, slug and goal id (so a second discovery of
+    the same goal, e.g. after a tracker reset, would derive the same id
+    again rather than minting a duplicate job)."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=3.0)
+            finally:
+                stop_sender()
+            return update, goal_id
+        finally:
+            stop_server()
+
+    update, goal_id = run(body)
+    assert update.origin == "external"
+    assert update.goal_id == goal_id
+    assert update.state == "running"
+    assert update.job_id == external_job_id("robot-xyz", "count", goal_id)
+
+
+def test_an_external_goal_occupies_its_slug_and_can_be_cancelled():
+    """An external goal is `busy` for its slug like any other job,
+    and the console's ordinary cancel — by slug, no `job_id` needed —
+    reaches it through the tracker's raw cancel service the same way an
+    own goal's cancel would."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, honor_cancel=True)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=3.0)
+                assert first.origin == "external"
+                assert rt.jobs.running_job_id("count") == first.job_id
+                await rt.cancel_job("count", None)
+                updates = [first]
+                updates += await _drain_until_terminal(rt, timeout=5.0)
+            finally:
+                stop_sender()
+            return updates
+        finally:
+            stop_server()
+
+    updates = run(body)
+    assert updates[-1].state == "cancelled"
+    assert updates[-1].origin == "external"
+
+
+def test_a_flapping_external_goal_between_two_ticks_is_never_reported():
+    """The one case where silence is correct, not a bug: a goal that both starts and fully ends
+    well inside one 1 Hz heartbeat interval must never reach the cloud at
+    all, never appear as a job, and never make `self.jobs` believe
+    anything is running on its slug."""
+
+    async def body(rt):
+        # One short step, fast — the whole goal starts and ends in well
+        # under JOB_HEARTBEAT_INTERVAL_MS (1000ms).
+        stop_server = _start_fibonacci_server(steps=1, step_delay=0.01)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_id, goal_handle, stop_sender = _send_goal_directly("/count", order=2)
+            try:
+                # Wait for the goal to genuinely finish server-side, then
+                # give the tracker's own status/feedback subscriptions a
+                # moment to (not) catch it, all before a heartbeat tick
+                # could ever fire.
+                result_future = goal_handle.get_result_async()
+                wait_until(lambda: result_future.done(), timeout=3.0)
+                await asyncio.sleep(0.05)
+                leftover = rt.jobs.updates.try_get()
+                running = rt.jobs.running_job_id("count")
+            finally:
+                stop_sender()
+            return leftover, running
+        finally:
+            stop_server()
+
+    leftover, running = run(body)
+    assert leftover is None
+    assert running is None
+
+
+# --- restart reconciliation: the persisted job/goal mapping survives a
+# process restart --------------------------------------------------------
+
+
+def test_a_bridge_restart_reattaches_to_a_still_active_persisted_goal():
+    """The persisted job/goal mapping survives a restart: a fresh process
+    (here, a second `RosRuntime` sharing the first one's state directory
+    — `RosRuntime.stop()`'s plain teardown never settles an in-flight
+    job, exactly like a crash) reads it and re-attaches to whatever is
+    still genuinely running, exactly as if it had sent the goal itself
+    this session — the eventual result is the real one, not a guess."""
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=10, step_delay=0.1, own_context=True)
+        # rt1/rt2 each wrapped in their own try/finally: `RosRuntime.stop()`
+        # is idempotent, and a `rclpy.init()`/`rclpy.shutdown()` pair left
+        # unbalanced by an assertion failure between them poisons every
+        # later test in this process (the default context stays
+        # initialized), not just this one.
+        rt1 = RosRuntime(
+            node_name="test_restart_before_{}".format(id(object())), goal_state_dir=state_dir
+        )
+        try:
+            rt1.start(asyncio.get_event_loop())
+            rt1.set_connected(True)
+            await rt1.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt1._actions["count"].client.server_is_ready())
+            await rt1.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            first = await asyncio.wait_for(rt1.jobs.updates.get(), timeout=5.0)
+            assert first.state == "running"
+        finally:
+            # "Crashes": stopped without ever settling job-1 — the
+            # persisted mapping on disk still names it, and the real
+            # Fibonacci server (untouched) is still working on it.
+            rt1.stop()
+
+        rt2 = RosRuntime(
+            node_name="test_restart_after_{}".format(id(object())), goal_state_dir=state_dir
+        )
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            updates = await _drain_until_terminal(rt2, timeout=10.0)
+        finally:
+            rt2.stop()
+            stop_server()
+        return updates
+
+    updates = asyncio.run(body())
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "succeeded"
+    assert updates[-1].result["sequence"][:2] == [0, 1]
+    assert updates[-1].origin == "fleetless"
+
+
+def test_a_bridge_restart_fetches_the_result_of_a_goal_that_ended_while_down():
+    """The goal finishes entirely while nothing is running, and the next
+    process to read the persisted mapping still gets the real, true
+    outcome, fetched from the action server rather than guessed."""
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=2, step_delay=0.02, own_context=True)
+        rt1 = RosRuntime(
+            node_name="test_restart_ended_before_{}".format(id(object())), goal_state_dir=state_dir
+        )
+        try:
+            rt1.start(asyncio.get_event_loop())
+            rt1.set_connected(True)
+            await rt1.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt1._actions["count"].client.server_is_ready())
+            await rt1.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
+            first = await asyncio.wait_for(rt1.jobs.updates.get(), timeout=5.0)
+            assert first.state == "running"
+        finally:
+            rt1.stop()
+
+        # The goal finishes for real while nothing is running at all — a
+        # real action server has no concept of "the bridge is down", it
+        # just keeps executing.
+        await asyncio.sleep(0.3)
+
+        rt2 = RosRuntime(
+            node_name="test_restart_ended_after_{}".format(id(object())), goal_state_dir=state_dir
+        )
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            updates = await _drain_until_terminal(rt2, timeout=10.0)
+        finally:
+            rt2.stop()
+            stop_server()
+        return updates
+
+    updates = asyncio.run(body())
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "succeeded"
+    assert updates[-1].result["sequence"] == [0, 1, 1, 2]  # two steps (`steps=2`), from [0, 1]
+
+
+def test_a_bridge_restart_with_the_mapping_removed_lets_the_goal_appear_external():
+    """The mapping file removed, or simply never written for a goal not
+    yet persisted at crash time: the goal appears as an external job on
+    the fresh process instead — no exception, no silent loss, just the
+    ordinary discovery path finding a goal it cannot attribute."""
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, own_context=True)
+        rt1 = RosRuntime(
+            node_name="test_restart_no_mapping_before_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        try:
+            rt1.start(asyncio.get_event_loop())
+            rt1.set_connected(True)
+            await rt1.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt1._actions["count"].client.server_is_ready())
+            await rt1.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            first = await asyncio.wait_for(rt1.jobs.updates.get(), timeout=5.0)
+            assert first.state == "running"
+        finally:
+            rt1.stop()
+
+        for path in state_dir.iterdir():
+            path.unlink()
+
+        rt2 = RosRuntime(
+            node_name="test_restart_no_mapping_after_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            rt2.set_robot_id("robot-xyz")
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            update = await asyncio.wait_for(rt2.jobs.updates.get(), timeout=3.0)
+        finally:
+            rt2.stop()
+            stop_server()
+        return update
+
+    update = asyncio.run(body())
+    assert update.origin == "external"
+    assert update.state == "running"
+
+
+def test_a_bridge_restart_against_a_server_that_no_longer_knows_the_goal_is_lost():
+    """The persisted mapping names a goal a *different* action server
+    (or the same one, its result already expired) no longer recognises —
+    `GoalStatus.STATUS_UNKNOWN` from `get_result` — becomes `lost`/
+    `job_unknown_to_bridge`, not a hang and not a crash."""
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, own_context=True)
+        rt1 = RosRuntime(
+            node_name="test_restart_unknown_before_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        try:
+            rt1.start(asyncio.get_event_loop())
+            rt1.set_connected(True)
+            await rt1.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt1._actions["count"].client.server_is_ready())
+            await rt1.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            first = await asyncio.wait_for(rt1.jobs.updates.get(), timeout=5.0)
+            assert first.state == "running"
+        finally:
+            rt1.stop()
+        # The old server (and its record of the goal) is gone entirely —
+        # a fresh one on the same action name knows nothing about it.
+        stop_server()
+
+        stop_new_server = _start_fibonacci_server(steps=2, step_delay=0.02, own_context=True)
+        rt2 = RosRuntime(
+            node_name="test_restart_unknown_after_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            update = await asyncio.wait_for(rt2.jobs.updates.get(), timeout=5.0)
+        finally:
+            rt2.stop()
+            stop_new_server()
+        return update
+
+    update = asyncio.run(body())
+    assert update.job_id == "job-1"
+    assert update.state == "lost"
+    assert update.error[0] == "job_unknown_to_bridge"
+
+
+# --- job_query/job_status: the cloud asking while connected instead of
+# guessing -------------------------------------------------------------
+
+
+def test_job_query_answers_a_running_own_job_with_its_state():
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)  # "running"
+            jobs, unknown = await rt.job_query(["job-1"])
+            return jobs, unknown
+        finally:
+            stop_server()
+
+    jobs, unknown = run(body)
+    assert unknown == []
+    assert len(jobs) == 1
+    assert jobs[0].job_id == "job-1"
+    assert jobs[0].state == "running"
+
+
+def test_job_query_answers_an_unrecognised_id_in_unknown_job_ids():
+    async def body(rt):
+        return await rt.job_query(["3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"])
+
+    jobs, unknown = run(body)
+    assert jobs == []
+    assert unknown == ["3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"]
+
+
+def test_job_query_answers_an_external_job_the_same_way_as_an_own_one():
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=3.0)
+                jobs, unknown = await rt.job_query([first.job_id])
+            finally:
+                stop_sender()
+            return jobs, unknown, first.job_id
+        finally:
+            stop_server()
+
+    jobs, unknown, job_id = run(body)
+    assert unknown == []
+    assert len(jobs) == 1
+    assert jobs[0].job_id == job_id
+    assert jobs[0].state == "running"
+
+
+def test_job_query_for_a_job_a_restarted_bridge_never_persisted_is_unknown():
+    """A service job has no persisted mapping at all (only actions do) —
+    a bridge restart during one simply forgets it, and a `job_query`
+    against it answers `unknown_job_ids` immediately, with no "is
+    anything else active" question to ask: a service has no status topic
+    to check in the first place."""
+
+    async def body(rt):
+        return await rt.job_query(["a-service-job-nobody-here-remembers"])
+
+    jobs, unknown = run(body)
+    assert jobs == []
+    assert unknown == ["a-service-job-nobody-here-remembers"]
 
 
 # --- services: apply_services, the diff -----------------------------------------

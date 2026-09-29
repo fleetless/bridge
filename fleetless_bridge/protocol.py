@@ -594,6 +594,19 @@ class TypeRequest:
 
 
 @dataclass(frozen=True)
+class CloudJobQuery:
+    """Asks what this bridge currently knows about specific jobs, while
+    connected — the cloud's alternative to guessing `bridge_timeout`.
+    Answered with a `BridgeJobStatus` carrying the same `request_id`, on the
+    same tier `job_update` uses (`_JobSource`) so it cannot be starved by
+    telemetry. Every id not recognised at all — own, external, or never
+    heard of — comes back in `unknown_job_ids` instead of `jobs`."""
+
+    request_id: str
+    job_ids: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class CloudInvoke:
     """Run an action or a service call. The cloud minted
     `job_id` before sending this, so a job exists — and can eventually be
@@ -706,6 +719,7 @@ CloudMessage = Union[
     Config,
     IntrospectRequest,
     TypeRequest,
+    CloudJobQuery,
     CloudInvoke,
     CloudCancel,
     CloudPublish,
@@ -844,6 +858,8 @@ def job_update_message(
     state: str,
     *,
     timestamp_ms: int,
+    origin: str = "fleetless",
+    goal_id: Optional[str] = None,
     feedback: Any = None,
     progress: Optional[float] = None,
     result: Any = None,
@@ -855,6 +871,13 @@ def job_update_message(
     a reconnect is visibly late rather than looking current. `error` is
     `(code, message)` or `None`; every field the schema requires is always
     present, `null` where there is nothing to say.
+
+    `origin` and `goal_id` are protocol 5's additions, both
+    required on the wire: `origin` is `'fleetless'` for everything this
+    bridge itself started, `'external'` for a goal the tracker found active
+    without having sent it. `goal_id` is the ROS 2 goal id this update is
+    about, or `None` for a service job (no goal exists) or an update
+    emitted before any goal was ever sent (e.g. `goal_send_failed`).
 
     `details` is the structured payload for an error code that has a documented
     one (`job_queue_full`'s `{limit, queued}`, today's only example) — nested
@@ -877,6 +900,8 @@ def job_update_message(
             "job_id": job_id,
             "slug": slug,
             "state": state,
+            "origin": origin,
+            "goal_id": goal_id,
             "feedback": feedback,
             "progress": progress,
             "result": result,
@@ -891,6 +916,54 @@ def job_lost_message(job_ids: Sequence[str]) -> str:
     restarted process says the same thing via `hello.active_job_ids` instead;
     see jobs.py for when this one actually gets used."""
     return json.dumps({"type": "job_lost", "job_ids": list(job_ids)})
+
+
+class JobStatusEntry(NamedTuple):
+    """One answer inside a `job_status` reply — `bridgeJobStatusEntry`.
+    `state` is never `'unknown'`: the bridge only ever states a definite
+    fact about a job it recognises (contracts' own doc comment on the
+    field); a job id this process does not recognise at all goes in
+    `job_status_message`'s `unknown_job_ids` instead of becoming one of
+    these."""
+
+    job_id: str
+    state: str
+    feedback: Any = None
+    progress: Optional[float] = None
+    result: Any = None
+    error: Optional[Tuple[str, str]] = None
+
+
+def job_status_message(
+    request_id: str, jobs: Sequence[JobStatusEntry], unknown_job_ids: Sequence[str]
+) -> str:
+    """Answers a `job_query`: the cloud's alternative to guessing
+    `bridge_timeout` for a job while the bridge is connected but silent.
+    `unknown_job_ids` names every id this process does not recognise at
+    all — never sent, not in the persisted mapping, and not an active
+    external goal — disjoint from `jobs`, which carries the ids this
+    process does recognise, each with its own error shaped exactly like
+    `job_update_message`'s."""
+    return json.dumps(
+        {
+            "type": "job_status",
+            "request_id": request_id,
+            "jobs": [
+                {
+                    "job_id": j.job_id,
+                    "state": j.state,
+                    "feedback": j.feedback,
+                    "progress": j.progress,
+                    "result": j.result,
+                    "error": (
+                        {"code": j.error[0], "message": j.error[1]} if j.error is not None else None
+                    ),
+                }
+                for j in jobs
+            ],
+            "unknown_job_ids": list(unknown_job_ids),
+        }
+    )
 
 
 def snapshot_frame(
@@ -1754,4 +1827,16 @@ def parse_cloud_message(raw: object) -> CloudMessage:
         ):
             return Unknown(raw, "type_request without usable type_names")
         return TypeRequest(request_id=request_id, type_names=tuple(type_names))
+    if kind == "job_query":
+        request_id = payload.get("request_id")
+        job_ids = payload.get("job_ids")
+        if not (isinstance(request_id, str) and request_id):
+            return Unknown(raw, "job_query without a usable request_id")
+        if not (
+            isinstance(job_ids, list)
+            and job_ids
+            and all(isinstance(j, str) and j for j in job_ids)
+        ):
+            return Unknown(raw, "job_query without usable job_ids")
+        return CloudJobQuery(request_id=request_id, job_ids=tuple(job_ids))
     return Unknown(raw, "unsupported message type {!r}".format(kind))

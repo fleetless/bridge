@@ -18,6 +18,39 @@ def test_a_slug_with_no_job_has_none_running():
     assert jobs.running_job_id("drive_to") is None
 
 
+def test_a_started_job_has_fleetless_origin():
+    jobs = JobManager()
+    jobs.start("job-1", "drive_to", "action")
+    assert jobs.origin_of("job-1") == "fleetless"
+
+
+def test_origin_of_an_unknown_job_id_is_none():
+    assert JobManager().origin_of("no-such-job") is None
+
+
+def test_register_external_is_the_running_job_for_its_slug_with_external_origin():
+    jobs = JobManager()
+    jobs.register_external("ext-1", "count")
+    assert jobs.running_job_id("count") == "ext-1"
+    assert jobs.origin_of("ext-1") == "external"
+    assert jobs.active_jobs() == [("ext-1", "count", "running")]
+
+
+def test_register_external_is_idempotent_for_the_same_job_id():
+    jobs = JobManager()
+    jobs.register_external("ext-1", "count")
+    jobs.register_external("ext-1", "count")
+    assert jobs.tracked_count() == 1
+
+
+def test_an_external_job_settles_and_frees_its_slug_the_same_way_as_an_own_job():
+    jobs = JobManager()
+    jobs.register_external("ext-1", "count")
+    jobs.finish("ext-1", "cancelled")
+    assert jobs.running_job_id("count") is None
+    assert jobs.origin_of("ext-1") is None
+
+
 def test_finishing_a_job_clears_it_from_its_slug():
     jobs = JobManager()
     jobs.start("job-1", "drive_to", "action")

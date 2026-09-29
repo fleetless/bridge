@@ -43,10 +43,10 @@ except ImportError:
 SCHEMA_DIR = pathlib.Path(__file__).parent / "contracts" / "schema"
 SCHEMA_OUTGOING_DIR = pathlib.Path(__file__).parent / "contracts" / "schema-outgoing"
 
-# The thirteen frames protocol.py builds and sends — see hello_message,
+# The fourteen frames protocol.py builds and sends — see hello_message,
 # pong_message, link_mode_message, config_applied_message,
 # introspect_message, type_definitions_message, datapoint_message,
-# job_update_message, job_lost_message, snapshot_frame,
+# job_update_message, job_lost_message, job_status_message, snapshot_frame,
 # bridge_camera_state_message, bridge_assets_available_message,
 # bridge_asset_progress_message.
 # Exhaustive list, not a naming pattern — datapoint-frame and
@@ -62,6 +62,7 @@ OUTGOING_FRAME_NAMES = frozenset(
         "datapoint-frame",
         "bridge-job-update",
         "bridge-job-lost",
+        "bridge-job-status",
         "snapshot-header",
         "bridge-camera-state",
         "bridge-assets-available",
