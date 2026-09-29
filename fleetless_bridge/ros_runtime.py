@@ -220,6 +220,12 @@ ACTION_SERVER_DISCOVERY_GRACE_S = 30.0
 # per reconciled goal).
 RESULT_SERVICE_DISCOVERY_TIMEOUT_S = 2.0
 
+# How often, at most, a failed write of the persisted goal mapping is
+# logged (`RosRuntime._save_goal_mapping`). A state directory that cannot
+# be written usually stays that way, and every own job would otherwise log
+# the same line twice.
+GOAL_STATE_ERROR_LOG_INTERVAL_S = 60.0
+
 # How long a removed publisher's handle outlives its last failsafe. A
 # reliable writer resends a sample its readers have not acknowledged; a
 # destroyed one resends nothing, so a failsafe dropped on first send and
@@ -1417,6 +1423,9 @@ class RosRuntime:
         # goal's restart-survival is not a promise this makes.
         self._goal_mapping: Dict[str, Tuple[str, str]] = {}
         self._goal_mapping_path: Optional[pathlib.Path] = None
+        # When `_save_goal_mapping` last logged a failed write — the
+        # rate limit for that warning (`GOAL_STATE_ERROR_LOG_INTERVAL_S`).
+        self._goal_mapping_error_logged_at: Optional[float] = None
         # Set once, from `hello_ok` (`set_robot_id`, called by client.py) —
         # `None` until the first successful handshake, which is also the
         # first moment either side of the wire can name this robot at all.
@@ -5956,5 +5965,28 @@ class RosRuntime:
             self._save_goal_mapping()
 
     def _save_goal_mapping(self) -> None:
-        if self._goal_mapping_path is not None:
+        """Writes the persisted mapping, and never raises for a write that
+        failed. Called from `_invoke_action` and from every terminal
+        report — the latter inside rclpy callbacks on the executor thread,
+        where an exception kills the thread and with it every subscription,
+        failsafe and job on the robot. The mapping only buys restart
+        survival: a job whose entry could not be written still runs and
+        reports normally in this process, and after a restart its goal is
+        found through the external-goal path instead of being
+        re-attached. Logged at most once per `GOAL_STATE_ERROR_LOG_INTERVAL_S`
+        so a full disk does not flood the log with one line per job."""
+        if self._goal_mapping_path is None:
+            return
+        try:
             save_mapping(self._goal_mapping_path, self._goal_mapping)
+        except OSError:
+            now = time.monotonic()
+            last = self._goal_mapping_error_logged_at
+            if last is None or now - last >= GOAL_STATE_ERROR_LOG_INTERVAL_S:
+                self._goal_mapping_error_logged_at = now
+                log.warning(
+                    "Could not write the goal-state mapping at %s — own jobs keep "
+                    "running, but will not be re-attached after a bridge restart "
+                    "(they will reappear as external goals)",
+                    self._goal_mapping_path, exc_info=True,
+                )
