@@ -1570,12 +1570,30 @@ def test_job_update_carries_state_and_the_bridge_capture_timestamp():
         "job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
         "slug": "drive_to",
         "state": "running",
+        "origin": "fleetless",
+        "goal_id": None,
         "feedback": {"distance": 2.5},
         "progress": 0.4,
         "result": None,
         "error": None,
         "timestamp_ms": 1786400000000,
     }
+
+
+def test_job_update_carries_its_origin_and_goal_id():
+    payload = json.loads(
+        job_update_message(
+            "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+            "drive_to",
+            "running",
+            timestamp_ms=1786400000000,
+            origin="external",
+            goal_id="4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70",
+        )
+    )
+    validate_frame("bridge-job-update", payload)
+    assert payload["origin"] == "external"
+    assert payload["goal_id"] == "4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70"
 
 
 def test_job_update_with_no_feedback_progress_or_result_is_still_valid():

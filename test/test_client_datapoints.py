@@ -77,6 +77,7 @@ class FakeRos:
         apply_camera_raises=None,
         graph=None,
         resolve=None,
+        job_query_result=None,
     ) -> None:
         self.samples = SampleQueue(maxsize=10)
         self.snapshots = _FakeSnapshots()
@@ -95,6 +96,9 @@ class FakeRos:
         self.invoke_calls = []
         self.cancel_calls = []
         self.publish_calls = []
+        self.robot_id_calls = []
+        self.job_query_calls = []
+        self._job_query_result = job_query_result or ([], [])
         self.start_live_calls = []
         self.stop_live_calls = []
         self.stop_all_live_calls = 0
@@ -159,11 +163,18 @@ class FakeRos:
             raise self._apply_camera_raises
         return self._apply_camera_errors
 
+    def set_robot_id(self, robot_id):
+        self.robot_id_calls.append(robot_id)
+
     async def invoke(self, job_id, slug, params, patience_ms):
         self.invoke_calls.append((job_id, slug, params, patience_ms))
 
     async def cancel_job(self, slug, job_id):
         self.cancel_calls.append((slug, job_id))
+
+    async def job_query(self, job_ids):
+        self.job_query_calls.append(list(job_ids))
+        return self._job_query_result
 
     async def publish(self, slug, message):
         self.publish_calls.append((slug, message))

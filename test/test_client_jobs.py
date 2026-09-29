@@ -16,6 +16,7 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_KIND_CAMERA,
     APPLY_ERROR_KIND_PUBLISHER,
     ApplyError,
+    JobStatusEntry,
 )
 
 
@@ -59,6 +60,39 @@ def test_a_cancel_by_job_id_is_dispatched_to_the_ros_runtime():
 
     _run_one_exchange(send_and_recv, ros=fake_ros)
     assert fake_ros.cancel_calls == [("drive_to", "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f")]
+
+
+def test_a_job_query_is_answered_from_the_ros_runtime():
+    fake_ros = FakeRos(
+        job_query_result=(
+            [JobStatusEntry(job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", state="running")],
+            ["4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70"],
+        )
+    )
+
+    async def send_and_recv(session):
+        await session.send_job_query(
+            "req-1", ["3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", "4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70"]
+        )
+        return await session.recv_job_status()
+
+    payload = _run_one_exchange(send_and_recv, ros=fake_ros)
+    assert payload["request_id"] == "req-1"
+    assert payload["jobs"][0]["job_id"] == "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"
+    assert payload["unknown_job_ids"] == ["4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70"]
+    assert fake_ros.job_query_calls == [
+        ["3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", "4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70"]
+    ]
+
+
+def test_a_job_query_without_a_ros_runtime_answers_every_id_unknown():
+    async def send_and_recv(session):
+        await session.send_job_query("req-1", ["3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"])
+        return await session.recv_job_status()
+
+    payload = _run_one_exchange(send_and_recv, ros=None)
+    assert payload["jobs"] == []
+    assert payload["unknown_job_ids"] == ["3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"]
 
 
 def test_a_publish_is_dispatched_to_the_ros_runtime():
@@ -247,6 +281,8 @@ def test_job_updates_are_pumped_out_once_connected():
         "job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
         "slug": "drive_to",
         "state": "running",
+        "origin": "fleetless",
+        "goal_id": None,
         "feedback": {"distance": 1.5},
         "progress": 0.3,
         "result": None,

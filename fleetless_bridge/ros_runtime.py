@@ -80,6 +80,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import (
@@ -101,18 +102,26 @@ import defusedxml.ElementTree as ElementTree
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from defusedxml import DefusedXmlException
 import rclpy
-from action_msgs.msg import GoalStatus
+from action_msgs.msg import GoalStatus, GoalStatusArray
+from action_msgs.srv import CancelGoal
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_action_status_default,
+)
 from rosidl_runtime_py.utilities import get_action, get_message, get_service
 from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String as StringMsg
+from unique_identifier_msgs.msg import UUID as RosUUID
 
 from fleetless_bridge import camera, camera_sources, introspection, live, params, sampling
 from fleetless_bridge.jobs import JobManager, JobUpdate
+from fleetless_bridge.goal_state import load_mapping, mapping_path, save_mapping
 from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
@@ -142,6 +151,7 @@ from fleetless_bridge.protocol import (
     RtspSource,
     ServiceConfig,
     V4l2Source,
+    JobStatusEntry,
     snapshot_frame,
 )
 
@@ -184,17 +194,31 @@ FAILSAFE_CHECK_INTERVAL_S = 0.01
 # for long: a job never stays "running" because nobody ever contradicts it.
 ACTION_SERVER_LIVENESS_DEBOUNCE_S = 3.0
 
-# How long `_check_action_server_liveness` waits for a job's first
+# How long `_check_action_server_liveness` waits for an action's first
 # `server_is_ready() == True` before it stops treating "not ready" as
-# "still discovering". The debounce above only starts once a job's server
-# was seen ready (see `_action_liveness_confirmed_ready`), because right
-# after acceptance a healthy server can read not-ready for several seconds.
+# "still discovering". The debounce above only starts once an action's
+# server was seen ready (see `_ActionEntry.liveness_confirmed_ready`),
+# because right after acceptance a healthy server can read not-ready for
+# several seconds.
 # Without a ceiling on that, a server that dies — or whose
 # `server_is_ready()` raises — before it was ever seen ready would leave
 # its job `running` forever, kept alive in the cloud by the heartbeat.
 # 30 s is an order of magnitude above an ordinary post-acceptance
 # discovery gap, and bounds that case at grace plus debounce.
 ACTION_SERVER_DISCOVERY_GRACE_S = 30.0
+
+# How long `GoalTracker.request_result` waits for its `get_result` client
+# to match the action server before sending — the startup-reconciliation
+# path only, run once per persisted goal at process start. A `get_result`
+# call is a plain request/response service, not the transient-local
+# status topic: a request sent before this brand-new client has matched
+# the server is genuinely dropped, not merely delayed, so this bounds a
+# real, one-time discovery wait rather than papering over a bug. Short
+# relative to `ACTION_SERVER_DISCOVERY_GRACE_S` (that one bounds an
+# ordinary goal's liveness debounce over the life of a run; this one
+# blocks the executor thread, so it stays small and is paid at most once
+# per reconciled goal).
+RESULT_SERVICE_DISCOVERY_TIMEOUT_S = 2.0
 
 # How long a removed publisher's handle outlives its last failsafe. A
 # reliable writer resends a sample its readers have not acknowledged; a
@@ -242,6 +266,14 @@ TYPE_CHANGE_ACK_WAIT_S = 0.5
 # enough that a caller flooding invokes for slugs it does not even own
 # hits a wall long before the queue behind it could threaten the process.
 MAX_TRACKED_JOBS = 200
+
+# jobs.py keeps its own, private copy of this same set (`_TERMINAL_STATES`)
+# for the update queue's coalescing rules — this one is what `_emit_job`
+# uses to decide when a job's persisted goal-id mapping (B3) and its
+# tracker registration (B1) can be forgotten. Duplicated rather than
+# imported: jobs.py's copy is a module-private implementation detail of the
+# queue, not a shared vocabulary this file should reach into.
+_JOB_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "lost"})
 
 # How long an invoked action may go unaccepted before the bridge gives up on
 # its server ever answering — without this, a `send_goal_async()` whose server
@@ -735,6 +767,212 @@ class _Subscription:
 # runtime-level copy would have to be kept in step by five apply passes
 # instead of by the three that actually build messages.
 
+# The three ROS 2 action-goal statuses (action_msgs/msg/GoalStatus) that mean
+# "still going" — the same set `_check_action_server_liveness` already
+# walked via `_active_goals` before, now what `GoalTracker.active_goal_ids`
+# filters on for own and external goals alike.
+_ACTIVE_GOAL_STATUSES = frozenset(
+    {GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING, GoalStatus.STATUS_CANCELING}
+)
+
+
+def _goal_id_str(goal_id_msg) -> str:
+    """A `unique_identifier_msgs/UUID` (16 raw bytes, as carried by every
+    action status/feedback/result/cancel message) as the string every other
+    goal id in this file is spelled — the ordinary `str(uuid.UUID(...))`
+    formatting, so a goal id round-trips identically whether it came from
+    this process's own `uuid.uuid4()` or from the wire."""
+    return str(uuid.UUID(bytes=bytes(goal_id_msg.uuid)))
+
+
+def _goal_id_msg(goal_id: str) -> RosUUID:
+    return RosUUID(uuid=list(uuid.UUID(goal_id).bytes))
+
+
+# A fixed, never-changing namespace UUID, local to the bridge — generated
+# once, committed here, and never regenerated: every future external job id
+# for every robot depends on it staying fixed, so a repeated report never
+# mints a job twice. The cloud never needs to reconstruct this id
+# independently — it trusts whatever id the bridge sends with
+# `origin: 'external'` and mints an in-memory job the first time it sees
+# one — so this does not need to live in contracts or match anything
+# cloud-side.
+EXTERNAL_JOB_NAMESPACE = uuid.UUID("239123fc-c772-444b-bf45-06ce6e04238d")
+
+
+def external_job_id(robot_id: str, slug: str, goal_id: str) -> str:
+    """The Fleetless job id for a goal this bridge discovered rather than
+    sent. Deterministic in `(robot_id, slug, goal_id)`: the same
+    triple always derives the same id, on this process or a fresh one
+    after a restart — external goals are never persisted (`goal_state.py`),
+    so this determinism, not a file, is what keeps a rediscovered goal from
+    minting a second job for the same thing."""
+    return str(uuid.uuid5(EXTERNAL_JOB_NAMESPACE, "{}|{}|{}".format(robot_id, slug, goal_id)))
+
+
+class GoalTracker:
+    """Tracks every goal active on one published action — Fleetless's own
+    and anyone else's alike — through the action's five low-level
+    ROS 2 interfaces (`send_goal`, `status`, `feedback`, `get_result`,
+    `cancel_goal`), keyed by goal id rather than by whatever rclpy's own
+    `ActionClient` happens to hand back, since that only ever knows about
+    goals *this* client itself sent.
+
+    Sending a goal still goes through the ordinary, public `ActionClient`
+    (`RosRuntime._invoke_action` keeps doing that, and now also passes it
+    a bridge-chosen `goal_uuid` instead of taking rclpy's random one, so
+    the tracker can be told the goal's id *before* the goal is even sent —
+    see B3's persisted mapping). What this tracker adds is the other four
+    interfaces, subscribed to and called directly by their fixed
+    `rcl_action` wire names (`<action>/_action/status` etc., stable across
+    every rclpy internal that builds `ActionClient` itself the same way),
+    so a goal nobody here sent — accepted by the same action server,
+    discovered on the shared `status` topic — is enumerated, fed feedback,
+    resulted and cancelled the exact same way an own goal is.
+    `register_own_goal`/`forget_own_goal` are how `_invoke_action`'s
+    existing send path tells this tracker which goal ids are its own, so
+    the discovery loop (B2) does not mistake them for someone else's."""
+
+    def __init__(self, node, action_class: type, ros_name: str) -> None:
+        self._action_class = action_class
+        self._ros_name = ros_name
+        # goal_id (str) -> action_msgs.msg.GoalStatus.status (int), for
+        # every goal `_action/status` has ever named, including one that
+        # already ended — `active_goal_ids()` is the live filter over this.
+        self._status: Dict[str, int] = {}
+        # goal_id (str) -> the action's own Feedback message, latest only —
+        # `_emit_job_heartbeats` reads this for both own and external goals
+        # alike; there is no separate, own-goal-only feedback path any
+        # more — own and external goals go through the same code.
+        self._feedback: Dict[str, Any] = {}
+        # goal_id (str) -> the Fleetless job_id that sent it — the only
+        # thing that tells an own goal apart from an external one once both
+        # are enumerated by this same tracker.
+        self._own_job_ids: Dict[str, str] = {}
+        self._status_sub = node.create_subscription(
+            action_class.Impl.GoalStatusMessage,
+            ros_name + "/_action/status",
+            self._on_status,
+            qos_profile_action_status_default,
+        )
+        self._feedback_sub = node.create_subscription(
+            action_class.Impl.FeedbackMessage,
+            ros_name + "/_action/feedback",
+            self._on_feedback,
+            10,
+        )
+        self._cancel_client = node.create_client(
+            action_class.Impl.CancelGoalService, ros_name + "/_action/cancel_goal",
+        )
+        self._result_client = node.create_client(
+            action_class.Impl.GetResultService, ros_name + "/_action/get_result",
+        )
+
+    def destroy(self, node) -> None:
+        node.destroy_subscription(self._status_sub)
+        node.destroy_subscription(self._feedback_sub)
+        node.destroy_client(self._cancel_client)
+        node.destroy_client(self._result_client)
+
+    def _on_status(self, msg: GoalStatusArray) -> None:
+        # Replaces wholesale, not merged — `GoalStatusArray` is the action
+        # server's full current snapshot each time it publishes, not a
+        # delta, and the server itself eventually stops naming a goal once
+        # it ages out of its own registry (`result_timeout`). Merging
+        # would let a goal that fell out of a later snapshot for that
+        # reason keep reading "active" here forever.
+        self._status = {
+            _goal_id_str(entry.goal_info.goal_id): entry.status for entry in msg.status_list
+        }
+
+    def _on_feedback(self, msg) -> None:
+        self._feedback[_goal_id_str(msg.goal_id)] = msg.feedback
+
+    def register_own_goal(self, goal_id: str, job_id: str) -> None:
+        self._own_job_ids[goal_id] = job_id
+
+    def forget_own_goal(self, goal_id: str) -> None:
+        """Called once *any* job for this goal id is settled (any terminal
+        state) — `RosRuntime._forget_goal_mapping` calls it uniformly
+        for an own job and an external one alike, since both share the
+        same `_job_goal_ids` map from protocol 5 on. Drops the goal from
+        every part of this tracker's state, including `_status`: the
+        genuine outcome (`_on_action_result`'s result future, an external
+        goal's own terminal status, or a config-change settlement) is
+        known and told to the cloud *before* this runs, and the
+        `_action/status` topic's own transition to a terminal status is a
+        second, independent, unsynchronised event — without this, a
+        heartbeat tick landing in that narrow gap would still find the
+        goal id `ACCEPTED`/`EXECUTING` here, now unattributed, and mint it
+        a spurious second job for something that already ended.
+
+        The one case this *should* surface as external rather than drop
+        silently — a config change that stops tracking an own goal the
+        real action server is still genuinely running — still does: the
+        next status update the server publishes repopulates this entry,
+        and the discovery loop picks it up fresh, honestly unattributed."""
+        self._own_job_ids.pop(goal_id, None)
+        self._feedback.pop(goal_id, None)
+        self._status.pop(goal_id, None)
+
+    def job_id_for(self, goal_id: str) -> Optional[str]:
+        return self._own_job_ids.get(goal_id)
+
+    def is_own(self, goal_id: str) -> bool:
+        return goal_id in self._own_job_ids
+
+    def active_goal_ids(self) -> Set[str]:
+        """Every goal `_action/status` currently names
+        `ACCEPTED`/`EXECUTING`/`CANCELING` — own and external alike."""
+        return {g for g, status in self._status.items() if status in _ACTIVE_GOAL_STATUSES}
+
+    def feedback_for(self, goal_id: str) -> Any:
+        return self._feedback.get(goal_id)
+
+    def status_of(self, goal_id: str) -> Optional[int]:
+        """The `action_msgs.msg.GoalStatus` value `_action/status` last
+        reported for `goal_id`, or `None` if it has never been named at
+        all. Read by the heartbeat to settle an external goal that just
+        dropped out of `active_goal_ids()` — the terminal status the
+        server itself reported, not a guess."""
+        return self._status.get(goal_id)
+
+    def cancel(self, goal_id: str) -> None:
+        """Fire-and-forget cancel by goal id, via the raw `cancel_goal`
+        service — the one cancel path that works identically for an own
+        goal (which also has a `ClientGoalHandle` reachable through
+        `_active_goals`) and an external one (which has no handle at all,
+        only this). No `service_is_ready()` gate, matching rclpy's own
+        `ClientGoalHandle.cancel_goal_async()`: the request is handed to
+        the middleware regardless, the same way `call_async` always does —
+        gating on readiness here would silently drop a cancel issued in
+        the ordinary, narrow window right after a goal (own or just
+        discovered) becomes active, before this client's own service
+        entity has finished matching."""
+        request = CancelGoal.Request()
+        request.goal_info.goal_id = _goal_id_msg(goal_id)
+        self._cancel_client.call_async(request)
+
+    def request_result(self, goal_id: str, callback: Callable[[Any], None]) -> None:
+        """Fetches a goal's result by id — the startup reconciliation
+        path, for a goal that ended while this process was down.
+        `callback` receives the `rclpy.Future`, the same shape
+        `add_done_callback` always hands one.
+
+        Waits (bounded, blocking the executor thread — acceptable here:
+        this only ever runs once per persisted goal, at startup, never on
+        the ordinary hot path) for the result service to be matched
+        first, unlike `cancel`'s fire-and-forget send: a `get_result`
+        service — plain request/response, not the status topic's
+        transient-local durability — genuinely drops a request sent
+        before the server-side endpoint has matched a brand new client's
+        result client, which a freshly-restarted process always is."""
+        self._result_client.wait_for_service(timeout_sec=RESULT_SERVICE_DISCOVERY_TIMEOUT_S)
+        request = self._action_class.Impl.GetResultService.Request()
+        request.goal_id = _goal_id_msg(goal_id)
+        future = self._result_client.call_async(request)
+        future.add_done_callback(callback)
+
 
 @dataclass
 class _ActionEntry:
@@ -748,6 +986,17 @@ class _ActionEntry:
     parameters: dict = field(default_factory=dict)
     shared_messages: dict = field(default_factory=dict)
     client: object = None  # the rclpy ActionClient, set once created
+    tracker: Optional[GoalTracker] = None
+    # `_check_action_server_liveness`'s debounce state, one per *action*
+    # rather than one per goal: `server_is_ready()` is a fact about
+    # the action/client pair, not about any one goal on it, and an action
+    # can now hold several concurrent active goals (own and/or external)
+    # at once, all of which stop being discoverable together the moment
+    # the server itself goes. See that method for how these four are used.
+    liveness_since: Optional[float] = None
+    liveness_confirmed_ready: bool = False
+    liveness_first_tick: Optional[float] = None
+    liveness_logged: bool = False
 
 
 @dataclass
@@ -1090,9 +1339,16 @@ class RosRuntime:
         live_publisher_factory: Optional[Callable[..., object]] = None,
         snapshot_max_bytes: int = camera.SNAPSHOT_MAX_BYTES,
         max_tracked_jobs: int = MAX_TRACKED_JOBS,
+        goal_state_dir: Optional[pathlib.Path] = None,
     ) -> None:
         self._node_name = node_name
         self._max_tracked_jobs = max_tracked_jobs
+        # Overridable the same way `live_publisher_factory` is — the
+        # default is `goal_state.state_dir()`, resolved lazily in `start()`
+        # rather than here, so `FLEETLESS_STATE_DIR` is read at the same
+        # point in the lifecycle a real launch would set it, and a test can
+        # inject a `tmp_path` without touching the environment.
+        self._goal_state_dir_override = goal_state_dir
         self._node = None
         self._executor: Optional[SingleThreadedExecutor] = None
         self._guard = None
@@ -1135,19 +1391,40 @@ class RosRuntime:
         # state actually became true rather than dating it to the moment of
         # the restatement, the exact bug that field exists to close.
         self._camera_last_reported_error: Dict[str, Tuple[str, str, int]] = {}
-        # job_id -> the rclpy goal handle currently pursuing it — cancel-by-
-        # slug looks the job up in `self.jobs` first, then the handle here.
+        # job_id -> the rclpy goal handle for a goal *this process itself
+        # sent* — only ever populated for the life of that one
+        # `get_result_async()` call (`_on_goal_response`/`_on_action_result`);
+        # own-goal cancel and the 1 Hz heartbeat no longer read this —
+        # own and external goals now go through the same tracker-based
+        # code — see `GoalTracker`, `_cancel_job`, `_emit_job_heartbeats`.
         self._active_goals: Dict[str, object] = {}
-        # job_id -> (feedback_json, progress) last seen for an accepted goal
-        # still in `_active_goals` — written by `_on_action_feedback`, read
-        # by `_emit_job_heartbeats` (1 Hz, protocol 4): the heartbeat has to
-        # restate a job's last known feedback and progress on every tick
-        # whether or not the action said anything new that second, so it
-        # needs somewhere to find "last known" other than the feedback
-        # callback itself, which only ever runs when something *did* arrive.
-        # Popped everywhere `_active_goals` is popped, for the same reason —
-        # a settled job has no "last known" left to restate.
-        self._latest_job_feedback: Dict[str, Tuple[Any, Optional[float]]] = {}
+        # job_id -> the ROS 2 goal id string this bridge reports for it —
+        # for *both* an own job (minted by this process, before
+        # `send_goal_async` is even issued — see `_goal_id_msg`) and an
+        # external one (minted by the discovery loop the moment it is
+        # first reported). `None`/absent for a service job (no ROS
+        # goal exists) or a job settled before it ever had one. What
+        # `_emit_job` reads for every `job_update`'s `goal_id` field, and
+        # what `_cancel_job`/the discovery loop use to ask the tracker
+        # about a specific job. Popped by `_forget_goal_mapping` once the
+        # job reaches a terminal state.
+        self._job_goal_ids: Dict[str, str] = {}
+        # The in-memory mirror of the persisted job_id -> (slug, goal_id)
+        # mapping (`goal_state.py`) — read once at `start()`, written back
+        # (merged, never overwritten wholesale) on every own-goal send and
+        # settlement. Only Fleetless's own action jobs are ever entries
+        # here; see `goal_state.py`'s own docstring for why an external
+        # goal's restart-survival is not a promise this makes.
+        self._goal_mapping: Dict[str, Tuple[str, str]] = {}
+        self._goal_mapping_path: Optional[pathlib.Path] = None
+        # Set once, from `hello_ok` (`set_robot_id`, called by client.py) —
+        # `None` until the first successful handshake, which is also the
+        # first moment either side of the wire can name this robot at all.
+        # The external-goal discovery tick (`_discover_external_goals`)
+        # simply does nothing while this is `None`: a goal discovered before
+        # the first handshake is discovered again on the very next tick,
+        # a heartbeat interval later, at no cost to anything.
+        self._robot_id: Optional[str] = None
         self._snapshot_max_bytes = snapshot_max_bytes
         # job_id -> (slug, deadline, patience_s) for a goal sent but not yet
         # accepted or rejected — only ever touched on the executor thread
@@ -1179,62 +1456,28 @@ class RosRuntime:
         # gained by pruning this set the way `JobManager._jobs` is pruned
         # on delivery — that set exists to bound memory, this one
         # exists to answer a yes/no question forever). Consulted by
-        # `_on_goal_response` (a late accept) and
-        # `_on_action_feedback` (feedback from a goal accepted late must not
-        # keep reporting "running" for a job the cloud already believes
-        # `goal_timeout`, or worse `lost` — that would be exactly the kind
-        # of machine-moving-while-platform-reports-idle situation this fix
-        # exists to prevent).
+        # `_on_goal_response` (a late accept must not report the ordinary
+        # "rejected"/"running" outcomes for a job the cloud already
+        # believes `goal_timeout`).
         self._timed_out_job_ids: Set[str] = set()
         # job_ids `_check_action_server_liveness` has already settled
         # `lost`/`action_server_lost` for — never removed, same "answer a
         # yes/no question forever" reasoning as `_timed_out_job_ids` just
-        # above, and consulted the same way: by `_on_action_feedback` and
-        # `_on_action_result`, so a late feedback or result callback rclpy
-        # still fires for a goal whose server this bridge has already given
-        # up on is silently ignored rather than re-contradicting a job the
-        # cloud was already told is over (spec, "Error handling": "a late
-        # result after action_server_lost: ignored by the bridge").
+        # above, and consulted the same way: by `_on_action_result`, so a
+        # late result callback rclpy still fires for a goal whose server
+        # this bridge has already given up on is silently ignored rather
+        # than re-contradicting a job the cloud was already told is over:
+        # a late result after action_server_lost is ignored by the bridge.
         self._server_lost_job_ids: Set[str] = set()
-        # job_id -> the monotonic time `_check_action_server_liveness` first
-        # found that job's action server not-ready, without a break since —
-        # the debounce state for `ACTION_SERVER_LIVENESS_DEBOUNCE_S`. Popped
-        # the moment a later tick finds the server ready again (a single
-        # missed tick must not count towards the debounce at all, not merely
-        # fail to reach it) and the moment the debounce actually settles the
-        # job, so a job_id here always means "currently mid-debounce", never
-        # a stale watermark from an earlier, already-resolved streak.
-        self._action_liveness_since: Dict[str, float] = {}
-        # job_ids `_check_action_server_liveness` has already logged a
-        # `server_is_ready()` exception for during the *current* not-ready
-        # streak — cleared alongside `_action_liveness_since` the moment a
-        # tick finds the server ready again, so a server that flaps between
-        # raising and answering gets logged once per flap, not merely once
-        # ever. Without this, a server that raises on every tick of a 3 s
-        # debounce (run at `FAILSAFE_CHECK_INTERVAL_S`, i.e. ~300 ticks)
-        # would log 300 times for one outage.
-        self._action_liveness_logged: Set[str] = set()
-        # job_ids `_check_action_server_liveness` has observed
-        # `server_is_ready()` answer `True` for at least once.
-        # `server_is_ready()` on the same `ActionClient` can still read
-        # `False` for several seconds right after a goal is accepted — goal
-        # acceptance only needs the goal-service entity matched, and
-        # `server_is_ready()` additionally waits on the cancel/result
-        # services and the feedback/status topics, which can each finish
-        # matching independently and later, especially on a loaded machine.
-        # Without this guard, that ordinary post-acceptance gap reads
-        # identically to a genuinely vanished server and the debounce fires
-        # on a goal that never stopped being healthy. So a job's debounce
-        # only starts counting *after* this set has seen it ready once —
-        # before that, "not ready yet" is still-discovering, not evidence
-        # of anything gone — or once `ACTION_SERVER_DISCOVERY_GRACE_S` has
-        # passed without it. Cleared alongside `_action_liveness_since`.
-        self._action_liveness_confirmed_ready: Set[str] = set()
-        # job_id -> the monotonic time `_check_action_server_liveness` first
-        # looked at that job — what `ACTION_SERVER_DISCOVERY_GRACE_S` is
-        # measured from for a job never yet confirmed ready. Cleared with
-        # the three above (`_forget_action_liveness`).
-        self._action_liveness_first_tick: Dict[str, float] = {}
+        # The liveness debounce itself (`ACTION_SERVER_LIVENESS_DEBOUNCE_S`,
+        # `ACTION_SERVER_DISCOVERY_GRACE_S`) is no longer job-id-keyed state
+        # here — moved into one state per *action* instead (an action can now
+        # hold several concurrent goals, own and external, all of which
+        # share one answer to "is the server there"): see
+        # `_ActionEntry.liveness_since`/`.liveness_confirmed_ready`/
+        # `.liveness_first_tick`/`.liveness_logged`, read and written only
+        # by `_check_action_server_liveness`, and gone automatically with
+        # the entry itself once the slug is destroyed or retargeted.
         # job_ids cancelled before the action server has answered
         # send_goal_async: `_active_goals[job_id]`
         # is only populated once accepted, in `_on_goal_response` — a
@@ -1350,6 +1593,14 @@ class RosRuntime:
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+        # Read once, before anything else — B3's persisted job -> goal
+        # mapping. Plain file I/O, safe here (the executor thread has not
+        # started spinning yet). Reconciliation against the live ROS graph
+        # happens later, per slug, in `_create_action` — actions do not
+        # exist until the cloud's first `config` frame applies them, which
+        # is always after this.
+        self._goal_mapping_path = mapping_path(self._goal_state_dir_override)
+        self._goal_mapping = load_mapping(self._goal_mapping_path)
         rclpy.init(args=[])
         self._node = rclpy.create_node(self._node_name)
         self._executor = SingleThreadedExecutor()
@@ -1725,6 +1976,14 @@ class RosRuntime:
             except Exception:  # noqa: BLE001 - a lever that failed must not end the session
                 log.exception("Could not re-target the live bitrate for slug %r", slug)
 
+    def set_robot_id(self, robot_id: str) -> None:
+        """Called by client.py the moment `hello_ok` names this robot.
+        Plain and synchronous, same reasoning as `set_connected` just
+        below: a single-reference assignment the executor thread's
+        discovery tick reads, safe without a lock under the GIL the same
+        way `_connected`/`_lb_active` already are."""
+        self._robot_id = robot_id
+
     def set_connected(self, connected: bool) -> None:
         """Called by client.py when a session starts (`True`, right after
         `hello_ok`) and ends (`False`, in `_converse`'s `finally`). Plain and
@@ -1795,6 +2054,48 @@ class RosRuntime:
         stale cancel for a job that just finished on its own is not an
         error."""
         await self._submit_async(lambda: self._cancel_job(slug, job_id))
+
+    async def job_query(
+        self, job_ids: Sequence[str]
+    ) -> Tuple[List[JobStatusEntry], List[str]]:
+        """Answers the cloud's `job_query`: for each id, this process's current
+        answer — own or external, `self.jobs` does not distinguish for
+        this purpose — or, for an id it has never heard of at all
+        (never invoked, not in the persisted mapping, not an active
+        external goal), a place in the second, `unknown_job_ids` list
+        instead. `feedback`/`progress` are only ever filled in for a
+        `running` job — a terminal-but-undelivered one answers with just
+        its `state`; the fuller frame (`result`/`error`) is already
+        queued and reaches the cloud moments later through the ordinary
+        `job_update` pump regardless of what this answers."""
+        return await self._submit_async(lambda: self._job_query(job_ids))
+
+    def _job_query(self, job_ids: Sequence[str]) -> Tuple[List[JobStatusEntry], List[str]]:
+        entries: List[JobStatusEntry] = []
+        unknown_job_ids: List[str] = []
+        for job_id in job_ids:
+            state = self.jobs.state_of(job_id)
+            if state is None:
+                unknown_job_ids.append(job_id)
+                continue
+            feedback_json: Any = None
+            progress: Optional[float] = None
+            if state == "running":
+                slug = self.jobs.slug_for(job_id)
+                goal_id = self._job_goal_ids.get(job_id)
+                entry = self._actions.get(slug) if slug is not None else None
+                if entry is not None and entry.tracker is not None and goal_id is not None:
+                    feedback_msg = entry.tracker.feedback_for(goal_id)
+                    if feedback_msg is not None:
+                        feedback_json = sampling.message_to_json(feedback_msg)
+                        progress = self._extract_progress(feedback_msg)
+            entries.append(
+                JobStatusEntry(
+                    job_id=job_id, state=state, feedback=feedback_json, progress=progress,
+                    result=None, error=None,
+                )
+            )
+        return entries, unknown_job_ids
 
     async def apply_services(
         self,
@@ -2437,11 +2738,13 @@ class RosRuntime:
             # one.
             return
         self._active_goals.pop(job_id, None)
-        self._latest_job_feedback.pop(job_id, None)
         self._goal_deadlines.pop(job_id, None)
         self._pending_cancels.discard(job_id)
         self._service_deadlines.pop(job_id, None)
-        self._forget_action_liveness(job_id)
+        # No per-job liveness state to drop any more — it lives on the
+        # `_ActionEntry`, which the caller destroys right after this call
+        # returns; see `RosRuntime.__init__`'s note beside
+        # `_server_lost_job_ids`.
         self._emit_job(job_id, slug, "lost", error=("config_changed", reason))
 
     # --- actions: apply, runs on the executor thread ------------------------
@@ -2510,7 +2813,8 @@ class RosRuntime:
         )
 
         client = ActionClient(self._node, action_class, cfg.ros_name)
-        self._actions[slug] = _ActionEntry(
+        tracker = GoalTracker(self._node, action_class, cfg.ros_name)
+        entry = _ActionEntry(
             ros_name=cfg.ros_name,
             type_name=cfg.type,
             action_class=action_class,
@@ -2518,11 +2822,78 @@ class RosRuntime:
             parameters=cfg.parameters,
             shared_messages=messages,
             client=client,
+            tracker=tracker,
         )
+        self._actions[slug] = entry
+        self._reconcile_persisted_goals(slug, entry)
+
+    def _reconcile_persisted_goals(self, slug: str, entry: "_ActionEntry") -> None:
+        """B3: whatever the persisted mapping (`goal_state.py`, read once
+        in `start()`) still names for `slug`, re-attach to it via
+        `get_result` on the tracker's raw service — the action server
+        itself, not any local guess, is the source of truth:
+
+        - **Still genuinely active:** the server defers its answer until
+          the goal actually finishes (rclpy's own action server behaviour
+          — a result future only resolves on a terminal status), so this
+          eventually reports the real outcome exactly as it would for a
+          goal sent this session. Meanwhile `register_own_goal` below
+          already makes the ordinary 1 Hz heartbeat pick it up as
+          `running` the moment `_action/status` reports it live again.
+        - **Already ended while this process was down:** the server
+          answers at once with the real terminal state and result — this
+          is what re-fetches an outcome missed while the bridge was
+          offline.
+        - **The server no longer recognises the goal at all**
+          (`GoalStatus.STATUS_UNKNOWN` — its result expired, or a
+          different server entirely since the restart): `lost`/
+          `job_unknown_to_bridge`."""
+        for job_id, (mapped_slug, goal_id) in list(self._goal_mapping.items()):
+            if mapped_slug != slug:
+                continue
+            self.jobs.start(job_id, slug, "action")
+            self._job_goal_ids[job_id] = goal_id
+            entry.tracker.register_own_goal(goal_id, job_id)
+            entry.tracker.request_result(
+                goal_id,
+                lambda future, job_id=job_id, slug=slug: self._on_reconciled_goal_result(
+                    job_id, slug, future
+                ),
+            )
+
+    def _on_reconciled_goal_result(self, job_id: str, slug: str, future) -> None:
+        try:
+            response = future.result()
+        except Exception as exc:  # noqa: BLE001 - reported to the caller, not raised here
+            self._emit_job(job_id, slug, "lost", error=("job_unknown_to_bridge", str(exc)))
+            return
+        if response.status == GoalStatus.STATUS_UNKNOWN:
+            self._emit_job(
+                job_id, slug, "lost",
+                error=(
+                    "job_unknown_to_bridge",
+                    "the action server no longer recognises this goal",
+                ),
+            )
+            return
+        result_json = sampling.message_to_json(response.result)
+        if response.status == GoalStatus.STATUS_SUCCEEDED:
+            self._emit_job(job_id, slug, "succeeded", result=result_json)
+        elif response.status == GoalStatus.STATUS_CANCELED:
+            self._emit_job(job_id, slug, "cancelled", result=result_json)
+        else:
+            self._emit_job(
+                job_id, slug, "failed", result=result_json,
+                error=("action_failed", "the action ended with status {}".format(response.status)),
+            )
 
     def _destroy_action(self, slug: str) -> None:
         entry = self._actions.pop(slug, None)
-        if entry is not None and entry.client is not None:
+        if entry is None:
+            return
+        if entry.tracker is not None:
+            entry.tracker.destroy(self._node)
+        if entry.client is not None:
             entry.client.destroy()
 
     # --- commands: kicked off on the executor thread, finish via callbacks -
@@ -2622,62 +2993,104 @@ class RosRuntime:
         patience_s = patience_ms / 1000.0
         self._goal_deadlines[job_id] = (slug, time.monotonic() + patience_s, patience_s)
 
-        def feedback_callback(feedback_msg, job_id=job_id, slug=slug):
-            self._on_action_feedback(job_id, slug, feedback_msg.feedback)
+        # The bridge chooses the goal id itself, rather than letting rclpy
+        # generate a random one inside `send_goal_async` — so it is known,
+        # and persisted (B3, "written before the goal is sent"), *before*
+        # anything is sent at all. Registered with the tracker up front
+        # too: `_on_status`/`_on_feedback` can start firing for this goal id
+        # the instant the server accepts it, on the executor thread, quite
+        # possibly before `send_goal_async`'s own done-callback below ever
+        # runs — the tracker must already know this goal is ours by then,
+        # or the discovery loop would mint it a second, external job.
+        goal_id = str(uuid.uuid4())
+        self._job_goal_ids[job_id] = goal_id
+        if entry.tracker is not None:
+            entry.tracker.register_own_goal(goal_id, job_id)
+        self._goal_mapping[job_id] = (slug, goal_id)
+        self._save_goal_mapping()
 
-        send_future = entry.client.send_goal_async(goal_msg, feedback_callback=feedback_callback)
+        send_future = entry.client.send_goal_async(goal_msg, goal_uuid=_goal_id_msg(goal_id))
         send_future.add_done_callback(
             lambda fut, job_id=job_id, slug=slug: self._on_goal_response(job_id, slug, fut)
         )
 
     def _cancel_job(self, slug: str, job_id: Optional[str]) -> None:
+        """Cancel by goal id, through the tracker — the one cancel
+        path that works identically whether the job is Fleetless's own or
+        `origin: external`, and whether or not this process holds a
+        `ClientGoalHandle` for it (a reconciled-from-persistence own job
+        never gets one).
+
+        `job_id=None` still means "whatever is running on `slug`". A
+        named `job_id` that does not match what `self.jobs` currently
+        calls the slug's occupant is refused *unless* the tracker has no
+        active goal for that named id at all — an old job id whose slug is
+        now occupied by a different goal: the console only ever shows one
+        job per slug, so its cancel button must reach whatever is actually
+        running there, not fail silently over an id that is simply stale.
+        `cloudCancel` already carries `slug` alongside `job_id`; no
+        protocol change."""
+        entry = self._actions.get(slug)
+        active_goal_ids = (
+            entry.tracker.active_goal_ids() if entry is not None and entry.tracker is not None else set()
+        )
         running_job_id = self.jobs.running_job_id(slug)
-        if running_job_id is None:
+        target_job_id = job_id if job_id is not None else running_job_id
+        if target_job_id is None:
             log.info("Cancel for slug %r: nothing running, silent no-op", slug)
-            return  # nothing running for this slug
-        if job_id is not None and job_id != running_job_id:
-            # A caller who named an id has ruled out "whatever is running"
-            # as the answer — falling back to the slug would cancel a
-            # machine they did not name. Distinguishable from the
-            # "nothing running" no-op above on purpose: those two silences
-            # used to be the same message, which is how a stale id and an
-            # idle slug both read as "cancel did nothing", indistinguishably
-            # — exactly the addressing gap this method exists to close.
+            return
+
+        target_goal_id = self._job_goal_ids.get(target_job_id)
+        if job_id is not None and job_id != running_job_id and target_goal_id not in active_goal_ids:
+            if active_goal_ids:
+                log.warning(
+                    "Cancel for slug %r named job %r, which the tracker has no "
+                    "active goal for — cancelling every goal currently active "
+                    "on this action instead",
+                    slug, job_id,
+                )
+                for goal_id in list(active_goal_ids):
+                    entry.tracker.cancel(goal_id)
+                return
+            # Distinguishable from the "nothing running" no-op above on
+            # purpose: those two silences used to be the same message,
+            # which is how a stale id and an idle slug both read as
+            # "cancel did nothing", indistinguishably.
             log.warning(
                 "Cancel for slug %r named job %r, but %r is running — "
                 "refusing rather than cancelling the wrong job",
                 slug, job_id, running_job_id,
             )
             return
-        goal_handle = self._active_goals.get(running_job_id)
-        if goal_handle is None:
-            if running_job_id in self._goal_deadlines:
-                # sent, not yet accepted or rejected — there is no
-                # goal handle to cancel *yet*, but there will be one, or a
-                # rejection that makes the question moot. Remembered rather
-                # than dropped; `_on_goal_response` applies it the instant
-                # the window closes either way.
-                self._pending_cancels.add(running_job_id)
-                log.info(
-                    "Cancel for slug %r (job %r): the goal has not been "
-                    "accepted yet — remembered, will apply once it is",
-                    slug, running_job_id,
-                )
-                return
-            # A service call, or any other kind with no ROS-level cancel —
-            # a genuine no-op, not a dropped one; logged anyway so "cancel"
-            # is discoverable in the logs for every branch that reaches
-            # here, not just two of the three.
+
+        if target_job_id in self._goal_deadlines:
+            # Sent, not yet accepted or rejected — there is no goal on the
+            # server to cancel *yet*, but there will be one, or a rejection
+            # that makes the question moot. Remembered rather than
+            # dropped; `_on_goal_response` applies it the instant the
+            # window closes either way.
+            self._pending_cancels.add(target_job_id)
             log.info(
-                "Cancel for slug %r (job %r): no ROS-level cancel exists for this job",
-                slug, running_job_id,
+                "Cancel for slug %r (job %r): the goal has not been "
+                "accepted yet — remembered, will apply once it is",
+                slug, target_job_id,
             )
             return
-        # The eventual "cancelled" job_update comes from the ordinary result
-        # callback once the server confirms (STATUS_CANCELED) — this call
-        # only has to ask, not report; that keeps there being exactly one
-        # place a job's terminal state is decided.
-        goal_handle.cancel_goal_async()
+
+        if target_goal_id is not None and target_goal_id in active_goal_ids and entry is not None and entry.tracker is not None:
+            # The eventual "cancelled" job_update comes from the ordinary
+            # status/result path once the server confirms — this call only
+            # has to ask, not report; exactly one place still decides a
+            # job's terminal state.
+            entry.tracker.cancel(target_goal_id)
+            return
+        # A service call, or any other kind with no ROS-level cancel — a
+        # genuine no-op, not a dropped one; logged anyway so "cancel" is
+        # discoverable in the logs for every branch that reaches here.
+        log.info(
+            "Cancel for slug %r (job %r): no ROS-level cancel exists for this job",
+            slug, target_job_id,
+        )
 
     # --- action goal lifecycle: every callback below runs on the executor --
 
@@ -2789,33 +3202,6 @@ class RosRuntime:
             job_id, slug,
         )
 
-    def _on_action_feedback(self, job_id: str, slug: str, feedback_msg) -> None:
-        if job_id in self._timed_out_job_ids or job_id in self._server_lost_job_ids:
-            # This goal was accepted after the cloud was already told
-            # `goal_timeout` (or, if the corrective cancel was refused,
-            # `lost`), or its action server has since been declared gone
-            # (`action_server_lost`) — its `feedback_callback` was
-            # registered before either was known and rclpy keeps invoking it
-            # regardless. Reporting "running" now would contradict what the
-            # cloud was already told, for a job it may believe closed.
-            return
-        feedback_json = sampling.message_to_json(feedback_msg)
-        progress = self._extract_progress(feedback_msg)
-        # Remembered for `_emit_job_heartbeats`, which has to restate "last
-        # known feedback and progress" on every 1 Hz tick whether or not the
-        # action said anything new that second — this callback is the only
-        # place that ever learns what "last known" is.
-        self._latest_job_feedback[job_id] = (feedback_json, progress)
-        timestamp_ms = sampling.capture_timestamp_ms()
-        self._emit_job(
-            job_id,
-            slug,
-            "running",
-            feedback=feedback_json,
-            progress=progress,
-            timestamp_ms=timestamp_ms,
-        )
-
     @staticmethod
     def _extract_progress(feedback_msg) -> Optional[float]:
         """Best-effort only: a feedback message with a top-level `progress`
@@ -2838,8 +3224,6 @@ class RosRuntime:
 
     def _on_action_result(self, job_id: str, slug: str, future) -> None:
         self._active_goals.pop(job_id, None)
-        self._latest_job_feedback.pop(job_id, None)
-        self._forget_action_liveness(job_id)
         if job_id in self._server_lost_job_ids:
             # This job's action server was already declared gone — the
             # cloud was told `lost`/`action_server_lost` and the slug was
@@ -2869,45 +3253,107 @@ class RosRuntime:
             )
 
     def _emit_job_heartbeats(self) -> None:
-        """Protocol 4's 1 Hz `job_update` heartbeat (`JOB_HEARTBEAT_INTERVAL_MS`):
-        every job still in `_active_goals` — accepted and not
-        yet settled — gets a `running` frame on every tick, carrying its
-        last known `progress`/`feedback` (`_latest_job_feedback`,
-        `_on_action_feedback`) whether or not the action itself said
-        anything new this second. `timestamp_ms` is this tick's own capture
-        time, not the feedback's — a heartbeat's whole job is to tell the
-        cloud "still alive, as of *now*", and dating it to a feedback frame
-        that may be several ticks stale would undersell exactly the
-        liveness this exists to state.
+        """The 1 Hz `job_update` heartbeat (`JOB_HEARTBEAT_INTERVAL_MS`,
+        protocol 5) and, in the same pass, the discovery tick for external
+        goals: for every configured action, the tracker's
+        `active_goal_ids()` is asked for every goal currently
+        `ACCEPTED`/`EXECUTING`/`CANCELING` on it — own and external alike,
+        the same enumeration for both. An id the tracker cannot attribute
+        to a job this process itself sent is a goal nobody here asked
+        for: its Fleetless job id is derived (`external_job_id`,
+        deterministic in robot/slug/goal id, so re-discovering the same
+        goal never mints a second job) and registered with `self.jobs`
+        the first time it is seen — no cloud round trip needed to "mint"
+        it, the cloud does that itself on first receipt.
 
-        Silent about jobs that are not in `_active_goals` for any reason
-        (never accepted, already settled, timed out, or lost) — there is
-        nothing to heartbeat for a job this bridge does not currently
-        believe is running, and every one of those paths already sends its
-        own, more specific word about the job."""
-        if not self._active_goals:
+        One `job_update` per still-active goal per tick, `running`,
+        carrying its latest known feedback/progress whether or not the
+        action said anything new this second — `timestamp_ms` is this
+        tick's own capture time, not the feedback's, so a heartbeat never
+        undersells how stale its content is.
+
+        **A goal that starts and fully ends between two ticks is never
+        reported at all**: the
+        tracker only ever offers a goal id here if `active_goal_ids()`
+        calls it active *at this tick*, and one that both started and
+        ended between ticks never is, at either tick. This is the one case
+        where silence is correct, not a bug.
+
+        **An external job that *was* active and just ended still gets one
+        last, authoritative word.** Nothing else ever learns an external
+        goal's outcome — there is no result-future callback for a goal
+        this process never sent, unlike an own job's `_on_action_result` —
+        so once its goal id drops out of `active_goal_ids()`, this same
+        tick settles it from whatever terminal status `_action/status`
+        last reported, keeping the "external jobs are live jobs" promise
+        honest rather than leaving the cloud to time it out.
+
+        An *own* goal heartbeats regardless of `self._robot_id` — nothing
+        about reporting a job this process itself started needs the robot
+        id. Only *minting* an external job needs it (external ids are
+        derived from it); a foreign goal discovered before the first
+        successful `hello_ok` is simply skipped for this tick and
+        discovered again, identically, on the next one, once there is
+        somewhere to tell the cloud about it at all."""
+        if not self._actions:
             return
         timestamp_ms = sampling.capture_timestamp_ms()
         # In low-bandwidth mode `feedback` is null, `progress` stays — the
-        # mode's whole point is trimming the
-        # bytes-heavy field, not the number that tells an app how far along
-        # a job is.
+        # mode's whole point is trimming the bytes-heavy field, not the
+        # number that tells an app how far along a job is.
         low_bandwidth = self._lb_active
-        for job_id in list(self._active_goals):
-            slug = self.jobs.slug_for(job_id)
-            if slug is None:
-                # Settled (and possibly already delivered) between building
-                # this snapshot and reaching it here — nothing left to
-                # heartbeat for it this tick.
+        for slug, entry in list(self._actions.items()):
+            if entry.tracker is None:
                 continue
-            feedback, progress = self._latest_job_feedback.get(job_id, (None, None))
+            for goal_id in entry.tracker.active_goal_ids():
+                job_id = entry.tracker.job_id_for(goal_id)
+                if job_id is None:
+                    if self._robot_id is None:
+                        continue  # nothing to name this external goal with yet
+                    job_id = external_job_id(self._robot_id, slug, goal_id)
+                    self.jobs.register_external(job_id, slug)
+                    self._job_goal_ids[job_id] = goal_id
+                feedback_msg = entry.tracker.feedback_for(goal_id)
+                if feedback_msg is None:
+                    feedback_json, progress = None, None
+                else:
+                    feedback_json = sampling.message_to_json(feedback_msg)
+                    progress = self._extract_progress(feedback_msg)
+                self._emit_job(
+                    job_id,
+                    slug,
+                    "running",
+                    feedback=None if low_bandwidth else feedback_json,
+                    progress=progress,
+                    timestamp_ms=timestamp_ms,
+                )
+        for job_id, slug, state in self.jobs.active_jobs():
+            if state != "running" or self.jobs.origin_of(job_id) != "external":
+                continue
+            goal_id = self._job_goal_ids.get(job_id)
+            if goal_id is None:
+                continue
+            entry = self._actions.get(slug)
+            if entry is None or entry.tracker is None or goal_id in entry.tracker.active_goal_ids():
+                continue
+            self._settle_external_goal(job_id, slug, entry.tracker.status_of(goal_id))
+
+    def _settle_external_goal(self, job_id: str, slug: str, status: Optional[int]) -> None:
+        """An external job whose goal just dropped out of
+        `active_goal_ids()` — settled from the terminal status
+        `_action/status` last reported for it, the only source of truth
+        this process has for a goal it never sent. No result payload:
+        the status topic carries only the enum, not the action's `Result`
+        message — an external job's `result` stays `null` on every state,
+        matching what it already is while `running`."""
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self._emit_job(job_id, slug, "succeeded")
+        elif status == GoalStatus.STATUS_CANCELED:
+            self._emit_job(job_id, slug, "cancelled")
+        else:
             self._emit_job(
-                job_id,
-                slug,
-                "running",
-                feedback=None if low_bandwidth else feedback,
-                progress=progress,
-                timestamp_ms=timestamp_ms,
+                job_id, slug, "failed",
+                error=("action_failed", "the action ended with status {}".format(status)),
             )
 
     # --- services: apply, runs on the executor thread ------------------------
@@ -3851,119 +4297,127 @@ class RosRuntime:
             )
 
     def _check_action_server_liveness(self) -> None:
-        """A goal already accepted
-        gets no timeout, but it does get a liveness check — the gap
-        `_check_goal_timeouts` deliberately does not cover, since that one
-        only bounds *acceptance*. For every job still in `_active_goals`,
+        """A goal already accepted gets no timeout, but it does get a
+        liveness check — the gap `_check_goal_timeouts` deliberately does
+        not cover, since that one only bounds *acceptance*.
         `entry.client.server_is_ready()` says whether *some* server is
-        still matched on the graph for that slug's action name; `False`
-        for `ACTION_SERVER_LIVENESS_DEBOUNCE_S` straight — not merely on
-        the latest tick — settles the job `lost`/`action_server_lost` (see
-        `_settle_action_server_lost`).
+        still matched on the graph for a slug's action name; `False` for
+        `ACTION_SERVER_LIVENESS_DEBOUNCE_S` straight — not merely on the
+        latest tick — settles *every* goal the tracker currently calls
+        active on that action, own and external alike, together
+        (`_settle_action_server_lost`): own goals end
+        `action_server_lost` exactly as before, and its external goals are
+        dropped the same way, since "is the server there" is one fact
+        about the action, not a separate fact per goal on it.
 
-        **The debounce only starts once this job's server has been seen
-        ready at least once** (`_action_liveness_confirmed_ready`). Right
-        after a goal is accepted, `server_is_ready()` on the very same
+        One debounce state per *action* now, not per job (`_ActionEntry`'s
+        four `liveness_*` fields) — an action can hold several concurrent
+        active goals, and they must debounce together, not restart the
+        clock for each other as jobs come and go on it.
+
+        **The debounce only starts once this action's server has been seen
+        ready at least once** (`liveness_confirmed_ready`). Right after a
+        goal is accepted, `server_is_ready()` on the very same
         `ActionClient` can still read `False` for several seconds —
         acceptance only needs the goal-service entity matched,
         `server_is_ready()` additionally waits on the cancel/result
         services and the feedback/status topics, and those can each finish
         matching independently and later, especially on a loaded machine.
         Treating that ordinary post-acceptance gap as indistinguishable
-        from a genuinely vanished server would settle a goal that never
-        stopped being healthy — so a `False` reading before this job's
+        from a genuinely vanished server would settle goals that never
+        stopped being healthy — so a `False` reading before this action's
         server was ever confirmed ready is silently ignored, still
         discovering rather than lost — for at most
-        `ACTION_SERVER_DISCOVERY_GRACE_S` after this check first saw the
-        job. Past that, the debounce counts regardless: a server that never
-        once answered ready is as gone as one that stopped.
+        `ACTION_SERVER_DISCOVERY_GRACE_S` after this check first saw a
+        goal active on it. Past that, the debounce counts regardless: a
+        server that never once answered ready is as gone as one that
+        stopped.
 
         No cancel is attempted anywhere in this method, deliberately: a
         server this bridge cannot even discover has nothing on the other
-        end of a cancel to receive it, and this is not a gap worth closing —
-        Fleetless is not a
-        safety layer, and the robot's own reflexes, e-stop and controller
-        timeouts are what a genuinely uncontrollable robot depends on, not
-        a cancel this bridge cannot deliver anyway."""
+        end of a cancel to receive it, and this is not a gap worth
+        closing — Fleetless is not a safety layer, and the robot's own
+        reflexes, e-stop and controller timeouts are what a genuinely
+        uncontrollable robot depends on, not a cancel this bridge cannot
+        deliver anyway."""
         now = time.monotonic()
-        for job_id in list(self._active_goals):
-            slug = self.jobs.slug_for(job_id)
-            if slug is None:
-                continue  # settled between building this snapshot and reaching it here
-            entry = self._actions.get(slug)
-            if entry is None or entry.client is None:
+        for slug, entry in list(self._actions.items()):
+            if entry.client is None or entry.tracker is None:
                 continue
-            first_tick = self._action_liveness_first_tick.setdefault(job_id, now)
+            active_goal_ids = entry.tracker.active_goal_ids()
+            if not active_goal_ids:
+                # Nothing to lose right now — reset so a goal accepted
+                # later starts its own discovery window rather than
+                # inheriting a stale mid-debounce state from a previous,
+                # unrelated goal on this same action.
+                entry.liveness_since = None
+                entry.liveness_confirmed_ready = False
+                entry.liveness_first_tick = None
+                entry.liveness_logged = False
+                continue
+            first_tick = entry.liveness_first_tick if entry.liveness_first_tick is not None else now
+            entry.liveness_first_tick = first_tick
             try:
                 ready = entry.client.server_is_ready()
             except Exception:  # noqa: BLE001 - treated as not-ready; see debounce below
                 ready = False
-                if job_id not in self._action_liveness_logged:
+                if not entry.liveness_logged:
                     log.exception(
-                        "server_is_ready() raised for job %r (slug %r) — treated as "
-                        "not-ready for the %.0fs liveness debounce",
-                        job_id, slug, ACTION_SERVER_LIVENESS_DEBOUNCE_S,
+                        "server_is_ready() raised for slug %r — treated as not-ready "
+                        "for the %.0fs liveness debounce",
+                        slug, ACTION_SERVER_LIVENESS_DEBOUNCE_S,
                     )
-                    self._action_liveness_logged.add(job_id)
+                    entry.liveness_logged = True
             if ready:
-                self._action_liveness_confirmed_ready.add(job_id)
-                self._action_liveness_since.pop(job_id, None)
-                self._action_liveness_logged.discard(job_id)
+                entry.liveness_confirmed_ready = True
+                entry.liveness_since = None
+                entry.liveness_logged = False
                 continue
-            if (
-                job_id not in self._action_liveness_confirmed_ready
-                and now - first_tick < ACTION_SERVER_DISCOVERY_GRACE_S
-            ):
+            if not entry.liveness_confirmed_ready and now - first_tick < ACTION_SERVER_DISCOVERY_GRACE_S:
                 continue  # never yet seen ready — still discovering, not evidence of anything gone
-            since = self._action_liveness_since.setdefault(job_id, now)
+            since = entry.liveness_since if entry.liveness_since is not None else now
+            entry.liveness_since = since
             if now - since < ACTION_SERVER_LIVENESS_DEBOUNCE_S:
                 continue
-            self._settle_action_server_lost(job_id, slug)
+            self._settle_action_server_lost(slug, entry, active_goal_ids)
 
-    def _forget_action_liveness(self, job_id: str) -> None:
-        """Drops everything `_check_action_server_liveness` keeps per job.
-        Called wherever a job leaves `_active_goals` for good — its own
-        result, a config change, the liveness settle itself — so none of it
-        outlives the job."""
-        self._action_liveness_since.pop(job_id, None)
-        self._action_liveness_logged.discard(job_id)
-        self._action_liveness_confirmed_ready.discard(job_id)
-        self._action_liveness_first_tick.pop(job_id, None)
-
-    def _settle_action_server_lost(self, job_id: str, slug: str) -> None:
+    def _settle_action_server_lost(
+        self, slug: str, entry: "_ActionEntry", goal_ids: Set[str]
+    ) -> None:
         """The debounce in `_check_action_server_liveness` just expired for
-        `job_id`: its action server has been unreachable for a straight
-        `ACTION_SERVER_LIVENESS_DEBOUNCE_S`, which ends the job
-        `lost`/`action_server_lost` —
-        not `failed`, because nobody here knows whether the robot actually
-        reached its goal before the server vanished, and `lost` is the
-        contract's own "outcome unknown".
+        `slug`'s action: its server has been unreachable for a straight
+        `ACTION_SERVER_LIVENESS_DEBOUNCE_S`. Every goal `goal_ids` names —
+        own and external alike — ends `lost`/`action_server_lost`, not
+        `failed`: nobody here knows whether the robot actually reached its
+        goal before the server vanished, and `lost` is the contract's own
+        "outcome unknown" for an own goal (unchanged behaviour) and the
+        honest end of a live-only external job that can no longer be
+        anything else.
 
-        Mirrors `_settle_orphaned_job`'s shape on purpose: popping
-        `_active_goals` (and the debounce/feedback bookkeeping that rides
-        alongside it) and then emitting a terminal update is the whole
-        mechanism that frees the slug — `JobManager.finish()` runs once
-        this update is actually delivered (`mark_delivered`), the same as
-        any other terminal outcome, so there is no second, explicit
-        "free the slug" step to perform here. `job_id` also joins
-        `_server_lost_job_ids` so a feedback or result callback rclpy still
-        fires for this goal later is silently ignored rather than
-        contradicting a job the cloud was already told is over."""
-        self._active_goals.pop(job_id, None)
-        self._latest_job_feedback.pop(job_id, None)
-        self._forget_action_liveness(job_id)
-        self._server_lost_job_ids.add(job_id)
-        self._emit_job(
-            job_id,
-            slug,
-            "lost",
-            error=(
-                "action_server_lost",
-                "the action server for slug {!r} has been unreachable for over {:.0f}s".format(
-                    slug, ACTION_SERVER_LIVENESS_DEBOUNCE_S
-                ),
+        The debounce state resets here too — the same action, reconfigured
+        later with a fresh client, starts its own discovery window rather
+        than inheriting an expired one."""
+        entry.liveness_since = None
+        entry.liveness_confirmed_ready = False
+        entry.liveness_first_tick = None
+        entry.liveness_logged = False
+        error = (
+            "action_server_lost",
+            "the action server for slug {!r} has been unreachable for over {:.0f}s".format(
+                slug, ACTION_SERVER_LIVENESS_DEBOUNCE_S
             ),
         )
+        for goal_id in list(goal_ids):
+            job_id = entry.tracker.job_id_for(goal_id)
+            if job_id is None:
+                if self._robot_id is None:
+                    continue  # nothing to name this external goal with yet
+                job_id = external_job_id(self._robot_id, slug, goal_id)
+                self.jobs.register_external(job_id, slug)
+                self._job_goal_ids[job_id] = goal_id
+            self._active_goals.pop(job_id, None)
+            self._server_lost_job_ids.add(job_id)
+            self._emit_job(job_id, slug, "lost", error=error)
 
     async def next_snapshot(self, max_bytes: int) -> Optional[bytes]:
         """The wire-ready bytes of the next snapshot that is due, or `None`
@@ -5450,6 +5904,22 @@ class RosRuntime:
         details: Any = None,
         timestamp_ms: Optional[int] = None,
     ) -> None:
+        """Every word this bridge says about a job goes through here — which
+        is also why `origin` and `goal_id` (protocol 5) need no new
+        parameter at any call site: `origin` is always
+        `self.jobs.origin_of(job_id)` (defaulting to `'fleetless'` for a
+        job not yet started, e.g. `unknown_slug`/`job_queue_full`, which
+        never has any other origin), and `goal_id` is always
+        `self._job_goal_ids.get(job_id)` — set in `_invoke_action` before
+        the goal is even sent (B3), so it is already correct by the time
+        anything can be reported about it, and `None` again once a first
+        terminal report has already forgotten it (`_forget_goal_mapping`) —
+        the one case this loses precision is a second, corrective report
+        for the same job_id (`_on_late_goal_cancel`), which then carries no
+        goal_id; acceptable, since the job_id and its (unchanged) error are
+        what that correction exists to convey."""
+        resolved_goal_id = self._job_goal_ids.get(job_id)
+        origin = self.jobs.origin_of(job_id) or "fleetless"
         self.jobs.emit(
             self._loop,
             JobUpdate(
@@ -5462,5 +5932,29 @@ class RosRuntime:
                 result=result,
                 error=error,
                 details=details,
+                origin=origin,
+                goal_id=resolved_goal_id,
             ),
         )
+        if state in _JOB_TERMINAL_STATES:
+            self._forget_goal_mapping(job_id, slug)
+
+    def _forget_goal_mapping(self, job_id: str, slug: str) -> None:
+        """A job just reached a terminal state — the tracker no longer
+        needs to tell this job's own goal apart from an external one, and
+        the persisted mapping entry, if any (removed once the job is
+        terminal and reported), is dropped and the file rewritten.
+        A no-op for a service job or an action job settled before it ever
+        had a goal id — `self._job_goal_ids` simply has nothing to pop."""
+        goal_id = self._job_goal_ids.pop(job_id, None)
+        if goal_id is None:
+            return
+        entry = self._actions.get(slug)
+        if entry is not None and entry.tracker is not None:
+            entry.tracker.forget_own_goal(goal_id)
+        if self._goal_mapping.pop(job_id, None) is not None:
+            self._save_goal_mapping()
+
+    def _save_goal_mapping(self) -> None:
+        if self._goal_mapping_path is not None:
+            save_mapping(self._goal_mapping_path, self._goal_mapping)

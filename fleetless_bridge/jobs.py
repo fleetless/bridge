@@ -51,6 +51,17 @@ class JobUpdate:
     result: Any = None
     error: Optional[Tuple[str, str]] = None
     details: Any = None
+    # Both required on the wire (contracts' bridgeJobUpdate, protocol 5) but
+    # defaulted here so every existing call site — all of them a
+    # 'fleetless' job with no ROS goal to report yet — need not be touched.
+    # 'external' is only ever passed explicitly, by the goal tracker's own
+    # discovery/heartbeat path (ros_runtime.py). `goal_id` is the ROS 2 goal
+    # id string for an action job, or `None` for a service job (no ROS
+    # goal exists) or a job that has none yet (e.g. `goal_send_failed`/
+    # `goal_rejected`,
+    # emitted before a goal ever existed).
+    origin: str = "fleetless"
+    goal_id: Optional[str] = None
 
 
 class JobUpdateQueue:
@@ -221,6 +232,12 @@ class _JobRecord:
     slug: str
     kind: str  # 'action' | 'service' — informational, nothing here branches on it
     state: str = "running"
+    # 'fleetless' | 'external' (contracts' job.origin) — 'external' only for
+    # a goal the tracker found active without this process having sent it
+    # (ros_runtime.py's GoalTracker). Never written to job_runs by the
+    # cloud, but tracked here the same as any other job: it occupies its
+    # slug, gets heartbeated, and can be cancelled the same way.
+    origin: str = "fleetless"
 
 
 class JobManager:
@@ -250,6 +267,36 @@ class JobManager:
                 return
             self._jobs[job_id] = _JobRecord(job_id=job_id, slug=slug, kind=kind)
             self._by_slug[slug] = job_id
+
+    def register_external(self, job_id: str, slug: str) -> None:
+        """The other way a job starts: the goal tracker (ros_runtime.py)
+        found an active goal on a published action that this process never
+        sent. Same bookkeeping as `start()` — occupies `slug`, appears in
+        `active_jobs()`, heartbeats and cancels the same way — except
+        there is no cloud-issued `invoke` behind it, so none of `start()`'s
+        own-job-only concerns (patience deadlines, goal-timeout bookkeeping)
+        apply here; the caller sends no goal, it only noticed one.
+        Idempotent for the same reasons `start()` is: the tracker's
+        discovery loop may see the same still-active goal on more than one
+        tick before this job is even reported once."""
+        with self._lock:
+            if job_id in self._jobs:
+                return
+            self._jobs[job_id] = _JobRecord(job_id=job_id, slug=slug, kind="action", origin="external")
+            self._by_slug[slug] = job_id
+
+    def origin_of(self, job_id: str) -> Optional[str]:
+        """`'fleetless'` or `'external'` for a job this manager still holds,
+        `None` if it does not (already delivered, or never started) — the
+        same shape as `state_of`. What `RosRuntime._emit_job` reads so every
+        call site can go on naming only a state, never an origin: a job's
+        origin is decided once, at `start()`/`register_external()`, and
+        every later word about it — including one this method itself does
+        not know how to spell out, like `action_server_lost` — carries
+        whichever origin the job already has."""
+        with self._lock:
+            record = self._jobs.get(job_id)
+            return record.origin if record is not None else None
 
     def running_job_id(self, slug: str) -> Optional[str]:
         """The job currently running for `slug`, if any — cancel-by-slug and
