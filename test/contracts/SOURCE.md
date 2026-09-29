@@ -1,18 +1,19 @@
 # Vendored contract schemas
 
-`schema/` holds copies of the JSON Schema artifacts for the twenty-five wire
+`schema/` holds copies of the JSON Schema artifacts for the twenty-seven wire
 messages the bridge speaks: the handshake (hello, hello_ok, hello_error,
 ping, pong), configuration and introspection (config, config_applied,
 introspect_request, introspect, type_request, type_definitions), telemetry
 (datapoint), link state (link_mode), jobs (invoke, cancel, publish,
-job_update, job_lost), cameras (snapshot [binary frame header],
-camera_start, camera_stop, camera_state) and assets (assets_available,
-asset_request, asset_progress).
+job_update, job_lost, job_query, job_status), cameras (snapshot [binary frame
+header], camera_start, camera_stop, camera_state) and assets
+(assets_available, asset_request, asset_progress).
 
 `pressure` was one of these until protocol 3 retired the uplink budget it
 reported on; `link_mode` took its place in the count, which is a
 coincidence of arithmetic and not a replacement — the two say different
-things.
+things. `job_query`/`job_status` (protocol 5) are the newest pair, added so
+the cloud can ask about a specific job while connected instead of guessing.
 
 The count and the list are both here on purpose, and they have to agree: the
 list said twenty-four and named twenty-four while twenty-five files sat in the
@@ -73,32 +74,38 @@ embeds the whole `robot-config-doc` tree (and everything nested under it,
 `bridge-type-definitions` embed the graph/field-tree shapes.
 
 **`schema-outgoing/` is a second copy of exactly
-thirteen of the twenty-five — the ones `protocol.py` sends, never receives —
-in zod's *output* mode instead of `schema/`'s input mode.** Input mode is
-the right description of the wire contract (a `.default()`ed field reads
-optional, matching the real cloud's own lenient `zod.parse()`), but every
-message in `protocol.py` is a hand-typed dict literal with no static
-protection against a key typo — unlike an attribute access on a dataclass,
-which would raise. Output mode reads `.default()`ed fields as required and
-keeps `additionalProperties: false`, so `schemas.py`'s `validate_frame`
-checks an outgoing frame (`OUTGOING_FRAME_NAMES`) against this stricter
-copy by default, catching a missing or misspelled field here instead of
-letting it reach the cloud's own parser, which would just silently drop
-it. `schema/`'s copies of the same thirteen stay in service too, for the
-rarer test that deliberately proves what the *contract* tolerates rather
-than what this bridge's own serializer produces (`strict=False`).
+fourteen of the twenty-seven — the ones `protocol.py` sends, never
+receives — in zod's *output* mode instead of `schema/`'s input mode.**
+Input mode is the right description of the wire contract (a `.default()`ed
+field reads optional, matching the real cloud's own lenient `zod.parse()`),
+but every message in `protocol.py` is a hand-typed dict literal with no
+static protection against a key typo — unlike an attribute access on a
+dataclass, which would raise. Output mode reads `.default()`ed fields as
+required and keeps `additionalProperties: false`, so `schemas.py`'s
+`validate_frame` checks an outgoing frame (`OUTGOING_FRAME_NAMES`) against
+this stricter copy by default, catching a missing or misspelled field here
+instead of letting it reach the cloud's own parser, which would just
+silently drop it. `schema/`'s copies of the same fourteen stay in service
+too, for the rarer test that deliberately proves what the *contract*
+tolerates rather than what this bridge's own serializer produces
+(`strict=False`).
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@4.0.0
-            at commit c8c323b (tag v4.0.0)
+    Source: @fleetless/contracts@5.0.0-next.1
+            at commit 9c29ca6 (fleetless/contracts#8)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-These bytes are the 4.0.0 release: protocol 4, the 1 Hz job heartbeat, the
-optional `error` on `job_lost`, and protocol 3's sunset moved to its actual
-deprecation date. The sync test compares against whatever
+These bytes are a pre-release of 5.0.0: protocol 5, the `unknown` job state,
+required `job.origin`, the `job_query`/`job_status` pair, `bridgeJobUpdate`'s
+new required `origin`/`goal_id`, and the hard cut of protocols 3 and 4 (no
+sunset window). Pinned as an exact pre-release tag
+(`AGENTS.md`, "Unpublished contracts or sdk") while contracts 5.0.0 itself is
+still on its issue branch; this pin moves to the final `5.0.0` before this
+pull request merges. The sync test compares against whatever
 `$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version
-against this line, so only a checkout or a tarball of 4.0.0 agrees with it.
+against this line, so only a checkout or a tarball of 5.0.0-next.1 agrees
+with it.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a

@@ -21,10 +21,29 @@
       "type": "string",
       "enum": [
         "running",
+        "unknown",
         "succeeded",
         "failed",
         "cancelled",
         "lost"
+      ]
+    },
+    "origin": {
+      "type": "string",
+      "enum": [
+        "fleetless",
+        "external"
+      ]
+    },
+    "goal_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "feedback": {
@@ -91,6 +110,8 @@
     "job_id",
     "slug",
     "state",
+    "origin",
+    "goal_id",
     "feedback",
     "progress",
     "result",

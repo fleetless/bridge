@@ -1,25 +1,15 @@
 {
   "AUDIT_RETENTION_DAYS": 90,
-  "PROTOCOL_VERSION": 4,
+  "PROTOCOL_VERSION": 5,
   "PROTOCOL_VERSIONS": [
     {
-      "version": 2,
-      "bridge_from": "3.0.0",
-      "deprecated_at": "2026-09-22"
-    },
-    {
-      "version": 3,
-      "bridge_from": "4.0.0",
-      "deprecated_at": "2026-09-29"
-    },
-    {
-      "version": 4,
-      "bridge_from": "5.0.0",
+      "version": 5,
+      "bridge_from": "6.0.0",
       "deprecated_at": null
     }
   ],
   "PROTOCOL_SUNSET_DAYS": 90,
-  "LATEST_BRIDGE_VERSION": "5.0.0",
+  "LATEST_BRIDGE_VERSION": "6.0.0",
   "CLOSE_ROBOT_DELETED": 4004,
   "CLOSE_TOKEN_ROTATED": 4005,
   "JOB_HEARTBEAT_INTERVAL_MS": 1000,
