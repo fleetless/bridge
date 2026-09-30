@@ -100,6 +100,7 @@ class FakeRos:
         self.applied_camera_calls = []
         self.invoke_calls = []
         self.cancel_calls = []
+        self.cancel_own_only = []
         self.publish_calls = []
         self.robot_id_calls = []
         self.job_query_calls = []
@@ -175,8 +176,9 @@ class FakeRos:
     async def invoke(self, job_id, slug, params, patience_ms):
         self.invoke_calls.append((job_id, slug, params, patience_ms))
 
-    async def cancel_job(self, slug, job_id):
+    async def cancel_job(self, slug, job_id, own_only=False):
         self.cancel_calls.append((slug, job_id))
+        self.cancel_own_only.append(own_only)
         return self._cancel_outcome
 
     async def job_query(self, job_ids):

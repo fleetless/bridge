@@ -642,11 +642,17 @@ class CloudCancel:
 
     `request_id` (protocol 5, required) is echoed on the `cancel_result`
     that answers this frame, so the cloud can tell its caller what the
-    action server said."""
+    action server said.
+
+    `own_only` (fleetless#84): `True` limits the cancel to a job this
+    bridge started itself and holds — the cloud sets it on the cancels it
+    sends on its own (a republish's reset), never on a user's. Absent on
+    the wire is `False`, today's meaning."""
 
     request_id: str
     slug: str
     job_id: Optional[str]
+    own_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -1819,7 +1825,12 @@ def parse_cloud_message(raw: object) -> CloudMessage:
         job_id = payload["job_id"]
         if job_id is not None and not (isinstance(job_id, str) and job_id):
             return Unknown(raw, "cancel without a usable job_id")
-        return CloudCancel(request_id=request_id, slug=slug, job_id=job_id)
+        own_only = payload.get("own_only", False)
+        if not isinstance(own_only, bool):
+            return Unknown(raw, "cancel without a usable own_only")
+        if own_only and job_id is None:
+            return Unknown(raw, "cancel with own_only but no job_id")
+        return CloudCancel(request_id=request_id, slug=slug, job_id=job_id, own_only=own_only)
     if kind == "publish":
         slug = payload.get("slug")
         message = payload.get("message")

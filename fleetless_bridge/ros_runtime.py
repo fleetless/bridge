@@ -2186,13 +2186,18 @@ class RosRuntime:
         required — see `cloudInvoke.patience_ms` and `_invoke_action`."""
         await self._submit_async(lambda: self._invoke(job_id, slug, params_dict, patience_ms))
 
-    async def cancel_job(self, slug: str, job_id: Optional[str]) -> CancelOutcome:
+    async def cancel_job(
+        self, slug: str, job_id: Optional[str], own_only: bool = False
+    ) -> CancelOutcome:
         """Cancel by slug, or by a specific job on that slug — a real ROS
         goal cancel — and what the action server answered, for the
         `cancel_result` that answers the cloud's `cancel`. Which goals are
         cancelled is `_cancel_job`'s: `job_id=None` every goal active on the
         action, a held `job_id` that job's goal alone, an id the bridge does
         not hold every *external* goal on the action, never an own one.
+        With `own_only` (fleetless#84) only a job this bridge holds as its
+        own is cancelled; any other id cancels nothing and is answered
+        `goals=[]`.
 
         Each goal gets its server's `CancelGoal` return code, collected
         within `CANCEL_RESULT_TIMEOUT_S` of the call (all requests go out at
@@ -2202,7 +2207,7 @@ class RosRuntime:
         unknown slug, a service (no ROS-level cancel), an action server
         gone — is `error` and `goals=[]`."""
         deadline = time.monotonic() + CANCEL_RESULT_TIMEOUT_S
-        targets, error = await self._submit_async(lambda: self._cancel_job(slug, job_id))
+        targets, error = await self._submit_async(lambda: self._cancel_job(slug, job_id, own_only))
         if error is not None:
             return CancelOutcome(goals=[], error=error)
         waiters = [asyncio.wrap_future(answer) for _, _, answer in targets]
@@ -3294,7 +3299,7 @@ class RosRuntime:
         )
 
     def _cancel_job(
-        self, slug: str, job_id: Optional[str]
+        self, slug: str, job_id: Optional[str], own_only: bool = False
     ) -> Tuple[List[Tuple[str, str, "concurrent.futures.Future"]], Optional[Tuple[str, str]]]:
         """Cancel by goal id, through the tracker — the one cancel
         path that works identically whether the job is Fleetless's own or
@@ -3313,6 +3318,13 @@ class RosRuntime:
         on the action instead, since one of them may be that very job.
         Never an own goal: that is a different job this bridge knows, and
         cancelling it would cancel the wrong job.
+
+        `own_only` (fleetless#84) is the cloud's own cancel — a republish's
+        reset. It cancels the named job only if this bridge holds it as its
+        own; an id it does not hold, or holds as an external goal, cancels
+        nothing: only a user's explicit cancel may stop a goal Fleetless
+        did not start. The parser never lets it arrive with `job_id=None`;
+        should it, it cancels nothing rather than everything.
 
         Returns `(targets, error)`: one `(job_id, goal_id, answer)` per
         cancel request sent (or remembered, for a goal not yet accepted),
@@ -3358,6 +3370,16 @@ class RosRuntime:
             targets.append((target_job_id, goal_id, answer))
 
         held = self.jobs.job_ids_on(slug)
+
+        if own_only and (
+            job_id is None or job_id not in held or self.jobs.origin_of(job_id) != "fleetless"
+        ):
+            log.info(
+                "Cancel for slug %r named job %r, which is not this bridge's own — "
+                "skipped: an own_only cancel never reaches another goal",
+                slug, job_id,
+            )
+            return targets, None
 
         if job_id is None:
             active_goal_ids = tracker.active_goal_ids()

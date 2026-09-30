@@ -79,7 +79,7 @@ from fleetless_bridge.ros_runtime import (
     UploadResult,
     external_job_id,
 )
-from fleetless_bridge.protocol import CancelResultEntry, cancel_result_message
+from fleetless_bridge.protocol import CancelOutcome, CancelResultEntry, cancel_result_message
 from fleetless_bridge import sampling
 from fleetless_bridge.goal_state import load_mapping
 from schemas import validate_frame
@@ -1537,6 +1537,163 @@ def test_cancel_by_a_non_matching_job_id_falls_back_to_the_external_goals_only()
         "bridge-cancel-result",
         json.loads(cancel_result_message("req-1", "count", outcome.goals, outcome.error)),
     )
+
+
+def test_an_own_only_cancel_of_a_job_the_bridge_does_not_hold_cancels_nothing():
+    """fleetless#84: the cloud's republish reset names an `unknown` job the
+    bridge does not hold. Without `own_only` that cancels every external
+    goal on the action (see the fallback test above); with it, nothing —
+    and the skip is logged at info so the operator can see why."""
+    import logging
+
+    class _RecordingHandler(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _RecordingHandler()
+    ros_runtime_log = logging.getLogger("fleetless_bridge.ros_runtime")
+    ros_runtime_log.addHandler(handler)
+    original_level = ros_runtime_log.level
+    ros_runtime_log.setLevel(logging.INFO)
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, honor_cancel=True)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            tracker = rt._actions["count"].tracker
+            wait_until(lambda: tracker.active_goal_ids(), timeout=3.0)
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                external = external_job_id("robot-xyz", "count", goal_id)
+                wait_until(lambda: external in rt.jobs.job_ids_on("count"), timeout=3.0)
+                outcome = await rt.cancel_job(
+                    "count", "11111111-1111-4111-8111-111111111111", own_only=True
+                )
+                await asyncio.sleep(0.3)
+                return (
+                    outcome,
+                    list(stop_server.cancel_requests),
+                    rt.jobs.state_of("job-1"),
+                    rt.jobs.state_of(external),
+                )
+            finally:
+                stop_sender()
+        finally:
+            stop_server()
+
+    try:
+        outcome, cancel_requests, own_state, external_state = run(body)
+    finally:
+        ros_runtime_log.removeHandler(handler)
+        ros_runtime_log.setLevel(original_level)
+
+    assert outcome == CancelOutcome(goals=[], error=None)
+    assert cancel_requests == []
+    assert own_state == "running"
+    assert external_state == "running"
+    messages = [r.getMessage() for r in handler.records if r.levelno == logging.INFO]
+    assert any(
+        "11111111-1111-4111-8111-111111111111" in m and "not this bridge's own" in m
+        for m in messages
+    )
+
+
+def test_an_own_only_cancel_of_a_held_own_job_cancels_that_goal_alone():
+    """The republish reset of a job the bridge holds still stops it, and
+    an external goal beside it keeps running."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, honor_cancel=True)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            tracker = rt._actions["count"].tracker
+            wait_until(lambda: tracker.active_goal_ids(), timeout=3.0)
+            own_goal_id = rt._job_goal_ids["job-1"]
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                external = external_job_id("robot-xyz", "count", goal_id)
+                wait_until(lambda: external in rt.jobs.job_ids_on("count"), timeout=3.0)
+                outcome = await rt.cancel_job("count", "job-1", own_only=True)
+                ended = None
+                while ended is None:
+                    update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+                    if update.state in ("succeeded", "failed", "cancelled", "lost"):
+                        ended = update
+                cancelled_goals = [
+                    str(uuid.UUID(bytes=bytes(h.goal_id.uuid))) for h in stop_server.cancel_requests
+                ]
+                return ended, outcome, cancelled_goals, own_goal_id, rt.jobs.state_of(external)
+            finally:
+                stop_sender()
+        finally:
+            stop_server()
+
+    ended, outcome, cancelled_goals, own_goal_id, external_state = run(body)
+    assert ended.job_id == "job-1"
+    assert ended.state == "cancelled"
+    assert cancelled_goals == [own_goal_id]
+    assert outcome == CancelOutcome(
+        goals=[CancelResultEntry(job_id="job-1", goal_id=own_goal_id, return_code=0)], error=None
+    )
+    assert external_state == "running"
+
+
+def test_an_own_only_cancel_naming_a_held_external_job_cancels_nothing():
+    """`own_only` means the bridge's own job. An external goal's derived id
+    is held too, but it is not a job Fleetless started, so an own-only
+    cancel naming it is skipped like any id that is not the bridge's own."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, honor_cancel=True)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                external = external_job_id("robot-xyz", "count", goal_id)
+                wait_until(lambda: external in rt.jobs.job_ids_on("count"), timeout=3.0)
+                outcome = await rt.cancel_job("count", external, own_only=True)
+                await asyncio.sleep(0.3)
+                return outcome, list(stop_server.cancel_requests), rt.jobs.state_of(external)
+            finally:
+                stop_sender()
+        finally:
+            stop_server()
+
+    outcome, cancel_requests, external_state = run(body)
+    assert outcome == CancelOutcome(goals=[], error=None)
+    assert cancel_requests == []
+    assert external_state == "running"
+
+
+def test_an_own_only_cancel_of_an_own_job_not_yet_accepted_is_remembered():
+    """The reset of an own job whose goal the server has not accepted yet
+    takes the pending-cancel path, exactly as without the flag
+    (`test_a_cancel_arriving_before_acceptance_is_remembered_and_applied`)."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, accept_delay=0.3)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            outcome = await rt.cancel_job("count", "job-1", own_only=True)  # not accepted yet
+            updates = await _drain_until_terminal(rt)
+            return updates, outcome, updates[-1].goal_id
+        finally:
+            stop_server()
+
+    updates, outcome, goal_id = run(body)
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "cancelled"
+    assert outcome.goals == [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=0)]
 
 
 def test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug():

@@ -332,16 +332,23 @@ class Session:
         )
 
     async def send_cancel(
-        self, slug: str, job_id: Optional[str] = None, request_id: str = "cancel-1"
+        self,
+        slug: str,
+        job_id: Optional[str] = None,
+        request_id: str = "cancel-1",
+        own_only: Optional[bool] = None,
     ) -> None:
         # job_id defaults to None — "cancel whatever is running on
         # this slug", today's behaviour, and the meaning every existing
         # caller of this helper already relies on. `request_id` is required
         # on the wire since protocol 5; it correlates the `cancel_result`.
-        await self._send(
-            "cloud-cancel",
-            {"type": "cancel", "request_id": request_id, "slug": slug, "job_id": job_id},
-        )
+        # `own_only` defaults to omitted (fleetless#84): every existing
+        # caller sends today's frame, and adding the key only when it is
+        # not `None` keeps that true.
+        frame = {"type": "cancel", "request_id": request_id, "slug": slug, "job_id": job_id}
+        if own_only is not None:
+            frame["own_only"] = own_only
+        await self._send("cloud-cancel", frame)
 
     async def send_job_query(self, request_id: str, job_ids: list) -> None:
         await self._send(
