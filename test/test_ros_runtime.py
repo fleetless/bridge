@@ -2495,6 +2495,52 @@ def test_a_persisted_job_whose_slug_the_config_no_longer_has_is_lost_config_chan
     assert slug_free
 
 
+def test_a_persisted_goal_whose_server_is_gone_after_a_restart_ends_action_server_lost(monkeypatch):
+    """A restarted bridge re-attaches to a persisted goal through
+    `get_result` and the tracker's status topic — both of which say
+    nothing at all when the action server is gone: no status, so the
+    liveness check sees no active goal to watch, and no answer to
+    `get_result`. The job would stay `running` for ever, kept alive in
+    the cloud by `hello` and `job_query`. Each re-attached job gets the
+    same bound a never-seen-ready server gets (discovery grace plus
+    liveness debounce, both shrunk here) and then ends
+    `lost`/`action_server_lost`; a result arriving after that is
+    ignored."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_DISCOVERY_GRACE_S", 0.5)
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_LIVENESS_DEBOUNCE_S", 0.5)
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.1, own_context=True)
+        try:
+            await _crash_mid_goal(state_dir, "test_restart_server_gone_before")
+        finally:
+            stop_server()
+        rt2 = RosRuntime(
+            node_name="test_restart_server_gone_after_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            started = time.monotonic()
+            updates = await _drain_until_terminal(rt2, timeout=10.0)
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(0.2)
+            leftover = rt2.jobs.updates.try_get()
+        finally:
+            rt2.stop()
+        return updates, elapsed, leftover
+
+    updates, elapsed, leftover = asyncio.run(body())
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "lost"
+    assert updates[-1].error[0] == "action_server_lost"
+    assert elapsed < 5.0
+    assert leftover is None
+
+
 def test_a_bridge_restart_fetches_the_result_of_a_goal_that_ended_while_down():
     """The goal finishes entirely while nothing is running, and the next
     process to read the persisted mapping still gets the real, true
