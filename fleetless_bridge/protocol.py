@@ -6,8 +6,8 @@ The message shapes mirror the contracts artifacts (`bridge-hello`,
 `cloud-config`, `bridge-config-applied`, `cloud-introspect-request`,
 `bridge-introspect`, `cloud-type-request`, `bridge-type-definitions`,
 `datapoint-frame`, `bridge-link-mode`, and the `cloud-invoke`,
-`cloud-cancel`, `cloud-publish`, `bridge-job-update`, `bridge-job-lost`
-— plus `bridge-hello` growing
+`cloud-cancel`, `bridge-cancel-result`, `cloud-publish`,
+`bridge-job-update`, `bridge-job-lost` — plus `bridge-hello` growing
 `active_jobs`, `{job_id, slug, state}` per entry (renamed from
 `active_job_ids`, the `cloud-invoke`/`cloud-cancel` gaining
 `patience_ms`/`job_id`, and the `cloud-camera-start`/`-stop` gaining
@@ -969,6 +969,53 @@ def job_status_message(
                 for j in jobs
             ],
             "unknown_job_ids": list(unknown_job_ids),
+        }
+    )
+
+
+class CancelResultEntry(NamedTuple):
+    """One goal a `cancel` reached — `bridgeCancelResultEntry`.
+    `return_code` is the action server's `CancelGoal` answer
+    (`CANCEL_RETURN_CODES`: 0 accepted, 1 rejected, 2 unknown goal id,
+    3 already terminated), or `None` when it did not answer within
+    `ros_runtime.CANCEL_RESULT_TIMEOUT_S`. Accepted is not ended: whether
+    the goal ends is what its `job_update` says afterwards."""
+
+    job_id: str
+    goal_id: str
+    return_code: Optional[int]
+
+
+class CancelOutcome(NamedTuple):
+    """What `RosRuntime.cancel_job` answers — the body of a
+    `cancel_result`: every goal a cancel request went out for, with its
+    return code, or an `(code, message)` error when none could be sent."""
+
+    goals: List[CancelResultEntry]
+    error: Optional[Tuple[str, str]] = None
+
+
+def cancel_result_message(
+    request_id: str,
+    slug: str,
+    goals: Sequence[CancelResultEntry],
+    error: Optional[Tuple[str, str]] = None,
+) -> str:
+    """Answers a `cancel`: every goal the bridge sent a cancel request for,
+    with the server's return code. `goals` is empty when nothing matched,
+    which is an answer, not a failure; `error` is for a cancel the bridge
+    could not send at all (an unknown slug, a service, a server gone), and
+    then `goals` is empty too. The cloud refuses its caller on a `1`."""
+    return json.dumps(
+        {
+            "type": "cancel_result",
+            "request_id": request_id,
+            "slug": slug,
+            "goals": [
+                {"job_id": g.job_id, "goal_id": g.goal_id, "return_code": g.return_code}
+                for g in goals
+            ],
+            "error": {"code": error[0], "message": error[1]} if error is not None else None,
         }
     )
 

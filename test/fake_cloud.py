@@ -219,6 +219,9 @@ class Session:
     async def recv_job_status(self) -> dict:
         return validate_frame("bridge-job-status", await self.recv())
 
+    async def recv_cancel_result(self) -> dict:
+        return validate_frame("bridge-cancel-result", await self.recv())
+
     async def accept(
         self,
         robot_id: str = ROBOT_ID,

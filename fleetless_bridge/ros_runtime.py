@@ -151,6 +151,8 @@ from fleetless_bridge.protocol import (
     RtspSource,
     ServiceConfig,
     V4l2Source,
+    CancelOutcome,
+    CancelResultEntry,
     JobStatusEntry,
     snapshot_frame,
 )
@@ -343,6 +345,13 @@ URDF_ASSET_NAME = _CONTRACTS_CONSTANTS["URDF_ASSET_NAME"]
 # reason every other constant on this page is: two `1000`s agreeing by
 # coincidence is exactly the drift this file exists to rule out.
 JOB_HEARTBEAT_INTERVAL_MS = _CONTRACTS_CONSTANTS["JOB_HEARTBEAT_INTERVAL_MS"]
+
+# How long a `cancel` waits for the action server's `CancelGoal` answers
+# before it sends its `cancel_result` anyway, a goal still unanswered listed
+# with `return_code: null`. The cloud waits `JOB_HEARTBEAT_TIMEOUT_MS` (5 s)
+# for that frame and then answers its caller without it, so this has to stay
+# clearly below that: the executor hop and the link take the rest.
+CANCEL_RESULT_TIMEOUT_S = 3.0
 
 # The header *names* a `POST` to the cloud's per-sync upload URL carries,
 # from contracts' `ASSET_UPLOAD_HEADERS` — used in `_upload_asset_bytes`
@@ -783,6 +792,47 @@ def _goal_id_msg(goal_id: str) -> RosUUID:
     return RosUUID(uuid=list(uuid.UUID(goal_id).bytes))
 
 
+def _cancel_return_code(response, goal_id: str) -> int:
+    """The `CancelGoal` return code a response means for `goal_id`.
+
+    rclpy's `ActionServer` answers a cancel its `cancel_callback` refused
+    with `ERROR_NONE` and the goal left out of `goals_canceling`; rclcpp
+    says `ERROR_REJECTED`. Both mean the server refused, and the cloud has
+    to hear a refusal (`cancel_rejected`), not a success, so the first is
+    read as the second."""
+    code = int(response.return_code)
+    if code == CancelGoal.Response.ERROR_NONE and not any(
+        _goal_id_str(info.goal_id) == goal_id for info in response.goals_canceling
+    ):
+        return int(CancelGoal.Response.ERROR_REJECTED)
+    return code
+
+
+def _settle_cancel_answer(answer: "concurrent.futures.Future", code: Optional[int]) -> None:
+    """Sets a cancel answer once; a second setter (or one after the
+    asyncio side gave up waiting) is a no-op, never an error on the
+    executor thread."""
+    if answer.done():
+        return
+    try:
+        answer.set_result(code)
+    except concurrent.futures.InvalidStateError:
+        pass
+
+
+def _answer_from_ros_future(
+    answer: "concurrent.futures.Future", ros_future, goal_id: str
+) -> None:
+    """Done callback of a `CancelGoal` call: its return code for
+    `goal_id`, or `None` when the call itself failed."""
+    try:
+        code: Optional[int] = _cancel_return_code(ros_future.result(), goal_id)
+    except Exception:  # noqa: BLE001 - reported as no answer, not raised on the executor
+        log.warning("The cancel request for goal %s failed", goal_id, exc_info=True)
+        code = None
+    _settle_cancel_answer(answer, code)
+
+
 # A fixed, never-changing namespace UUID, local to the bridge — generated
 # once, committed here, and never regenerated: every future external job id
 # for every robot depends on it staying fixed, so a repeated report never
@@ -978,8 +1028,8 @@ class GoalTracker:
         server itself reported, not a guess."""
         return self._status.get(goal_id)
 
-    def cancel(self, goal_id: str) -> None:
-        """Fire-and-forget cancel by goal id, via the raw `cancel_goal`
+    def cancel(self, goal_id: str) -> "concurrent.futures.Future":
+        """Cancel by goal id, via the raw `cancel_goal`
         service — the one cancel path that works identically for an own
         goal (which also has a `ClientGoalHandle` reachable through
         `_active_goals`) and an external one (which has no handle at all,
@@ -989,10 +1039,25 @@ class GoalTracker:
         gating on readiness here would silently drop a cancel issued in
         the ordinary, narrow window right after a goal (own or just
         discovered) becomes active, before this client's own service
-        entity has finished matching."""
+        entity has finished matching.
+
+        Returns a future for the server's return code
+        (`_cancel_return_code`), set on the executor thread when the answer
+        arrives; nothing bounds it here — `RosRuntime.cancel_job` does."""
         request = CancelGoal.Request()
         request.goal_info.goal_id = _goal_id_msg(goal_id)
-        self._cancel_client.call_async(request)
+        answer: "concurrent.futures.Future" = concurrent.futures.Future()
+        ros_future = self._cancel_client.call_async(request)
+        ros_future.add_done_callback(
+            lambda fut, goal_id=goal_id: _answer_from_ros_future(answer, fut, goal_id)
+        )
+        return answer
+
+    def cancel_service_ready(self) -> bool:
+        """Whether the `cancel_goal` service is matched. `cancel` does not
+        gate on it (see there); `RosRuntime._cancel_job` reads it only once
+        the liveness check already holds the server gone."""
+        return self._cancel_client.service_is_ready()
 
     def result_service_ready(self) -> bool:
         """Whether the `get_result` service is matched — `request_result`
@@ -1553,6 +1618,12 @@ class RosRuntime:
         # `_timed_out_job_ids`) the moment `_on_goal_response` resolves the
         # window one way or another, whether or not it was ever applied.
         self._pending_cancels: Set[str] = set()
+        # job_id -> the answers every `cancel` that found the job's goal not
+        # yet accepted is waiting on; settled with the server's return code
+        # once the remembered cancel is applied, or `None` when the goal
+        # never reached a server. Several cancels for one pending job share
+        # one cancel request: the cancel stays idempotent.
+        self._pending_cancel_answers: Dict[str, List["concurrent.futures.Future"]] = {}
         self._stopped = False
         # Plain bool, not a Lock: a single flag read by the subscription
         # callback and written by client.py's set_connected — an assignment
@@ -2115,20 +2186,41 @@ class RosRuntime:
         required — see `cloudInvoke.patience_ms` and `_invoke_action`."""
         await self._submit_async(lambda: self._invoke(job_id, slug, params_dict, patience_ms))
 
-    async def cancel_job(self, slug: str, job_id: Optional[str]) -> None:
-        """Cancel by slug, or by a specific job on that slug —
-        a real ROS goal cancel. `job_id=None` means today's behaviour:
-        whatever is running on `slug`. A `job_id` that does not match what
-        is currently running is refused outright — see `_cancel_job` — and
-        must never fall back to cancelling the slug's current occupant; the
-        caller named an id specifically to rule that out.
+    async def cancel_job(self, slug: str, job_id: Optional[str]) -> CancelOutcome:
+        """Cancel by slug, or by a specific job on that slug — a real ROS
+        goal cancel — and what the action server answered, for the
+        `cancel_result` that answers the cloud's `cancel`. Which goals are
+        cancelled is `_cancel_job`'s: `job_id=None` every goal active on the
+        action, a held `job_id` that job's goal alone, an id the bridge does
+        not hold every *external* goal on the action, never an own one.
 
-        A slug with nothing running, or nothing cancellable (e.g. a service
-        call, which has no ROS-level cancel), is a silent no-op: the cloud
-        already knows what is running and would not ask otherwise, and a
-        stale cancel for a job that just finished on its own is not an
-        error."""
-        await self._submit_async(lambda: self._cancel_job(slug, job_id))
+        Each goal gets its server's `CancelGoal` return code, collected
+        within `CANCEL_RESULT_TIMEOUT_S` of the call (all requests go out at
+        once, so one bound covers them all); a goal whose server has not
+        answered by then is listed with `None`. Nothing matched is
+        `goals=[]` at once. A cancel that could not be sent at all — an
+        unknown slug, a service (no ROS-level cancel), an action server
+        gone — is `error` and `goals=[]`."""
+        deadline = time.monotonic() + CANCEL_RESULT_TIMEOUT_S
+        targets, error = await self._submit_async(lambda: self._cancel_job(slug, job_id))
+        if error is not None:
+            return CancelOutcome(goals=[], error=error)
+        waiters = [asyncio.wrap_future(answer) for _, _, answer in targets]
+        remaining = deadline - time.monotonic()
+        if waiters and remaining > 0:
+            await asyncio.wait(waiters, timeout=remaining)
+        goals: List[CancelResultEntry] = []
+        for (target_job_id, goal_id, _), waiter in zip(targets, waiters):
+            code = None
+            if waiter.done() and not waiter.cancelled() and waiter.exception() is None:
+                code = waiter.result()
+            goals.append(CancelResultEntry(job_id=target_job_id, goal_id=goal_id, return_code=code))
+            log.info(
+                "Cancel for slug %r (job %r): goal %s answered return code %s",
+                slug, target_job_id, goal_id,
+                "none within {:.1f}s".format(CANCEL_RESULT_TIMEOUT_S) if code is None else code,
+            )
+        return CancelOutcome(goals=goals, error=None)
 
     async def job_query(
         self, job_ids: Sequence[str]
@@ -2827,6 +2919,7 @@ class RosRuntime:
             self._active_goals.pop(job_id, None)
             self._goal_deadlines.pop(job_id, None)
             self._pending_cancels.discard(job_id)
+            self._settle_pending_cancel_answers(job_id, None)
             self._service_deadlines.pop(job_id, None)
             # No per-job liveness state to drop any more — it lives on the
             # `_ActionEntry`, which the caller destroys right after this
@@ -3200,7 +3293,9 @@ class RosRuntime:
             lambda fut, job_id=job_id, slug=slug: self._on_goal_response(job_id, slug, fut)
         )
 
-    def _cancel_job(self, slug: str, job_id: Optional[str]) -> None:
+    def _cancel_job(
+        self, slug: str, job_id: Optional[str]
+    ) -> Tuple[List[Tuple[str, str, "concurrent.futures.Future"]], Optional[Tuple[str, str]]]:
         """Cancel by goal id, through the tracker — the one cancel
         path that works identically whether the job is Fleetless's own or
         `origin: external`, and whether or not this process holds a
@@ -3217,15 +3312,60 @@ class RosRuntime:
         the cloud holds `unknown` — cancels every *external* goal active
         on the action instead, since one of them may be that very job.
         Never an own goal: that is a different job this bridge knows, and
-        cancelling it would cancel the wrong job. `cloudCancel` already
-        carries `slug` alongside `job_id`; no protocol change."""
+        cancelling it would cancel the wrong job.
+
+        Returns `(targets, error)`: one `(job_id, goal_id, answer)` per
+        cancel request sent (or remembered, for a goal not yet accepted),
+        `answer` a future for the server's return code; or no targets and
+        an `(code, message)` error when nothing could be sent at all.
+        `cancel_job` waits for the answers, bounded, off this thread."""
+        targets: List[Tuple[str, str, "concurrent.futures.Future"]] = []
         entry = self._actions.get(slug)
-        tracker = entry.tracker if entry is not None else None
-        active_goal_ids = tracker.active_goal_ids() if tracker is not None else set()
+        if entry is None:
+            if slug in self._services:
+                log.info(
+                    "Cancel for slug %r (job %r): no ROS-level cancel exists for a service call",
+                    slug, job_id,
+                )
+                return targets, (
+                    "not_cancellable",
+                    "slug {!r} is a service, and a service call has no cancel".format(slug),
+                )
+            log.warning("Cancel for slug %r: no action is configured under it", slug)
+            return targets, ("unknown_slug", "no action is configured under slug {!r}".format(slug))
+        tracker = entry.tracker
+        if tracker is None or (entry.liveness_since is not None and not tracker.cancel_service_ready()):
+            log.warning(
+                "Cancel for slug %r (job %r): the action server is gone, nothing to send to",
+                slug, job_id,
+            )
+            return targets, (
+                "action_server_lost",
+                "the action server for slug {!r} is not reachable".format(slug),
+            )
+
+        def send(target_job_id: Optional[str], goal_id: str) -> None:
+            answer = tracker.cancel(goal_id)
+            if target_job_id is None:
+                # An external goal found before `hello_ok` named the robot:
+                # cancelled all the same, but there is no job id to list it
+                # under — the cloud cannot have asked about it either.
+                log.warning(
+                    "Cancel for slug %r: goal %s cancelled, but not listed — no robot id yet",
+                    slug, goal_id,
+                )
+                return
+            targets.append((target_job_id, goal_id, answer))
+
         held = self.jobs.job_ids_on(slug)
 
         if job_id is None:
-            pending = [held_id for held_id in held if held_id in self._goal_deadlines]
+            active_goal_ids = tracker.active_goal_ids()
+            pending = [
+                held_id for held_id in held
+                if held_id in self._goal_deadlines
+                and self._job_goal_ids.get(held_id) not in active_goal_ids
+            ]
             if not active_goal_ids and not pending:
                 if held:
                     log.info(
@@ -3234,15 +3374,17 @@ class RosRuntime:
                     )
                 else:
                     log.info("Cancel for slug %r: nothing running, silent no-op", slug)
-                return
+                return targets, None
             for held_id in pending:
-                self._remember_pending_cancel(slug, held_id)
+                targets.append(
+                    (held_id, self._job_goal_ids[held_id], self._remember_pending_cancel(slug, held_id))
+                )
             for goal_id in sorted(active_goal_ids):
-                tracker.cancel(goal_id)
-            return
+                send(self._job_id_for_goal(slug, tracker, goal_id), goal_id)
+            return targets, None
 
         if job_id not in held:
-            external_goal_ids = tracker.external_goal_ids() if tracker is not None else set()
+            external_goal_ids = tracker.external_goal_ids()
             if external_goal_ids:
                 log.warning(
                     "Cancel for slug %r named job %r, which this bridge does not hold — "
@@ -3250,8 +3392,8 @@ class RosRuntime:
                     slug, job_id,
                 )
                 for goal_id in sorted(external_goal_ids):
-                    tracker.cancel(goal_id)
-                return
+                    send(self._job_id_for_goal(slug, tracker, goal_id), goal_id)
+                return targets, None
             # Distinguishable from the "nothing running" no-op above on
             # purpose: those two silences used to be the same message,
             # which is how a stale id and an idle slug both read as
@@ -3261,40 +3403,68 @@ class RosRuntime:
                 "no external goal is active on the action — nothing to cancel",
                 slug, job_id,
             )
-            return
-
-        if job_id in self._goal_deadlines:
-            self._remember_pending_cancel(slug, job_id)
-            return
+            return targets, None
 
         target_goal_id = self._job_goal_ids.get(job_id)
-        if target_goal_id is not None and tracker is not None:
+        if job_id in self._goal_deadlines and target_goal_id is not None:
+            targets.append((job_id, target_goal_id, self._remember_pending_cancel(slug, job_id)))
+            return targets, None
+
+        if target_goal_id is not None:
             # The eventual "cancelled" job_update comes from the ordinary
             # status/result path once the server confirms — this call only
             # has to ask, not report; exactly one place still decides a
             # job's terminal state.
-            tracker.cancel(target_goal_id)
-            return
-        # A service call, or any other kind with no ROS-level cancel — a
-        # genuine no-op, not a dropped one; logged anyway so "cancel" is
-        # discoverable in the logs for every branch that reaches here.
+            send(job_id, target_goal_id)
+            return targets, None
         log.info(
-            "Cancel for slug %r (job %r): no ROS-level cancel exists for this job",
+            "Cancel for slug %r (job %r): no goal id is known for this job, nothing to cancel",
             slug, job_id,
         )
+        return targets, None
 
-    def _remember_pending_cancel(self, slug: str, job_id: str) -> None:
+    def _job_id_for_goal(self, slug: str, tracker: GoalTracker, goal_id: str) -> Optional[str]:
+        """The job a goal active on `slug`'s action is listed under in a
+        `cancel_result`: the own job that sent it, the job it last belonged
+        to, or the id its external job is derived as — `None` only for an
+        external goal before any robot id is known."""
+        own = tracker.job_id_for(goal_id)
+        if own is not None:
+            return own
+        for known_job_id, known_goal_id in self._job_goal_ids.items():
+            if known_goal_id == goal_id:
+                return known_job_id
+        if self._robot_id is None:
+            return None
+        return external_job_id(self._robot_id, slug, goal_id)
+
+    def _remember_pending_cancel(self, slug: str, job_id: str) -> "concurrent.futures.Future":
         """Sent, not yet accepted or rejected — there is no goal on the
         server to cancel *yet*, but there will be one, or a rejection that
         makes the question moot. Remembered rather than dropped;
         `_on_goal_response` applies it the instant the window closes
-        either way."""
+        either way. Returns the future the server's answer to that cancel
+        settles (`None` if the goal never reaches a server)."""
         self._pending_cancels.add(job_id)
+        answer: "concurrent.futures.Future" = concurrent.futures.Future()
+        self._pending_cancel_answers.setdefault(job_id, []).append(answer)
         log.info(
             "Cancel for slug %r (job %r): the goal has not been "
             "accepted yet — remembered, will apply once it is",
             slug, job_id,
         )
+        return answer
+
+    def _settle_pending_cancel_answers(self, job_id: str, code: Optional[int]) -> None:
+        for answer in self._pending_cancel_answers.pop(job_id, []):
+            _settle_cancel_answer(answer, code)
+
+    def _answer_pending_cancels_from(self, job_id: str, ros_future, goal_id: str) -> None:
+        """Done callback of the cancel applied for a remembered one:
+        every waiting `cancel` gets that one request's return code."""
+        answers = self._pending_cancel_answers.pop(job_id, [])
+        for answer in answers:
+            _answer_from_ros_future(answer, ros_future, goal_id)
 
     # --- action goal lifecycle: every callback below runs on the executor --
 
@@ -3319,15 +3489,20 @@ class RosRuntime:
         try:
             goal_handle = future.result()
         except Exception as exc:  # noqa: BLE001 - reported to the caller, not raised here
+            # No goal on any server: a remembered cancel reached nothing,
+            # and nothing answered it.
+            self._settle_pending_cancel_answers(job_id, None)
             if not late:
                 self._emit_job(job_id, slug, "failed", error=("goal_send_failed", str(exc)))
             return
         if not goal_handle.accepted:
+            self._settle_pending_cancel_answers(job_id, None)
             if not late:
                 self._emit_job(
                     job_id, slug, "failed", error=("goal_rejected", "the action server rejected the goal")
                 )
             return
+        goal_id = self._job_goal_ids.get(job_id) or _goal_id_str(goal_handle.goal_id)
 
         if late:
             # Accepted after the cloud was already told this job never
@@ -3341,6 +3516,13 @@ class RosRuntime:
             cancel_future = goal_handle.cancel_goal_async()
             cancel_future.add_done_callback(
                 lambda fut, job_id=job_id, slug=slug: self._on_late_goal_cancel(job_id, slug, fut)
+            )
+            # A cancel remembered before the timeout is answered by this
+            # corrective one: the same goal, one request.
+            cancel_future.add_done_callback(
+                lambda fut, job_id=job_id, goal_id=goal_id: self._answer_pending_cancels_from(
+                    job_id, fut, goal_id
+                )
             )
             return
 
@@ -3357,7 +3539,12 @@ class RosRuntime:
                 "this goal was accepted",
                 job_id, slug,
             )
-            goal_handle.cancel_goal_async()
+            cancel_future = goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(
+                lambda fut, job_id=job_id, goal_id=goal_id: self._answer_pending_cancels_from(
+                    job_id, fut, goal_id
+                )
+            )
 
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(

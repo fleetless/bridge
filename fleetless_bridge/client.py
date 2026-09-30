@@ -86,6 +86,7 @@ from fleetless_bridge.protocol import (
     PROTOCOL_VERSION,
     VERSION_REFUSED_CODE,
     ApplyError,
+    CancelResultEntry,
     CloudAssetRequest,
     CloudCameraStart,
     CloudCameraStop,
@@ -103,6 +104,7 @@ from fleetless_bridge.protocol import (
     bridge_asset_progress_message,
     bridge_assets_available_message,
     bridge_camera_state_message,
+    cancel_result_message,
     config_applied_message,
     datapoint_message,
     hello_message,
@@ -1870,7 +1872,7 @@ class BridgeClient:
                 elif isinstance(message, CloudInvoke):
                     self._dispatch_invoke(message)
                 elif isinstance(message, CloudCancel):
-                    self._dispatch_cancel(message)
+                    self._dispatch_cancel(writer, message)
                 elif isinstance(message, CloudPublish):
                     self._dispatch_publish(message)
                 elif isinstance(message, CloudCameraStart):
@@ -1957,9 +1959,38 @@ class BridgeClient:
                 )
             )
 
-    def _dispatch_cancel(self, message: CloudCancel) -> None:
+    def _dispatch_cancel(self, writer: PrioritizedWriter, message: CloudCancel) -> None:
+        """Fire-and-forget like `_dispatch_invoke` as far as the receive
+        loop is concerned — the task's first step reaches
+        `RosRuntime._enqueue` before the loop reads the next frame, so an
+        invoke/cancel burst keeps its order — but answered: see
+        `_answer_cancel`."""
+        asyncio.ensure_future(self._answer_cancel(writer, message))
+
+    async def _answer_cancel(self, writer: PrioritizedWriter, message: CloudCancel) -> None:
+        """Cancels, then answers with one `cancel_result`: each goal the
+        cancel reached and its server's `CancelGoal` return code, within
+        `ros_runtime.CANCEL_RESULT_TIMEOUT_S`. The cloud waits for this
+        frame to answer its caller, and refuses on a `1`. Tier 1
+        (`_TIER_OUTCOME`), with `job_update`, so telemetry cannot starve it
+        past the cloud's wait.
+
+        Without a ROS runtime nothing runs, so nothing matched. A runtime
+        that raises instead of answering still gets the cloud an answer —
+        an error, never silence it would have to time out on."""
+        goals: List[CancelResultEntry] = []
+        error: Optional[Tuple[str, str]] = None
         if self._ros is not None:
-            asyncio.ensure_future(self._ros.cancel_job(message.slug, message.job_id))
+            try:
+                outcome = await self._ros.cancel_job(message.slug, message.job_id)
+            except Exception:  # noqa: BLE001 - answered as an error, not raised
+                log.exception("Cancel for slug %r failed", message.slug)
+                error = ("internal_error", "the bridge could not carry out the cancel")
+            else:
+                goals, error = list(outcome.goals), outcome.error
+        writer.enqueue(
+            _TIER_OUTCOME, cancel_result_message(message.request_id, message.slug, goals, error)
+        )
 
     def _dispatch_publish(self, message: CloudPublish) -> None:
         """No reply is expected on the wire (a publish has no id,
