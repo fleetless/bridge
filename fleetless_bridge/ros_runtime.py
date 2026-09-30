@@ -1423,6 +1423,12 @@ class RosRuntime:
         # goal's restart-survival is not a promise this makes.
         self._goal_mapping: Dict[str, Tuple[str, str]] = {}
         self._goal_mapping_path: Optional[pathlib.Path] = None
+        # job_id -> (slug, goal_id): the persisted entries `start()` found,
+        # registered as running jobs but not yet re-attached to their goal
+        # — popped by `_reconcile_persisted_goals` once the slug's action
+        # exists, or settled by `_settle_unreconciled_goals` when a config
+        # no longer configures it. Executor-thread state after `start()`.
+        self._unreconciled_goals: Dict[str, Tuple[str, str]] = {}
         # When `_save_goal_mapping` last logged a failed write — the
         # rate limit for that warning (`GOAL_STATE_ERROR_LOG_INTERVAL_S`).
         self._goal_mapping_error_logged_at: Optional[float] = None
@@ -1608,12 +1614,21 @@ class RosRuntime:
         self._loop = loop
         # Read once, before anything else — B3's persisted job -> goal
         # mapping. Plain file I/O, safe here (the executor thread has not
-        # started spinning yet). Reconciliation against the live ROS graph
+        # started spinning yet). Every entry is registered as a `running`
+        # job right away: the cloud reconciles on `hello` and may send
+        # `job_query` before the first `config` frame, and a job missing
+        # from both answers is one the cloud settles `lost` for good.
+        # Re-attaching to the goal (tracker registration, `get_result`)
         # happens later, per slug, in `_create_action` — actions do not
-        # exist until the cloud's first `config` frame applies them, which
-        # is always after this.
+        # exist until the cloud's first `config` frame applies them; an
+        # entry whose slug that config no longer has is settled by
+        # `_settle_unreconciled_goals`.
         self._goal_mapping_path = mapping_path(self._goal_state_dir_override)
         self._goal_mapping = load_mapping(self._goal_mapping_path)
+        for job_id, (slug, goal_id) in self._goal_mapping.items():
+            self.jobs.start(job_id, slug, "action")
+            self._job_goal_ids[job_id] = goal_id
+            self._unreconciled_goals[job_id] = (slug, goal_id)
         rclpy.init(args=[])
         self._node = rclpy.create_node(self._node_name)
         self._executor = SingleThreadedExecutor()
@@ -2808,6 +2823,7 @@ class RosRuntime:
                     slug=slug, kind=APPLY_ERROR_KIND_ACTION,
                     code=APPLY_ERROR_CODE_UNKNOWN, message=str(exc),
                 ))
+        self._settle_unreconciled_goals()
         return errors
 
     def _create_action(
@@ -2842,7 +2858,9 @@ class RosRuntime:
 
     def _reconcile_persisted_goals(self, slug: str, entry: "_ActionEntry") -> None:
         """B3: whatever the persisted mapping (`goal_state.py`, read once
-        in `start()`) still names for `slug`, re-attach to it via
+        in `start()`, where each entry was already registered as a
+        `running` job so `hello` and `job_query` name it before any config
+        arrives) still names for `slug`, re-attach to it via
         `get_result` on the tracker's raw service — the action server
         itself, not any local guess, is the source of truth:
 
@@ -2861,16 +2879,41 @@ class RosRuntime:
           (`GoalStatus.STATUS_UNKNOWN` — its result expired, or a
           different server entirely since the restart): `lost`/
           `job_unknown_to_bridge`."""
-        for job_id, (mapped_slug, goal_id) in list(self._goal_mapping.items()):
+        for job_id, (mapped_slug, goal_id) in list(self._unreconciled_goals.items()):
             if mapped_slug != slug:
                 continue
-            self.jobs.start(job_id, slug, "action")
-            self._job_goal_ids[job_id] = goal_id
+            del self._unreconciled_goals[job_id]
+            if self.jobs.state_of(job_id) != "running":
+                continue  # already settled, nothing left to re-attach
             entry.tracker.register_own_goal(goal_id, job_id)
             entry.tracker.request_result(
                 goal_id,
                 lambda future, job_id=job_id, slug=slug: self._on_reconciled_goal_result(
                     job_id, slug, future
+                ),
+            )
+
+    def _settle_unreconciled_goals(self) -> None:
+        """After a config apply: a persisted job (`start()`) whose slug
+        is not a configured action now can never be re-attached — its
+        action is gone from the config, or failed to apply. Settled
+        `lost`/`config_changed`, the word a running job gets when its slug
+        is removed (`_settle_orphaned_job`): the bridge no longer watches
+        the goal, so it cannot say how it ends. Its mapping entry goes once
+        that is delivered, like any other."""
+        for job_id, (slug, _goal_id) in list(self._unreconciled_goals.items()):
+            if slug in self._actions:
+                continue
+            del self._unreconciled_goals[job_id]
+            if self.jobs.state_of(job_id) != "running":
+                continue
+            self._emit_job(
+                job_id, slug, "lost",
+                error=(
+                    "config_changed",
+                    "the action configured for slug {!r} is no longer configured, so "
+                    "the goal this job was running before the bridge restarted cannot "
+                    "be followed".format(slug),
                 ),
             )
 
