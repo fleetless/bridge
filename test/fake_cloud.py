@@ -328,11 +328,17 @@ class Session:
             },
         )
 
-    async def send_cancel(self, slug: str, job_id: Optional[str] = None) -> None:
+    async def send_cancel(
+        self, slug: str, job_id: Optional[str] = None, request_id: str = "cancel-1"
+    ) -> None:
         # job_id defaults to None — "cancel whatever is running on
         # this slug", today's behaviour, and the meaning every existing
-        # caller of this helper already relies on.
-        await self._send("cloud-cancel", {"type": "cancel", "slug": slug, "job_id": job_id})
+        # caller of this helper already relies on. `request_id` is required
+        # on the wire since protocol 5; it correlates the `cancel_result`.
+        await self._send(
+            "cloud-cancel",
+            {"type": "cancel", "request_id": request_id, "slug": slug, "job_id": job_id},
+        )
 
     async def send_job_query(self, request_id: str, job_ids: list) -> None:
         await self._send(

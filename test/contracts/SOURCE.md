@@ -1,19 +1,22 @@
 # Vendored contract schemas
 
-`schema/` holds copies of the JSON Schema artifacts for the twenty-seven wire
+`schema/` holds copies of the JSON Schema artifacts for the twenty-eight wire
 messages the bridge speaks: the handshake (hello, hello_ok, hello_error,
 ping, pong), configuration and introspection (config, config_applied,
 introspect_request, introspect, type_request, type_definitions), telemetry
-(datapoint), link state (link_mode), jobs (invoke, cancel, publish,
-job_update, job_lost, job_query, job_status), cameras (snapshot [binary frame
-header], camera_start, camera_stop, camera_state) and assets
+(datapoint), link state (link_mode), jobs (invoke, cancel, cancel_result,
+publish, job_update, job_lost, job_query, job_status), cameras (snapshot
+[binary frame header], camera_start, camera_stop, camera_state) and assets
 (assets_available, asset_request, asset_progress).
 
 `pressure` was one of these until protocol 3 retired the uplink budget it
 reported on; `link_mode` took its place in the count, which is a
 coincidence of arithmetic and not a replacement — the two say different
-things. `job_query`/`job_status` (protocol 5) are the newest pair, added so
-the cloud can ask about a specific job while connected instead of guessing.
+things. `job_query`/`job_status` (protocol 5) are the pair added so the
+cloud can ask about a specific job while connected instead of guessing;
+`cancel_result` is the newest, the bridge's answer to a `cancel` with each
+goal's `CancelGoal` return code, correlated by the `request_id` `cancel`
+now carries.
 
 The count and the list are both here on purpose, and they have to agree: the
 list said twenty-four and named twenty-four while twenty-five files sat in the
@@ -74,7 +77,7 @@ embeds the whole `robot-config-doc` tree (and everything nested under it,
 `bridge-type-definitions` embed the graph/field-tree shapes.
 
 **`schema-outgoing/` is a second copy of exactly
-fourteen of the twenty-seven — the ones `protocol.py` sends, never
+fifteen of the twenty-eight — the ones `protocol.py` sends, never
 receives — in zod's *output* mode instead of `schema/`'s input mode.**
 Input mode is the right description of the wire contract (a `.default()`ed
 field reads optional, matching the real cloud's own lenient `zod.parse()`),
@@ -92,19 +95,21 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@5.0.0-next.1
-            at commit 9c29ca6 (fleetless/contracts#8)
+    Source: @fleetless/contracts@5.0.0-next.2
+            at commit 70cb173 (fleetless/contracts#8)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
 These bytes are a pre-release of 5.0.0: protocol 5, the `unknown` job state,
 required `job.origin`, the `job_query`/`job_status` pair, `bridgeJobUpdate`'s
-new required `origin`/`goal_id`, and the hard cut of protocols 3 and 4 (no
-sunset window). Pinned as an exact pre-release tag
+new required `origin`/`goal_id`, `cancel`'s required `request_id` and its
+answer `cancel_result`, `reportedJobState` (every state but `unknown`, for
+what the bridge reports), and the hard cut of protocols 3 and 4 (no sunset
+window). Pinned as an exact pre-release tag
 (`AGENTS.md`, "Unpublished contracts or sdk") while contracts 5.0.0 itself is
 still on its issue branch; this pin moves to the final `5.0.0` before this
 pull request merges. The sync test compares against whatever
 `$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version
-against this line, so only a checkout or a tarball of 5.0.0-next.1 agrees
+against this line, so only a checkout or a tarball of 5.0.0-next.2 agrees
 with it.
 
 An **exact npm version**, not a git revision. The contracts package is
