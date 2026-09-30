@@ -1279,36 +1279,50 @@ def test_cancel_by_the_matching_job_id_issues_a_real_ros_goal_cancel():
     assert updates[-1].state == "cancelled"
 
 
-def test_cancel_by_a_non_matching_job_id_falls_back_to_whatever_is_actually_active():
+def test_cancel_by_a_non_matching_job_id_falls_back_to_the_external_goals_only():
     """Protocol 4's rule was stricter: a caller who named an id had ruled
     out "whatever is running" as the answer, full stop. Protocol 5 carves
-    out one exception: the tracker has no way to tell
-    "a genuinely wrong id" apart from "the id of an old, now-stale job
-    whose slug is occupied by a different goal since" — an `unknown` job
-    superseded by a rediscovered or external goal on the same action is
-    exactly that second case, and the console's cancel button for it must
-    still reach whatever is actually running, not fail silently. So a
-    named id the tracker has no active goal for falls back to cancelling
-    every goal currently active on the slug's action instead of refusing
-    — see `test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug`
-    for the boundary that *does* still hold."""
+    out one exception: cancelling a job the cloud holds `unknown` — one
+    this bridge does not hold — also cancels every external goal on its
+    action, since one of them may be that very job. Only the external
+    ones: an own goal is a different, known job, and cancelling it would
+    be cancelling the wrong job. See
+    `test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug`
+    for the slug boundary that holds as well."""
 
     async def body(rt):
-        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, honor_cancel=True)
         try:
             await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
             await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
-            updates = []
-            while len([u for u in updates if u.state == "running"]) < 2:
-                updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0))
-            await rt.cancel_job("count", "some-other-job-id")
-            updates += await _drain_until_terminal(rt)
-            return updates
+            tracker = rt._actions["count"].tracker
+            wait_until(lambda: tracker.active_goal_ids(), timeout=3.0)
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                external = external_job_id("robot-xyz", "count", goal_id)
+                wait_until(lambda: external in rt.jobs.job_ids_on("count"), timeout=3.0)
+                await rt.cancel_job("count", "11111111-1111-4111-8111-111111111111")
+                ended = None
+                while ended is None:
+                    update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+                    if update.state in ("succeeded", "failed", "cancelled", "lost"):
+                        ended = update
+                own_state = rt.jobs.state_of("job-1")
+                cancelled_goals = [
+                    str(uuid.UUID(bytes=bytes(h.goal_id.uuid))) for h in stop_server.cancel_requests
+                ]
+            finally:
+                stop_sender()
+            return ended, external, own_state, cancelled_goals, goal_id
         finally:
             stop_server()
 
-    updates = run(body)
-    assert updates[-1].state == "cancelled"
+    ended, external, own_state, cancelled_goals, goal_id = run(body)
+    assert ended.job_id == external
+    assert ended.state == "cancelled"
+    assert own_state == "running"
+    assert cancelled_goals == [goal_id]
 
 
 def test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug():

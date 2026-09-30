@@ -920,6 +920,12 @@ class GoalTracker:
         `ACCEPTED`/`EXECUTING`/`CANCELING` — own and external alike."""
         return {g for g, status in self._status.items() if status in _ACTIVE_GOAL_STATUSES}
 
+    def external_goal_ids(self) -> Set[str]:
+        """The active goals this tracker cannot attribute to an own job —
+        what the discovery tick reports as external jobs, and what a
+        cancel for a job the bridge does not hold falls back to."""
+        return {g for g in self.active_goal_ids() if g not in self._own_job_ids}
+
     def feedback_for(self, goal_id: str) -> Any:
         return self._feedback.get(goal_id)
 
@@ -3155,13 +3161,12 @@ class RosRuntime:
         action, and remembers the cancel for an own goal not yet accepted.
 
         A named `job_id` this process holds on `slug` cancels exactly that
-        job. A named `job_id` it does not hold at all — an old job id
-        whose slug is now occupied by a different goal, the `unknown`
-        job the cloud holds `unknown` — falls back to cancelling the goals active on the
-        action: the console only ever shows one job per slug, so its
-        cancel button must reach whatever is actually running there, not
-        fail silently over an id that is simply stale. `cloudCancel`
-        already carries `slug` alongside `job_id`; no protocol change."""
+        job. A named `job_id` it does not hold at all — typically a job
+        the cloud holds `unknown` — cancels every *external* goal active
+        on the action instead, since one of them may be that very job.
+        Never an own goal: that is a different job this bridge knows, and
+        cancelling it would cancel the wrong job. `cloudCancel` already
+        carries `slug` alongside `job_id`; no protocol change."""
         entry = self._actions.get(slug)
         tracker = entry.tracker if entry is not None else None
         active_goal_ids = tracker.active_goal_ids() if tracker is not None else set()
@@ -3185,13 +3190,14 @@ class RosRuntime:
             return
 
         if job_id not in held:
-            if active_goal_ids:
+            external_goal_ids = tracker.external_goal_ids() if tracker is not None else set()
+            if external_goal_ids:
                 log.warning(
                     "Cancel for slug %r named job %r, which this bridge does not hold — "
-                    "cancelling every goal currently active on this action instead",
+                    "cancelling every external goal active on this action instead",
                     slug, job_id,
                 )
-                for goal_id in sorted(active_goal_ids):
+                for goal_id in sorted(external_goal_ids):
                     tracker.cancel(goal_id)
                 return
             # Distinguishable from the "nothing running" no-op above on
@@ -3200,7 +3206,7 @@ class RosRuntime:
             # "cancel did nothing", indistinguishably.
             log.warning(
                 "Cancel for slug %r named job %r, which this bridge does not hold, and "
-                "no goal is active on the action — nothing to cancel",
+                "no external goal is active on the action — nothing to cancel",
                 slug, job_id,
             )
             return
