@@ -2097,11 +2097,14 @@ class RosRuntime:
         this purpose — or, for an id it has never heard of at all
         (never invoked, not in the persisted mapping, not an active
         external goal), a place in the second, `unknown_job_ids` list
-        instead. `feedback`/`progress` are only ever filled in for a
-        `running` job — a terminal-but-undelivered one answers with just
-        its `state`; the fuller frame (`result`/`error`) is already
-        queued and reaches the cloud moments later through the ordinary
-        `job_update` pump regardless of what this answers."""
+        instead. A `running` job answers with its latest feedback and
+        progress; a terminal-but-undelivered one with everything its
+        queued terminal `job_update` says (result, error, feedback,
+        progress) — the cloud applies a `job_status` entry like a
+        `job_update`, so a bare terminal state would write the job down
+        without the outcome the bridge already holds. In low-bandwidth
+        mode `feedback` is `null` and `progress` stays, as for the
+        heartbeat."""
         return await self._submit_async(lambda: self._job_query(job_ids))
 
     def _job_query(self, job_ids: Sequence[str]) -> Tuple[List[JobStatusEntry], List[str]]:
@@ -2114,7 +2117,13 @@ class RosRuntime:
                 continue
             feedback_json: Any = None
             progress: Optional[float] = None
-            if state == "running":
+            result: Any = None
+            error: Optional[Tuple[str, str]] = None
+            terminal = self.jobs.terminal_update_of(job_id) if state != "running" else None
+            if terminal is not None:
+                feedback_json, progress = terminal.feedback, terminal.progress
+                result, error = terminal.result, terminal.error
+            elif state == "running":
                 slug = self.jobs.slug_for(job_id)
                 goal_id = self._job_goal_ids.get(job_id)
                 entry = self._actions.get(slug) if slug is not None else None
@@ -2123,10 +2132,12 @@ class RosRuntime:
                     if feedback_msg is not None:
                         feedback_json = sampling.message_to_json(feedback_msg)
                         progress = self._extract_progress(feedback_msg)
+            if self._lb_active:
+                feedback_json = None
             entries.append(
                 JobStatusEntry(
                     job_id=job_id, state=state, feedback=feedback_json, progress=progress,
-                    result=None, error=None,
+                    result=result, error=error,
                 )
             )
         return entries, unknown_job_ids

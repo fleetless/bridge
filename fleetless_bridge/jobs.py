@@ -241,6 +241,10 @@ class _JobRecord:
     # cloud, but tracked here the same as any other job: it occupies its
     # slug, gets heartbeated, and can be cancelled the same way.
     origin: str = "fleetless"
+    # The last terminal update `emit` queued for this job, kept until
+    # delivery retires the record — what `job_query` answers a
+    # terminal-but-undelivered job from (`terminal_update_of`).
+    terminal_update: Optional[JobUpdate] = None
 
 
 class JobManager:
@@ -448,7 +452,16 @@ class JobManager:
             record = self._jobs.get(update.job_id)
             if record is not None:
                 record.state = update.state
+                if update.state in _TERMINAL_STATES:
+                    record.terminal_update = update
         self.updates.put_threadsafe(loop, update)
+
+    def terminal_update_of(self, job_id: str) -> Optional[JobUpdate]:
+        """The terminal update `emit` last queued for `job_id`, while the
+        job is still held (not yet delivered); `None` otherwise."""
+        with self._lock:
+            record = self._jobs.get(job_id)
+            return record.terminal_update if record is not None else None
 
     def mark_delivered(self, update: JobUpdate) -> None:
         """Called once `update`'s frame has actually been sent over the
