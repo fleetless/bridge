@@ -1203,16 +1203,25 @@ def test_invoke_without_a_job_id_is_unknown():
 
 
 def test_cancel_with_a_null_job_id_means_whatever_is_running():
-    payload = json.dumps({"type": "cancel", "slug": "drive_to", "job_id": None})
-    assert parse_cloud_message(payload) == CloudCancel(slug="drive_to", job_id=None)
+    payload = json.dumps(
+        {"type": "cancel", "request_id": "cancel-1", "slug": "drive_to", "job_id": None}
+    )
+    assert parse_cloud_message(payload) == CloudCancel(
+        request_id="cancel-1", slug="drive_to", job_id=None
+    )
 
 
 def test_cancel_with_a_job_id_names_which_job():
     payload = json.dumps(
-        {"type": "cancel", "slug": "drive_to", "job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"}
+        {
+            "type": "cancel",
+            "request_id": "cancel-1",
+            "slug": "drive_to",
+            "job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+        }
     )
     assert parse_cloud_message(payload) == CloudCancel(
-        slug="drive_to", job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"
+        request_id="cancel-1", slug="drive_to", job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"
     )
 
 
@@ -1220,12 +1229,33 @@ def test_cancel_without_a_job_id_key_is_unknown():
     # job_id is required-and-nullable: the key itself must be present
     # — an old-shaped frame that omits it entirely is not the same as one
     # that explicitly says null.
-    payload = json.dumps({"type": "cancel", "slug": "drive_to"})
+    payload = json.dumps({"type": "cancel", "request_id": "cancel-1", "slug": "drive_to"})
     assert isinstance(parse_cloud_message(payload), Unknown)
 
 
 def test_cancel_with_an_empty_string_job_id_is_unknown():
-    payload = json.dumps({"type": "cancel", "slug": "drive_to", "job_id": ""})
+    payload = json.dumps(
+        {"type": "cancel", "request_id": "cancel-1", "slug": "drive_to", "job_id": ""}
+    )
+    assert isinstance(parse_cloud_message(payload), Unknown)
+
+
+def test_cancel_without_a_request_id_is_unknown():
+    """Protocol 5 answers every cancel with a `cancel_result` the cloud
+    correlates by `request_id`. A frame without one is the protocol-4 shape,
+    which the vendored schema refuses too: an answer nobody can match is
+    not an answer."""
+    frame = {"type": "cancel", "slug": "drive_to", "job_id": None}
+    with pytest.raises(ValidationError):
+        validate_frame("cloud-cancel", frame)
+    assert isinstance(parse_cloud_message(json.dumps(frame)), Unknown)
+
+
+@pytest.mark.parametrize("request_id", ["", 7, None])
+def test_cancel_with_an_unusable_request_id_is_unknown(request_id):
+    payload = json.dumps(
+        {"type": "cancel", "request_id": request_id, "slug": "drive_to", "job_id": None}
+    )
     assert isinstance(parse_cloud_message(payload), Unknown)
 
 
