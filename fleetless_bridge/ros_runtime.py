@@ -4691,6 +4691,25 @@ class RosRuntime:
                 ),
             )
 
+    def _slug_has_running_own_job(self, slug: str) -> bool:
+        """Whether the bridge itself still holds a non-terminal *own* job
+        for `slug` — read by `_check_action_server_liveness`'s "nothing
+        to lose" branch to tell a genuine gap (no goal of any kind left
+        on the action) from a tick where the tracker's own status view
+        merely has not (yet, or again) caught up with a job the bridge
+        knows perfectly well is still running (fleetless#92). `state_of`
+        rather than `origin_of` alone: a job already settled but not yet
+        delivered (e.g. this very method just declared it `lost`) must
+        not count as "running" here, or the reset below would never run
+        for it. External jobs never need this check on their own behalf
+        — the tracker's status view is the *only* way this bridge ever
+        learns of one, so a gap in that view already means none is
+        known."""
+        for job_id in self.jobs.job_ids_on(slug):
+            if self.jobs.origin_of(job_id) != "external" and self.jobs.state_of(job_id) == "running":
+                return True
+        return False
+
     def _check_action_server_liveness(self) -> None:
         """A goal already accepted gets no timeout, but it does get a
         liveness check — the gap `_check_goal_timeouts` deliberately does
@@ -4734,13 +4753,44 @@ class RosRuntime:
         closing — Fleetless is not a safety layer, and the robot's own
         reflexes, e-stop and controller timeouts are what a genuinely
         uncontrollable robot depends on, not a cancel this bridge cannot
-        deliver anyway."""
+        deliver anyway.
+
+        **An empty `active_goal_ids()` resets the debounce state only if
+        the bridge also holds no non-terminal own job for this slug**
+        (`_slug_has_running_own_job`, fleetless#92). The tracker's own
+        status view can lag the bridge's: right after a goal is accepted
+        — and, on a loaded machine, again on a later tick, since nothing
+        makes `_action/status` snapshots arrive on this method's own
+        cadence — `active_goal_ids()` can read empty for a tick even
+        though the job that goal belongs to is still running. Resetting
+        `liveness_confirmed_ready` on that tick alone was harmless (there
+        was nothing to lose yet); resetting it once it was already `True`
+        wiped a genuine "seen ready" back to "never seen", which restarts
+        this method at `ACTION_SERVER_DISCOVERY_GRACE_S` instead of the
+        3s debounce for a server that vanishes moments later — the
+        measured 33.02s in fleetless#92 (30s grace + 3s debounce) against
+        the documented 3-8s. A momentary gap in the tracker's own
+        bookkeeping is not evidence the server is gone; "no goal of any
+        kind left on the action" — this reset's actual job — is checked
+        against the bridge's own held jobs instead, not only the
+        tracker's. External goals are unaffected: an external goal is
+        only ever known through the tracker's status view in the first
+        place, so a gap in that view already means this method knows of
+        no external goal to protect."""
         now = time.monotonic()
         for slug, entry in list(self._actions.items()):
             if entry.client is None or entry.tracker is None:
                 continue
             active_goal_ids = entry.tracker.active_goal_ids()
             if not active_goal_ids:
+                if self._slug_has_running_own_job(slug):
+                    # The tracker's own status view is momentarily behind
+                    # the bridge's — see this method's docstring — not
+                    # evidence that nothing is left on this action.
+                    # Neither reset nor evaluate the debounce this tick;
+                    # the goal simply is not visible to
+                    # `active_goal_ids()` yet.
+                    continue
                 # Nothing to lose right now — reset so a goal accepted
                 # later starts its own discovery window rather than
                 # inheriting a stale mid-debounce state from a previous,

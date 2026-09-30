@@ -164,6 +164,14 @@ def _fake_feedback(**fields):
     return type("_FakeFeedback", (), namespace)()
 
 
+#: `example_interfaces/Fibonacci`'s feedback field (`sequence`) is `int32[]`;
+#: the plain sequence overflows that around the 46th value (fleetless#68).
+#: Wrapping at 2**31 keeps every value representable for any `steps` a test
+#: passes — nothing here asserts feedback *values*, only that feedback
+#: arrived.
+_FEEDBACK_MODULUS = 2**31
+
+
 def _start_fibonacci_server(
     *,
     action_name="/count",
@@ -202,7 +210,70 @@ def _start_fibonacci_server(
     own thread. A single-threaded executor blocked in this callback's
     `time.sleep()` cannot also process an incoming cancel until the callback
     returns — by which point the goal has already finished. Same for a real
-    robot's action server: this is rclpy, not a test shortcut."""
+    robot's action server: this is rclpy, not a test shortcut.
+
+    `stop()` bounds a goal in flight rather than letting it run to
+    completion (fleetless#68): a stop flag `execute_callback` checks on
+    every step, right next to `is_cancel_requested`, so a goal that is
+    mid-`time.sleep()` when `stop()` is called notices within at most one
+    `step_delay` and returns. `stop()` itself does **not** wait for that
+    before tearing the node down — it destroys the server, shuts the
+    executor down (which *does* block until `execute_callback` has
+    actually returned, but now that takes at most one `step_delay`
+    instead of running the goal to completion) and destroys the node. A
+    goal server this deliberately pulled out from under is meant to
+    behave like one that genuinely vanished — the liveness tests need the
+    client to never receive a clean answer for it.
+
+    **`server.destroy()` runs before the stop flag is set, not after —
+    measured, not assumed.** An earlier version set the flag first (so
+    `execute_callback` would notice as early as possible) and destroyed
+    the server second; under `fleetless#92`'s own measurement that let
+    the callback's own `goal_handle.abort()` occasionally win a genuine
+    race against `destroy()` and reach the network before the handle was
+    invalidated — 15/15 reproductions once the window between the two
+    calls was widened to 60ms, landing on `failed` (a real aborted
+    result) instead of the `lost` the liveness tests assert, and in one
+    unwidened run on CI-scale timing, on nothing arriving in the drain's
+    10s bound at all: a real terminal status without a matching result,
+    which the bridge's own liveness watchdog also had no way to notice
+    since the goal had already dropped out of `active_goal_ids()`.
+    Destroying the server *first* removes the race rather than narrowing
+    it: `execute_callback` cannot see the flag as `True` before the flag
+    is set, and the flag is never set until `destroy()` has already
+    returned, so by the time `is_cancel_requested`'s neighbour ever reads
+    `True`, the handle it is about to call `abort()` on is already
+    invalid — `server.destroy()` invalidates the still-executing
+    callback's handle out from under it (rclpy logs, but does not raise,
+    "action server pointer is invalid" when the callback's own
+    `abort()`/`publish_feedback()` lands after that), the same way it
+    already did for the goal ending via the overflow crash below. 15/15
+    of the same widened-window reproductions passed clean after this
+    reordering. Waiting for the callback to finish *before* tearing
+    anything down was tried and rejected, separately: it gives
+    `execute_callback` a clean, uncontested path to `goal_handle.abort()`
+    and a real result the client *does* receive — turning "the server
+    vanished" into "the goal was cleanly aborted", which is a different
+    outcome the liveness tests do not expect (and, being a real answer,
+    arrives before the liveness debounce ever gets to declare anything
+    lost).
+
+    Before the stop flag, `stop()` destroyed the server, shut the
+    executor down and destroyed the node while `execute_callback` was
+    still sleeping between steps on the executor's own thread — node
+    teardown then waited for that thread, which only noticed anything was
+    wrong via `is_cancel_requested` (`False` here, nothing cancelled this
+    goal) once it woke up for its *next* step, `step_delay` later, and so
+    on for every remaining step: `stop()` for a `steps=60` goal could take
+    seconds instead of one `step_delay`. The Fibonacci feedback is
+    computed modulo `_FEEDBACK_MODULUS` for the same reason
+    `is_cancel_requested` alone used to be enough and no longer is: a step
+    count high enough to still be running when `stop()` lands (as the
+    liveness tests need) ran the sequence past `int32`'s range
+    (`OverflowError: signed integer is greater than maximum`, around the
+    46th value) before this stop flag existed to cut it short. The tests
+    only ever assert that feedback arrived, not its values, so wrapping it
+    changes nothing they check."""
     context = None
     if own_context:
         context = rclpy.Context()
@@ -213,18 +284,24 @@ def _start_fibonacci_server(
     thread = threading.Thread(target=executor.spin, daemon=True)
     thread.start()
     cancel_requests = []
+    stop_requested = threading.Event()
 
     def execute_callback(goal_handle):
         feedback = Fibonacci.Feedback()
         feedback.sequence = [0, 1]
         for _ in range(steps):
+            if stop_requested.is_set():
+                goal_handle.abort()
+                result = Fibonacci.Result()
+                result.sequence = feedback.sequence
+                return result
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 result = Fibonacci.Result()
                 result.sequence = feedback.sequence
                 return result
             feedback.sequence.append(
-                feedback.sequence[-1] + feedback.sequence[-2]
+                (feedback.sequence[-1] + feedback.sequence[-2]) % _FEEDBACK_MODULUS
             )
             goal_handle.publish_feedback(feedback)
             time.sleep(step_delay)
@@ -258,6 +335,7 @@ def _start_fibonacci_server(
 
     def stop():
         server.destroy()
+        stop_requested.set()
         executor.shutdown()
         node.destroy_node()
         if context is not None:
@@ -2123,11 +2201,18 @@ def test_an_action_server_vanishing_for_3s_straight_settles_lost_and_frees_the_s
         # ready`'s doc comment) — server_is_ready() additionally waits on the
         # cancel/result services and the feedback/status topics, which can
         # take an unpredictable extra stretch to finish matching on a loaded
-        # machine. Seeded directly rather than polled for real: this test is
-        # about the debounce once the action is known ready, not about how
-        # long real discovery happens to take on whatever machine runs the
-        # suite.
-        rt._actions["count"].liveness_confirmed_ready = True
+        # machine. Waited for through the bridge's own watchdog, not seeded
+        # by hand: a hand seed here raced the tracker's own status view (its
+        # `active_goal_ids()` can still be empty right after acceptance,
+        # before the first `_action/status` snapshot arrives) and could be
+        # wiped again before `stop_server()` ever ran — turning this test's
+        # 3-8s debounce into `ACTION_SERVER_DISCOVERY_GRACE_S` + debounce,
+        # 33s, on a loaded machine (fleetless#92).
+        wait_until(
+            lambda: rt._actions["count"].liveness_confirmed_ready,
+            timeout=15.0,
+            message="action 'count' never reached liveness_confirmed_ready within 15.0s",
+        )
 
         # Started here, not after stop_server() returns: a node destroyed
         # while its callback thread is mid-`time.sleep` (the
@@ -2178,13 +2263,15 @@ def test_an_action_server_that_recovers_within_1s_is_never_declared_lost():
         assert first.state == "running"
 
         # Confirmed ready first — see the sibling test above for why: the
-        # debounce does not start counting until this has read True once.
-        # Seeded directly rather than polled for real — real discovery of
-        # every entity server_is_ready() waits on can take an unpredictable
-        # multi-second stretch on a loaded machine, and this test is about
-        # the debounce surviving a short outage, not about real discovery
-        # timing.
-        rt._actions["count"].liveness_confirmed_ready = True
+        # debounce does not start counting until this has read True once,
+        # waited for through the bridge's own watchdog rather than seeded
+        # by hand — see the sibling test above for why a hand seed here
+        # is unsound.
+        wait_until(
+            lambda: rt._actions["count"].liveness_confirmed_ready,
+            timeout=15.0,
+            message="action 'count' never reached liveness_confirmed_ready within 15.0s",
+        )
 
         # Started here, not after stop_server() returns — see the sibling
         # test above: a node destroyed while its callback thread is
@@ -2220,6 +2307,63 @@ def test_an_action_server_that_recovers_within_1s_is_never_declared_lost():
 
     pending = run(body)
     assert all(u.state != "lost" for u in pending)
+
+
+def test_a_running_own_job_survives_a_momentary_gap_in_active_goal_ids():
+    """fleetless#92, hypothesis A pinned directly: while the bridge holds
+    a non-terminal own job for a slug, a tick where the tracker's own
+    `active_goal_ids()` is momentarily empty must not wipe
+    `liveness_confirmed_ready` back to `False` — that gap is the
+    tracker's status view lagging the bridge's own bookkeeping, not
+    evidence the server is gone. Drives the tracker's `_status` dict
+    directly rather than real DDS discovery timing, so this does not
+    depend on how long real discovery happens to take on whatever
+    machine runs the suite. `ACTION_SERVER_DISCOVERY_GRACE_S` (30s) is
+    deliberately left at its production value, not shrunk: the old,
+    buggy behaviour (this gap wiping `liveness_confirmed_ready`,
+    restarting the grace period) would then need the full 30s + 3s
+    before settling, well past `_drain_until_terminal`'s 10s timeout —
+    so a regression here fails loudly as a hang, not as a passing
+    `elapsed` a shrunk grace period could quietly let back in."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=60, step_delay=0.05)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+        first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        assert first.state == "running"
+
+        entry = rt._actions["count"]
+        wait_until(
+            lambda: entry.liveness_confirmed_ready,
+            timeout=15.0,
+            message="action 'count' never reached liveness_confirmed_ready within 15.0s",
+        )
+
+        # The tracker's status view momentarily loses sight of job-1's
+        # goal — as if a status snapshot had not (yet, or again) named it
+        # — while the bridge still holds job-1 for this slug throughout.
+        goal_id = rt._job_goal_ids["job-1"]
+        saved_status = entry.tracker._status.pop(goal_id, None)
+        assert saved_status is not None  # the tracker did see it active, or this proves nothing
+        assert not entry.tracker.active_goal_ids()  # the gap this test is about
+        await asyncio.sleep(0.1)  # several ticks at FAILSAFE_CHECK_INTERVAL_S (10ms)
+        assert entry.liveness_confirmed_ready  # not wiped by the gap alone
+        entry.tracker._status[goal_id] = saved_status
+
+        settle_started = time.monotonic()
+        stop_server()  # the action server vanishes mid-goal, deliberately
+        updates = await _drain_until_terminal(rt, timeout=10.0)
+        elapsed = time.monotonic() - settle_started
+        return updates, elapsed
+
+    updates, elapsed = run(body)
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "lost"
+    assert updates[-1].error[0] == "action_server_lost"
+    # The 3-8s debounce, not 30s (ACTION_SERVER_DISCOVERY_GRACE_S) + 3s —
+    # the bug this test pins would show up here as `elapsed` near 33s.
+    assert ACTION_SERVER_LIVENESS_DEBOUNCE_S <= elapsed < 8.0
 
 
 def test_a_late_result_after_action_server_lost_is_silently_ignored():
