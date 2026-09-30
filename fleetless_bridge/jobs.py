@@ -259,7 +259,12 @@ class JobManager:
         # (`finish`, called from `mark_delivered`) — not kept for the life
         # of the process; see `finish`'s own docstring.
         self._jobs: Dict[str, _JobRecord] = {}
-        self._by_slug: Dict[str, str] = {}  # slug -> job_id, only while that job is running
+        # slug -> the ids of every job held on it, oldest first (a dict
+        # used as an ordered set). Several at once on one action: an own
+        # job and external goals, or several external goals — an action
+        # server may run goals concurrently, and one ending must not make
+        # the slug look free while another still runs.
+        self._by_slug: Dict[str, Dict[str, None]] = {}
         # Called with the job id, outside the lock, once `finish` retired a
         # job — i.e. once its terminal update was *delivered*. Runs on
         # whichever thread called `mark_delivered` (client.py's asyncio
@@ -277,7 +282,7 @@ class JobManager:
             if job_id in self._jobs:
                 return
             self._jobs[job_id] = _JobRecord(job_id=job_id, slug=slug, kind=kind)
-            self._by_slug[slug] = job_id
+            self._by_slug.setdefault(slug, {})[job_id] = None
 
     def register_external(self, job_id: str, slug: str) -> None:
         """The other way a job starts: the goal tracker (ros_runtime.py)
@@ -294,7 +299,7 @@ class JobManager:
             if job_id in self._jobs:
                 return
             self._jobs[job_id] = _JobRecord(job_id=job_id, slug=slug, kind="action", origin="external")
-            self._by_slug[slug] = job_id
+            self._by_slug.setdefault(slug, {})[job_id] = None
 
     def origin_of(self, job_id: str) -> Optional[str]:
         """`'fleetless'` or `'external'` for a job this manager still holds,
@@ -310,10 +315,19 @@ class JobManager:
             return record.origin if record is not None else None
 
     def running_job_id(self, slug: str) -> Optional[str]:
-        """The job currently running for `slug`, if any — cancel-by-slug and
-        the defensive busy-guard both key off this."""
+        """The oldest job held for `slug`, if any — enough for a question
+        with one answer ("is anything held here?", the service busy-guard).
+        An action slug can hold several jobs at once; whoever must act on
+        each of them uses `job_ids_on`."""
         with self._lock:
-            return self._by_slug.get(slug)
+            held = self._by_slug.get(slug)
+            return next(iter(held)) if held else None
+
+    def job_ids_on(self, slug: str) -> List[str]:
+        """Every job held for `slug`, oldest first — own and external,
+        running or terminal-but-undelivered."""
+        with self._lock:
+            return list(self._by_slug.get(slug, ()))
 
     def slug_for(self, job_id: str) -> Optional[str]:
         """The slug `job_id` is running on, or `None` if this manager is not
@@ -370,8 +384,11 @@ class JobManager:
             record = self._jobs.pop(job_id, None)
             if record is None:
                 return
-            if self._by_slug.get(record.slug) == job_id:
-                del self._by_slug[record.slug]
+            held = self._by_slug.get(record.slug)
+            if held is not None:
+                held.pop(job_id, None)
+                if not held:
+                    del self._by_slug[record.slug]
         if self.on_finished is not None:
             self.on_finished(job_id)
 

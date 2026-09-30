@@ -477,3 +477,33 @@ def test_a_queue_with_a_pending_update_is_not_empty():
         return jobs.updates.empty()
 
     assert asyncio.run(scenario()) is False
+
+
+def test_one_of_several_jobs_on_a_slug_ending_does_not_free_the_slug():
+    """An action can run several goals at once — an own job beside an
+    external goal, or several external goals. The slug index used to hold
+    one job id per slug, so the second registration overwrote the first
+    and the first one's delivery freed the slug while the other job still
+    ran: the busy guard let a new goal through and cancel-by-slug found
+    nothing."""
+    jobs = JobManager()
+    jobs.start("own", "count", "action")
+    jobs.register_external("ext", "count")
+    assert jobs.job_ids_on("count") == ["own", "ext"]
+    jobs.finish("ext", "succeeded")
+    assert jobs.running_job_id("count") == "own"
+    assert jobs.job_ids_on("count") == ["own"]
+    jobs.finish("own", "succeeded")
+    assert jobs.running_job_id("count") is None
+    assert jobs.job_ids_on("count") == []
+
+
+def test_on_finished_is_called_once_a_job_is_retired():
+    jobs = JobManager()
+    retired = []
+    jobs.on_finished = retired.append
+    jobs.start("job-1", "drive_to", "action")
+    jobs.mark_delivered(JobUpdate(job_id="job-1", slug="drive_to", state="running", timestamp_ms=1))
+    assert retired == []
+    jobs.mark_delivered(JobUpdate(job_id="job-1", slug="drive_to", state="succeeded", timestamp_ms=2))
+    assert retired == ["job-1"]
