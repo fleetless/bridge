@@ -2893,6 +2893,73 @@ def test_job_query_answers_a_running_own_job_with_its_state():
     assert jobs[0].state == "running"
 
 
+def test_job_query_answers_a_terminal_undelivered_job_with_its_result_and_error():
+    """A job that ended but whose terminal `job_update` has not been
+    delivered yet is answered with that update's result and error, not
+    `null`s: the cloud applies a `job_status` entry like a `job_update`,
+    and a terminal state with no result would write the job down
+    without the outcome the bridge already holds."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=2, step_delay=0.02)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            await rt.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
+            await _drain_until_terminal(rt, timeout=10.0)  # queued, never delivered
+            return await rt.job_query(["job-1"])
+        finally:
+            stop_server()
+
+    jobs, unknown = run(body)
+    assert unknown == []
+    assert [(e.job_id, e.state) for e in jobs] == [("job-1", "succeeded")]
+    assert jobs[0].result == {"sequence": [0, 1, 1, 2]}
+    assert jobs[0].error is None
+
+
+def test_job_query_answers_a_failed_undelivered_job_with_its_error():
+    async def body(rt):
+        stop_server = _start_fibonacci_server(accept=False)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            await rt.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
+            await _drain_until_terminal(rt, timeout=10.0)
+            return await rt.job_query(["job-1"])
+        finally:
+            stop_server()
+
+    jobs, _unknown = run(body)
+    assert jobs[0].state == "failed"
+    assert jobs[0].error[0] == "goal_rejected"
+
+
+def test_job_query_nulls_feedback_in_low_bandwidth_mode_but_keeps_progress():
+    """`job_status` follows the same low-bandwidth rule as the heartbeat:
+    `feedback` null, `progress` kept."""
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        entry = rt._actions["count"]
+        goal_id = "11111111-1111-4111-8111-111111111111"
+        rt.jobs.start("job-1", "count", "action")
+        rt._job_goal_ids["job-1"] = goal_id
+        entry.tracker.register_own_goal(goal_id, "job-1")
+        entry.tracker._status[goal_id] = GoalStatus.STATUS_EXECUTING
+        entry.tracker._feedback[goal_id] = _fake_feedback(waypoint=3, progress=0.75)
+        rt._lb_active = True
+        low_bandwidth = await rt.job_query(["job-1"])
+        rt._lb_active = False
+        normal = await rt.job_query(["job-1"])
+        return low_bandwidth, normal
+
+    (low_bandwidth, _), (normal, _) = run(body)
+    assert low_bandwidth[0].feedback is None
+    assert low_bandwidth[0].progress == pytest.approx(0.75)
+    assert normal[0].feedback == {"waypoint": 3, "progress": 0.75}
+
+
 def test_job_query_answers_an_unrecognised_id_in_unknown_job_ids():
     async def body(rt):
         return await rt.job_query(["3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f"])
