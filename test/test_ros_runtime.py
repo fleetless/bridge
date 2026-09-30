@@ -2471,26 +2471,29 @@ def test_a_late_status_snapshot_does_not_turn_an_ended_own_goal_into_an_external
 
 
 def test_a_flapping_external_goal_between_two_ticks_is_never_reported():
-    """The one case where silence is correct, not a bug: a goal that both starts and fully ends
-    well inside one 1 Hz heartbeat interval must never reach the cloud at
-    all, never appear as a job, and never make `self.jobs` believe
-    anything is running on its slug."""
+    """The one case where silence is correct, not a bug: a goal that both
+    starts and fully ends between two heartbeat ticks must never reach
+    the cloud at all, never appear as a job, and never make `self.jobs`
+    believe anything is running on its slug. The heartbeat timer is
+    cancelled and the tick is run by hand once the goal has ended, so
+    "between two ticks" is a fact of the test, not a race against the
+    1 Hz timer."""
 
     async def body(rt):
-        # One short step, fast — the whole goal starts and ends in well
-        # under JOB_HEARTBEAT_INTERVAL_MS (1000ms).
+        rt._job_heartbeat_timer.cancel()
         stop_server = _start_fibonacci_server(steps=1, step_delay=0.01)
         try:
             await rt.apply_actions(by_slug([_action_cfg("count")]))
             rt.set_robot_id("robot-xyz")
             goal_id, goal_handle, stop_sender = _send_goal_directly("/count", order=2)
             try:
-                # Wait for the goal to genuinely finish server-side, then
-                # give the tracker's own status/feedback subscriptions a
-                # moment to (not) catch it, all before a heartbeat tick
-                # could ever fire.
                 result_future = goal_handle.get_result_async()
                 wait_until(lambda: result_future.done(), timeout=3.0)
+                tracker = rt._actions["count"].tracker
+                wait_until(
+                    lambda: tracker.status_of(goal_id) == GoalStatus.STATUS_SUCCEEDED, timeout=3.0,
+                )
+                rt._emit_job_heartbeats()
                 await asyncio.sleep(0.05)
                 leftover = rt.jobs.updates.try_get()
                 running = rt.jobs.running_job_id("count")
@@ -2503,6 +2506,98 @@ def test_a_flapping_external_goal_between_two_ticks_is_never_reported():
     leftover, running = run(body)
     assert leftover is None
     assert running is None
+
+
+def test_feedback_reaches_the_cloud_only_with_the_heartbeat_not_per_message():
+    """Protocol 5 dropped the immediate `job_update` per feedback message:
+    goal state and feedback go out once per heartbeat interval, only the
+    newest. Every `emit` is counted (the update queue coalesces what is
+    not read yet, so counting what comes out of it would prove nothing):
+    a goal sending twenty feedback messages gets its acceptance, one
+    heartbeat per second it runs, and its end — not twenty updates."""
+    emitted = []
+
+    async def body(rt):
+        real_emit = rt.jobs.emit
+
+        def recording_emit(loop, update):
+            emitted.append((time.monotonic(), update.state))
+            real_emit(loop, update)
+
+        rt.jobs.emit = recording_emit
+        stop_server = _start_fibonacci_server(steps=20, step_delay=0.03)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            return await _drain_until_terminal(rt, timeout=10.0)
+        finally:
+            stop_server()
+
+    updates = run(body)
+    assert updates[-1].state == "succeeded"
+    running = [t for t, state in emitted if state == "running"]
+    duration = emitted[-1][0] - emitted[0][0]
+    # The acceptance, plus at most one heartbeat per started second.
+    assert len(running) <= 2 + int(duration)
+
+
+def test_the_heartbeat_nulls_feedback_of_an_external_goal_in_low_bandwidth_mode():
+    """Low-bandwidth mode applies to external goals exactly as to own
+    jobs: `feedback` null, `progress` kept."""
+
+    async def body(rt):
+        rt._job_heartbeat_timer.cancel()
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        rt.set_robot_id("robot-xyz")
+        tracker = rt._actions["count"].tracker
+        goal_id = "11111111-1111-4111-8111-111111111111"
+        tracker._status[goal_id] = GoalStatus.STATUS_EXECUTING
+        tracker._feedback[goal_id] = _fake_feedback(waypoint=3, progress=0.75)
+        rt._lb_active = True
+        rt._emit_job_heartbeats()
+        return await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0), goal_id
+
+    update, goal_id = run(body)
+    assert update.origin == "external"
+    assert update.goal_id == goal_id
+    assert update.feedback is None
+    assert update.progress == pytest.approx(0.75)
+
+
+def test_external_goals_are_dropped_as_lost_when_their_action_server_is_lost(monkeypatch):
+    """A tracker whose action server disappears drops its external jobs
+    as `lost`/`action_server_lost`, the same way it ends own jobs —
+    nothing else would ever end them: no further status arrives."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_LIVENESS_DEBOUNCE_S", 0.5)
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        stopped = False
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=3.0)
+                assert first.origin == "external"
+                entry = rt._actions["count"]
+                wait_until(lambda: entry.liveness_confirmed_ready, timeout=3.0)
+                stop_server()
+                stopped = True
+                updates = [first] + await _drain_until_terminal(rt, timeout=10.0)
+            finally:
+                stop_sender()
+            return updates, goal_id
+        finally:
+            if not stopped:
+                stop_server()
+
+    updates, goal_id = run(body)
+    assert updates[-1].job_id == external_job_id("robot-xyz", "count", goal_id)
+    assert updates[-1].origin == "external"
+    assert updates[-1].state == "lost"
+    assert updates[-1].error[0] == "action_server_lost"
 
 
 def test_an_unwritable_state_directory_neither_kills_the_executor_nor_the_job():
