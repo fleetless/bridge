@@ -638,8 +638,13 @@ class CloudCancel:
     stop). A non-`None` id that does not match what is currently running on
     `slug` must cancel **nothing** and must not fall back to the slug — a
     caller who named an id has ruled out "whatever is running" as the
-    answer (see `RosRuntime._cancel_job`)."""
+    answer (see `RosRuntime._cancel_job`).
 
+    `request_id` (protocol 5, required) is echoed on the `cancel_result`
+    that answers this frame, so the cloud can tell its caller what the
+    action server said."""
+
+    request_id: str
     slug: str
     job_id: Optional[str]
 
@@ -1751,7 +1756,12 @@ def parse_cloud_message(raw: object) -> CloudMessage:
             return Unknown(raw, "invoke without a usable patience_ms")
         return CloudInvoke(job_id=job_id, slug=slug, params=params, patience_ms=patience_ms)
     if kind == "cancel":
+        request_id = payload.get("request_id")
         slug = payload.get("slug")
+        # Required since protocol 5: the `cancel_result` answering this
+        # frame echoes it, and an answer nobody can correlate is none.
+        if not (isinstance(request_id, str) and request_id):
+            return Unknown(raw, "cancel without a usable request_id")
         if not (isinstance(slug, str) and slug):
             return Unknown(raw, "cancel without a usable slug")
         # `job_id` is required-and-nullable: the key must be present —
@@ -1762,7 +1772,7 @@ def parse_cloud_message(raw: object) -> CloudMessage:
         job_id = payload["job_id"]
         if job_id is not None and not (isinstance(job_id, str) and job_id):
             return Unknown(raw, "cancel without a usable job_id")
-        return CloudCancel(slug=slug, job_id=job_id)
+        return CloudCancel(request_id=request_id, slug=slug, job_id=job_id)
     if kind == "publish":
         slug = payload.get("slug")
         message = payload.get("message")
