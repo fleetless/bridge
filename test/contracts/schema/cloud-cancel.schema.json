@@ -28,6 +28,9 @@
           "type": "null"
         }
       ]
+    },
+    "own_only": {
+      "type": "boolean"
     }
   },
   "required": [
