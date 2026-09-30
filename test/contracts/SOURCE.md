@@ -95,22 +95,20 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@5.0.0-next.2
-            at commit 70cb173 (fleetless/contracts#8)
+    Source: @fleetless/contracts@5.0.0
+            at commit 3cb155b (tag v5.0.0)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-These bytes are a pre-release of 5.0.0: protocol 5, the `unknown` job state,
+These bytes are the 5.0.0 release: protocol 5, the `unknown` job state,
 required `job.origin`, the `job_query`/`job_status` pair, `bridgeJobUpdate`'s
 new required `origin`/`goal_id`, `cancel`'s required `request_id` and its
 answer `cancel_result`, `reportedJobState` (every state but `unknown`, for
 what the bridge reports), and the hard cut of protocols 3 and 4 (no sunset
-window). Pinned as an exact pre-release tag
-(`AGENTS.md`, "Unpublished contracts or sdk") while contracts 5.0.0 itself is
-still on its issue branch; this pin moves to the final `5.0.0` before this
-pull request merges. The sync test compares against whatever
+window). Diffed field-for-field against the `5.0.0-next.2` pre-release this
+pin replaces (`AGENTS.md`, "Unpublished contracts or sdk") — identical
+bytes, only the version moved. The sync test compares against whatever
 `$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version
-against this line, so only a checkout or a tarball of 5.0.0-next.2 agrees
-with it.
+against this line, so only a checkout or a tarball of 5.0.0 agrees with it.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a
