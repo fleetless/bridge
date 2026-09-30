@@ -734,7 +734,8 @@ def hello_message(
 ) -> str:
     """The opening frame: it identifies the robot and the protocol we speak.
 
-    `active_jobs` is every job this process still has in memory (the format,
+    `active_jobs` is every own job this process still has in memory —
+    external jobs stay out, see `JobManager.hello_jobs` — (the format,
 ), as `(job_id, slug, state)` triples (renamed from
     `active_job_ids`, which named only the id) — on a fresh process only
     the own action jobs its persisted goal mapping still names, which is
@@ -744,7 +745,7 @@ def hello_message(
     this process's own current answer for each — including a terminal one
     it has not yet managed to deliver, so the cloud writes down `succeeded`
     instead of guessing `lost`. See `jobs.py` for where the list comes
-    from (`JobManager.active_jobs`)."""
+    from (`JobManager.hello_jobs`)."""
     return json.dumps(
         {
             "type": "hello",

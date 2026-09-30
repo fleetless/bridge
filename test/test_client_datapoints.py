@@ -53,6 +53,9 @@ class _FakeJobs:
     def active_jobs(self):
         return list(self._active)
 
+    def hello_jobs(self):
+        return list(self._active)
+
     def mark_delivered(self, update):
         self.delivered_calls.append(update)
 
