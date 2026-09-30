@@ -804,6 +804,12 @@ def external_job_id(robot_id: str, slug: str, goal_id: str) -> str:
     return str(uuid.uuid5(EXTERNAL_JOB_NAMESPACE, "{}|{}|{}".format(robot_id, slug, goal_id)))
 
 
+# How many just-forgotten own goal ids a `GoalTracker` remembers at most
+# (`GoalTracker._recently_own`). Far above the goals one action runs at
+# once; only a flood of goals that never reached a server comes near it.
+_RECENTLY_OWN_LIMIT = 256
+
+
 class GoalTracker:
     """Tracks every goal active on one published action — Fleetless's own
     and anyone else's alike — through the action's five low-level
@@ -844,6 +850,13 @@ class GoalTracker:
         # thing that tells an own goal apart from an external one once both
         # are enumerated by this same tracker.
         self._own_job_ids: Dict[str, str] = {}
+        # Goal ids `forget_own_goal` just dropped, until a status snapshot
+        # names the goal ended or no longer names it — see there. A dict
+        # used as an ordered set, capped at `_RECENTLY_OWN_LIMIT` (oldest
+        # out): a goal that never reached the server (rejected, never
+        # sent) is never named by any snapshot, so nothing else would
+        # ever drop it.
+        self._recently_own: Dict[str, None] = {}
         self._status_sub = node.create_subscription(
             action_class.Impl.GoalStatusMessage,
             ros_name + "/_action/status",
@@ -888,6 +901,8 @@ class GoalTracker:
         active = {g for g, status in self._status.items() if status in _ACTIVE_GOAL_STATUSES}
         for goal_id in [g for g in self._feedback if g not in active]:
             del self._feedback[goal_id]
+        for goal_id in [g for g in self._recently_own if g not in active]:
+            del self._recently_own[goal_id]
 
     def _on_feedback(self, msg) -> None:
         self._feedback[_goal_id_str(msg.goal_id)] = msg.feedback
@@ -910,12 +925,23 @@ class GoalTracker:
         goal id `ACCEPTED`/`EXECUTING` here, now unattributed, and mint it
         a spurious second job for something that already ended.
 
+        The same gap exists one snapshot later: a snapshot the server
+        published just before the goal ended can arrive just after this,
+        still naming the goal active. So the goal id is remembered as
+        *recently own* until a snapshot names it ended or stops naming
+        it; until then `external_goal_ids()` leaves it out, and the
+        discovery tick does not mint it a job.
+
         The one case this *should* surface as external rather than drop
         silently — a config change that stops tracking an own goal the
         real action server is still genuinely running — still does: the
-        next status update the server publishes repopulates this entry,
-        and the discovery loop picks it up fresh, honestly unattributed."""
-        self._own_job_ids.pop(goal_id, None)
+        config change destroys this tracker, and the new one's first
+        status update names the goal, which the discovery loop picks up
+        fresh, honestly unattributed."""
+        if self._own_job_ids.pop(goal_id, None) is not None:
+            self._recently_own[goal_id] = None
+            while len(self._recently_own) > _RECENTLY_OWN_LIMIT:
+                del self._recently_own[next(iter(self._recently_own))]
         self._feedback.pop(goal_id, None)
         self._status.pop(goal_id, None)
 
@@ -933,8 +959,13 @@ class GoalTracker:
     def external_goal_ids(self) -> Set[str]:
         """The active goals this tracker cannot attribute to an own job —
         what the discovery tick reports as external jobs, and what a
-        cancel for a job the bridge does not hold falls back to."""
-        return {g for g in self.active_goal_ids() if g not in self._own_job_ids}
+        cancel for a job the bridge does not hold falls back to. An own
+        goal just settled and forgotten is not one of them while a late
+        snapshot may still name it active (`forget_own_goal`)."""
+        return {
+            g for g in self.active_goal_ids()
+            if g not in self._own_job_ids and g not in self._recently_own
+        }
 
     def feedback_for(self, goal_id: str) -> Any:
         return self._feedback.get(goal_id)
@@ -3478,9 +3509,12 @@ class RosRuntime:
         for slug, entry in list(self._actions.items()):
             if entry.tracker is None:
                 continue
+            external_goal_ids = entry.tracker.external_goal_ids()
             for goal_id in entry.tracker.active_goal_ids():
                 job_id = entry.tracker.job_id_for(goal_id)
                 if job_id is None:
+                    if goal_id not in external_goal_ids:
+                        continue  # an own goal just settled; a late snapshot still names it
                     if self._robot_id is None:
                         continue  # nothing to name this external goal with yet
                     job_id = external_job_id(self._robot_id, slug, goal_id)
@@ -4581,9 +4615,12 @@ class RosRuntime:
                 slug, ACTION_SERVER_LIVENESS_DEBOUNCE_S
             ),
         )
+        external_goal_ids = entry.tracker.external_goal_ids()
         for goal_id in list(goal_ids):
             job_id = entry.tracker.job_id_for(goal_id)
             if job_id is None:
+                if goal_id not in external_goal_ids:
+                    continue  # an own goal already settled
                 if self._robot_id is None:
                     continue  # nothing to name this external goal with yet
                 job_id = external_job_id(self._robot_id, slug, goal_id)
