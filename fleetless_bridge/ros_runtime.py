@@ -207,18 +207,6 @@ ACTION_SERVER_LIVENESS_DEBOUNCE_S = 3.0
 # discovery gap, and bounds that case at grace plus debounce.
 ACTION_SERVER_DISCOVERY_GRACE_S = 30.0
 
-# How long `GoalTracker.request_result` waits for its `get_result` client
-# to match the action server before sending — the startup-reconciliation
-# path only, run once per persisted goal at process start. A `get_result`
-# call is a plain request/response service, not the transient-local
-# status topic: a request sent before this brand-new client has matched
-# the server is genuinely dropped, not merely delayed, so this bounds a
-# real, one-time discovery wait rather than papering over a bug. Short
-# relative to `ACTION_SERVER_DISCOVERY_GRACE_S` (that one bounds an
-# ordinary goal's liveness debounce over the life of a run; this one
-# blocks the executor thread, so it stays small and is paid at most once
-# per reconciled goal).
-RESULT_SERVICE_DISCOVERY_TIMEOUT_S = 2.0
 
 # How often, at most, a failed write of the persisted goal mapping is
 # logged (`RosRuntime._save_goal_mapping`). A state directory that cannot
@@ -959,21 +947,24 @@ class GoalTracker:
         request.goal_info.goal_id = _goal_id_msg(goal_id)
         self._cancel_client.call_async(request)
 
+    def result_service_ready(self) -> bool:
+        """Whether the `get_result` service is matched — `request_result`
+        must not be called before: unlike `cancel`'s fire-and-forget send,
+        a `get_result` request (plain request/response, not the status
+        topic's transient-local durability) sent before the server-side
+        endpoint has matched this brand-new client is genuinely dropped,
+        and a freshly-restarted process always has a brand-new client.
+        `RosRuntime._check_reconciled_goals` polls this on its watchdog
+        tick rather than blocking the executor thread in
+        `wait_for_service`."""
+        return self._result_client.service_is_ready()
+
     def request_result(self, goal_id: str, callback: Callable[[Any], None]) -> None:
         """Fetches a goal's result by id — the startup reconciliation
-        path, for a goal that ended while this process was down.
-        `callback` receives the `rclpy.Future`, the same shape
-        `add_done_callback` always hands one.
-
-        Waits (bounded, blocking the executor thread — acceptable here:
-        this only ever runs once per persisted goal, at startup, never on
-        the ordinary hot path) for the result service to be matched
-        first, unlike `cancel`'s fire-and-forget send: a `get_result`
-        service — plain request/response, not the status topic's
-        transient-local durability — genuinely drops a request sent
-        before the server-side endpoint has matched a brand new client's
-        result client, which a freshly-restarted process always is."""
-        self._result_client.wait_for_service(timeout_sec=RESULT_SERVICE_DISCOVERY_TIMEOUT_S)
+        path, for a persisted goal (still running, or ended while this
+        process was down). `callback` receives the `rclpy.Future`, the
+        same shape `add_done_callback` always hands one. Only once
+        `result_service_ready()`."""
         request = self._action_class.Impl.GetResultService.Request()
         request.goal_id = _goal_id_msg(goal_id)
         future = self._result_client.call_async(request)
@@ -1429,6 +1420,15 @@ class RosRuntime:
         # exists, or settled by `_settle_unreconciled_goals` when a config
         # no longer configures it. Executor-thread state after `start()`.
         self._unreconciled_goals: Dict[str, Tuple[str, str]] = {}
+        # job_id -> [slug, goal_id, deadline, result_requested] for a
+        # re-attached persisted goal whose result has not arrived yet —
+        # `_check_reconciled_goals` sends its `get_result` once the
+        # service is matched and, until the tracker has seen the goal
+        # active (from then on the ordinary liveness check watches it),
+        # bounds the wait: an action server that is simply gone publishes
+        # no status and answers no `get_result`, so nothing else would
+        # ever end the job. Executor-thread state.
+        self._reconciling: Dict[str, List[Any]] = {}
         # When `_save_goal_mapping` last logged a failed write — the
         # rate limit for that warning (`GOAL_STATE_ERROR_LOG_INTERVAL_S`).
         self._goal_mapping_error_logged_at: Optional[float] = None
@@ -2886,10 +2886,68 @@ class RosRuntime:
             if self.jobs.state_of(job_id) != "running":
                 continue  # already settled, nothing left to re-attach
             entry.tracker.register_own_goal(goal_id, job_id)
-            entry.tracker.request_result(
-                goal_id,
-                lambda future, job_id=job_id, slug=slug: self._on_reconciled_goal_result(
-                    job_id, slug, future
+            deadline = (
+                time.monotonic() + ACTION_SERVER_DISCOVERY_GRACE_S + ACTION_SERVER_LIVENESS_DEBOUNCE_S
+            )
+            self._reconciling[job_id] = [slug, goal_id, deadline, False]
+        self._check_reconciled_goals()
+
+    def _check_reconciled_goals(self) -> None:
+        """The watchdog half of `_reconcile_persisted_goals`, on every
+        `_check_watchdogs` tick:
+
+        - sends each re-attached goal's `get_result` as soon as the
+          tracker's result service is matched (a request sent earlier is
+          dropped — see `GoalTracker.result_service_ready`);
+        - disarms the goal's deadline once the tracker sees it active: the
+          server is demonstrably there, and from then on
+          `_check_action_server_liveness` watches it like any other goal
+          (its result request, already sent or sent as soon as the
+          service matches, answers when the goal ends, however long that
+          takes);
+        - otherwise, past the deadline — `ACTION_SERVER_DISCOVERY_GRACE_S`
+          plus `ACTION_SERVER_LIVENESS_DEBOUNCE_S`, the bound a goal whose
+          server was never seen ready gets — ends the job
+          `lost`/`action_server_lost`, like a goal whose server vanished.
+          A server that is gone publishes no status and answers no
+          `get_result`; without this the job would be named `running` for
+          ever."""
+        if not self._reconciling:
+            return
+        now = time.monotonic()
+        for job_id, record in list(self._reconciling.items()):
+            slug, goal_id, deadline, requested = record
+            if self.jobs.state_of(job_id) != "running":
+                del self._reconciling[job_id]  # settled some other way
+                continue
+            entry = self._actions.get(slug)
+            if entry is None or entry.tracker is None:
+                continue
+            if not requested and entry.tracker.result_service_ready():
+                record[3] = True
+                entry.tracker.request_result(
+                    goal_id,
+                    lambda future, job_id=job_id, slug=slug: self._on_reconciled_goal_result(
+                        job_id, slug, future
+                    ),
+                )
+            if deadline is None:
+                continue
+            if goal_id in entry.tracker.active_goal_ids():
+                record[2] = None
+                continue
+            if now < deadline:
+                continue
+            del self._reconciling[job_id]
+            self._server_lost_job_ids.add(job_id)
+            self._emit_job(
+                job_id, slug, "lost",
+                error=(
+                    "action_server_lost",
+                    "the action server for slug {!r} did not answer for this goal within "
+                    "{:.0f}s of the bridge restarting".format(
+                        slug, ACTION_SERVER_DISCOVERY_GRACE_S + ACTION_SERVER_LIVENESS_DEBOUNCE_S
+                    ),
                 ),
             )
 
@@ -2918,6 +2976,13 @@ class RosRuntime:
             )
 
     def _on_reconciled_goal_result(self, job_id: str, slug: str, future) -> None:
+        self._reconciling.pop(job_id, None)
+        if job_id in self._server_lost_job_ids or self.jobs.state_of(job_id) != "running":
+            # Already settled — `action_server_lost` by the deadline above or
+            # the liveness check, or `config_changed` — and the cloud told
+            # so; a late result must not contradict it (same rule as
+            # `_on_action_result`).
+            return
         try:
             response = future.result()
         except Exception as exc:  # noqa: BLE001 - reported to the caller, not raised here
@@ -4244,6 +4309,7 @@ class RosRuntime:
         self._check_goal_timeouts()
         self._check_service_timeouts()
         self._check_action_server_liveness()
+        self._check_reconciled_goals()
 
     def _check_failsafes(self) -> None:
         """Ticks every `FAILSAFE_CHECK_INTERVAL_S` regardless of anything
