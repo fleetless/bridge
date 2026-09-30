@@ -834,7 +834,8 @@ class GoalTracker:
         # every goal `_action/status` has ever named, including one that
         # already ended — `active_goal_ids()` is the live filter over this.
         self._status: Dict[str, int] = {}
-        # goal_id (str) -> the action's own Feedback message, latest only —
+        # goal_id (str) -> the action's own Feedback message, latest only,
+        # for goals the latest status snapshot names active (`_on_status`) —
         # `_emit_job_heartbeats` reads this for both own and external goals
         # alike; there is no separate, own-goal-only feedback path any
         # more — own and external goals go through the same code.
@@ -878,6 +879,15 @@ class GoalTracker:
         self._status = {
             _goal_id_str(entry.goal_info.goal_id): entry.status for entry in msg.status_list
         }
+        # Feedback is kept only for goals this snapshot names active:
+        # `_feedback` is keyed by every goal id the feedback topic ever
+        # named, external goals included, and nothing else ever forgets
+        # one — on a busy action it would grow for the life of the
+        # process. A goal's feedback arriving before the first snapshot
+        # naming it survives until the next snapshot, which names it.
+        active = {g for g, status in self._status.items() if status in _ACTIVE_GOAL_STATUSES}
+        for goal_id in [g for g in self._feedback if g not in active]:
+            del self._feedback[goal_id]
 
     def _on_feedback(self, msg) -> None:
         self._feedback[_goal_id_str(msg.goal_id)] = msg.feedback

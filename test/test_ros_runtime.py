@@ -31,7 +31,7 @@ import cv2
 import numpy as np
 import pytest
 import rclpy
-from action_msgs.msg import GoalStatus
+from action_msgs.msg import GoalInfo, GoalStatus, GoalStatusArray
 from example_interfaces.action import Fibonacci
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 from conftest import wait_until
@@ -2390,6 +2390,43 @@ def test_removing_an_action_settles_every_job_running_on_it():
         goal_a: ("lost", "config_changed"),
         goal_b: ("lost", "config_changed"),
     }
+
+
+def _status_array(*entries):
+    """A `GoalStatusArray` naming `(goal_id, status)` pairs — what an
+    action server publishes on `_action/status`."""
+    msg = GoalStatusArray()
+    for goal_id, status in entries:
+        info = GoalInfo()
+        info.goal_id.uuid = list(uuid.UUID(goal_id).bytes)
+        msg.status_list.append(GoalStatus(goal_info=info, status=status))
+    return msg
+
+
+def test_the_tracker_drops_feedback_of_goals_that_ended_or_left_the_status():
+    """`_feedback` is keyed by every goal id the feedback topic ever
+    named — external goals included, which nothing ever forgets
+    otherwise — so on a busy action it grew for the life of the
+    process. Each status snapshot now drops the feedback of every goal
+    it does not name as active."""
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        tracker = rt._actions["count"].tracker
+        running, ended, gone = (
+            "11111111-1111-4111-8111-111111111111",
+            "22222222-2222-4222-8222-222222222222",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        for goal_id in (running, ended, gone):
+            tracker._feedback[goal_id] = _fake_feedback(waypoint=1)
+        tracker._on_status(_status_array(
+            (running, GoalStatus.STATUS_EXECUTING), (ended, GoalStatus.STATUS_SUCCEEDED),
+        ))
+        return set(tracker._feedback), running
+
+    remaining, running = run(body)
+    assert remaining == {running}
 
 
 def test_a_flapping_external_goal_between_two_ticks_is_never_reported():
