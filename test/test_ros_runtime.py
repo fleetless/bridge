@@ -171,6 +171,14 @@ def _fake_feedback(**fields):
 #: arrived.
 _FEEDBACK_MODULUS = 2**31
 
+#: How long the Fibonacci server's `stop()` waits for a running
+#: `execute_callback` to return before tearing down regardless (fleetless#92,
+#: "Error handling": the suite must not hang on a callback that cannot see
+#: the stop flag in time).
+_FIBONACCI_STOP_JOIN_TIMEOUT_S = 2.0
+
+_fibonacci_server_log = logging.getLogger("test_ros_runtime.fibonacci_server")
+
 
 def _start_fibonacci_server(
     *,
@@ -216,11 +224,12 @@ def _start_fibonacci_server(
     completion (fleetless#68): a stop flag `execute_callback` checks on
     every step, right next to `is_cancel_requested`, so a goal that is
     mid-`time.sleep()` when `stop()` is called notices within at most one
-    `step_delay` and returns. `stop()` itself does **not** wait for that
-    before tearing the node down — it destroys the server, shuts the
-    executor down (which *does* block until `execute_callback` has
-    actually returned, but now that takes at most one `step_delay`
-    instead of running the goal to completion) and destroys the node. A
+    `step_delay` and returns. `stop()` destroys the server first, then
+    sets the flag and waits for `execute_callback` to return — at most
+    `_FIBONACCI_STOP_JOIN_TIMEOUT_S`; a callback that has not returned by
+    then is logged and the node torn down regardless, so the suite cannot
+    hang on it (`executor.shutdown()` alone waits without a bound on
+    jazzy and later, measured: 10s for a callback asleep for 10s). A
     goal server this deliberately pulled out from under is meant to
     behave like one that genuinely vanished — the liveness tests need the
     client to never receive a clean answer for it.
@@ -285,8 +294,23 @@ def _start_fibonacci_server(
     thread.start()
     cancel_requests = []
     stop_requested = threading.Event()
+    # Running `execute_callback`s, so `stop()` can wait for them with a
+    # bound of its own rather than through `executor.shutdown()`, which
+    # waits without one.
+    executing = [0]
+    executing_changed = threading.Condition()
 
     def execute_callback(goal_handle):
+        with executing_changed:
+            executing[0] += 1
+        try:
+            return _execute(goal_handle)
+        finally:
+            with executing_changed:
+                executing[0] -= 1
+                executing_changed.notify_all()
+
+    def _execute(goal_handle):
         feedback = Fibonacci.Feedback()
         feedback.sequence = [0, 1]
         for _ in range(steps):
@@ -336,13 +360,30 @@ def _start_fibonacci_server(
     def stop():
         server.destroy()
         stop_requested.set()
-        executor.shutdown()
+        with executing_changed:
+            joined = executing_changed.wait_for(
+                lambda: executing[0] == 0, timeout=_FIBONACCI_STOP_JOIN_TIMEOUT_S
+            )
+        if not joined:
+            _fibonacci_server_log.warning(
+                "execute_callback for %s did not return within %.1fs of stop(); "
+                "tearing the node down regardless",
+                action_name, _FIBONACCI_STOP_JOIN_TIMEOUT_S,
+            )
+        # Bounded here too: `executor.shutdown()` without a timeout waits for
+        # every running callback (jazzy and later also join the thread pool
+        # unless told not to), which is the unbounded wait just avoided.
+        try:
+            executor.shutdown(timeout_sec=_FIBONACCI_STOP_JOIN_TIMEOUT_S if joined else 0.0, wait_for_threads=joined)
+        except TypeError:  # humble's MultiThreadedExecutor has no wait_for_threads
+            executor.shutdown(timeout_sec=_FIBONACCI_STOP_JOIN_TIMEOUT_S if joined else 0.0)
         node.destroy_node()
         if context is not None:
             rclpy.shutdown(context=context)
         thread.join(timeout=5.0)
 
     stop.cancel_requests = cancel_requests
+    stop.executing = lambda: executing[0] > 0
 
     return stop
 
@@ -2364,6 +2405,53 @@ def test_a_running_own_job_survives_a_momentary_gap_in_active_goal_ids():
     # The 3-8s debounce, not 30s (ACTION_SERVER_DISCOVERY_GRACE_S) + 3s —
     # the bug this test pins would show up here as `elapsed` near 33s.
     assert ACTION_SERVER_LIVENESS_DEBOUNCE_S <= elapsed < 8.0
+
+
+def test_the_fibonacci_server_stops_within_1s_with_a_goal_in_flight(ros):
+    """fleetless/fleetless#92, "Fibonacci test server": "`stop()` returns
+    within 1 s with a goal in flight" — the premise the recovery test's
+    "about 1 s" outage rests on."""
+    stop_server = _start_fibonacci_server(steps=60, step_delay=0.05)
+    _goal_id, _goal_handle, stop_client = _send_goal_directly()
+    try:
+        wait_until(stop_server.executing, message="the goal never started executing")
+        started = time.monotonic()
+        stop_server()
+        elapsed = time.monotonic() - started
+    finally:
+        stop_client()
+    assert elapsed < 1.0
+
+
+def test_the_fibonacci_server_stop_is_bounded_even_if_the_callback_is_not(ros):
+    """fleetless/fleetless#92, "Error handling": "`stop()` that cannot join
+    the execute callback within its bound still tears the node down and
+    logs it; the test suite must not hang." A callback asleep for 10s
+    between steps cannot see the stop flag before it wakes up; `stop()`
+    must not wait for it."""
+
+    class _RecordingHandler(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _RecordingHandler()
+    _fibonacci_server_log.addHandler(handler)
+    stop_server = _start_fibonacci_server(steps=3, step_delay=10.0)
+    _goal_id, _goal_handle, stop_client = _send_goal_directly()
+    try:
+        wait_until(stop_server.executing, message="the goal never started executing")
+        started = time.monotonic()
+        stop_server()
+        elapsed = time.monotonic() - started
+    finally:
+        stop_client()
+        _fibonacci_server_log.removeHandler(handler)
+    assert elapsed < _FIBONACCI_STOP_JOIN_TIMEOUT_S + 1.0
+    assert any(r.levelno == logging.WARNING for r in handler.records)
 
 
 def test_a_late_result_after_action_server_lost_is_silently_ignored():
