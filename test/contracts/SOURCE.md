@@ -95,21 +95,22 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@5.1.0-next.2
-            at commit 3ec9c64 (fleetless/contracts#11)
+    Source: @fleetless/contracts@5.2.0
+            at commit c6cbb3a (tag v5.2.0)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-These bytes are a pre-release of 5.1.0: `cloud-cancel` (`cancel`) gains an
+These bytes are the 5.2.0 release: `cloud-cancel` (`cancel`) gains an
 optional `own_only`, absent meaning `false`, today's meaning — with `true`
 the bridge is to cancel only a job it holds as its own, never falling back
 to every external goal on the action. `LATEST_BRIDGE_VERSION` is `6.1.0`,
 the first bridge that honours it. Protocol stays 5, and no other frame
-moves. Pinned as an exact pre-release tag (`AGENTS.md`, "Unpublished
-contracts or sdk") while contracts 5.1.0 itself is still on its issue
-branch; this pin moves to the final `5.1.0` before this pull request
-merges. The sync test compares against whatever `$FLEETLESS_CONTRACTS_DIR`
-points at and checks that tree's own version against this line, so only a
-checkout or a tarball of 5.1.0-next.2 agrees with it.
+moves. The version is 5.2.0, not 5.1.0, because 5.1.0 was already taken by
+fleetless#85 by the time this feature released. Diffed field-for-field
+against the `5.1.0-next.2` pre-release this pin replaces (`AGENTS.md`,
+"Unpublished contracts or sdk") — identical bytes, only the version moved.
+The sync test compares against whatever `$FLEETLESS_CONTRACTS_DIR` points
+at and checks that tree's own version against this line, so only a
+checkout or a tarball of 5.2.0 agrees with it.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a
