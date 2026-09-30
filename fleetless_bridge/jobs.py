@@ -257,6 +257,14 @@ class JobManager:
         # of the process; see `finish`'s own docstring.
         self._jobs: Dict[str, _JobRecord] = {}
         self._by_slug: Dict[str, str] = {}  # slug -> job_id, only while that job is running
+        # Called with the job id, outside the lock, once `finish` retired a
+        # job — i.e. once its terminal update was *delivered*. Runs on
+        # whichever thread called `mark_delivered` (client.py's asyncio
+        # thread); a settable attribute, like `JobUpdateQueue.on_put`, so
+        # nothing here knows who listens. `RosRuntime` uses it to drop the
+        # job's persisted goal mapping only now (goal_state.py: "removed
+        # once the job is terminal *and reported*").
+        self.on_finished: Optional[Callable[[str], None]] = None
 
     def start(self, job_id: str, slug: str, kind: str) -> None:
         """Record a new job as running. Idempotent for the same `job_id` —
@@ -361,6 +369,8 @@ class JobManager:
                 return
             if self._by_slug.get(record.slug) == job_id:
                 del self._by_slug[record.slug]
+        if self.on_finished is not None:
+            self.on_finished(job_id)
 
     def active_jobs(self) -> List[Tuple[str, str, str]]:
         """Every job this manager still holds, as `(job_id, slug, state)` —

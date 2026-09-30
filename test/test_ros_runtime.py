@@ -79,6 +79,7 @@ from fleetless_bridge.ros_runtime import (
     external_job_id,
 )
 from fleetless_bridge import sampling
+from fleetless_bridge.goal_state import load_mapping
 from schemas import validate_frame
 
 FIBONACCI_TYPE = "example_interfaces/action/Fibonacci"
@@ -2443,6 +2444,78 @@ def test_a_bridge_restart_fetches_the_result_of_a_goal_that_ended_while_down():
     assert updates[-1].job_id == "job-1"
     assert updates[-1].state == "succeeded"
     assert updates[-1].result["sequence"] == [0, 1, 1, 2]  # two steps (`steps=2`), from [0, 1]
+
+
+def test_the_persisted_entry_outlives_the_terminal_update_until_it_is_delivered():
+    """The mapping entry is removed when the job is terminal *and
+    reported*, not when its terminal update is merely queued: a bridge
+    that restarts in between must still know the job, or the outcome it
+    already had in hand is lost with the process and the cloud settles
+    the job `lost`. Only delivery (`jobs.mark_delivered`, on the asyncio
+    thread) retires the entry."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=2, step_delay=0.02)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt._actions["count"].client.server_is_ready())
+            await rt.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
+            updates = await _drain_until_terminal(rt, timeout=10.0)
+            path = rt._goal_mapping_path
+            before_delivery = load_mapping(path)
+            rt.jobs.mark_delivered(updates[-1])
+            wait_until(lambda: "job-1" not in load_mapping(path), timeout=3.0)
+            return updates[-1].state, before_delivery
+        finally:
+            stop_server()
+
+    state, before_delivery = run(body)
+    assert state == "succeeded"
+    assert "job-1" in before_delivery
+
+
+def test_a_restart_between_the_end_and_its_delivery_reports_the_outcome_again():
+    """The case the entry is kept for: the job ended and its terminal
+    update was queued, but the process died before the update reached
+    the cloud. The next process re-attaches from the mapping and fetches
+    the real outcome from the action server again."""
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=2, step_delay=0.02, own_context=True)
+        rt1 = RosRuntime(
+            node_name="test_restart_undelivered_before_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        try:
+            rt1.start(asyncio.get_event_loop())
+            rt1.set_connected(True)
+            await rt1.apply_actions(by_slug([_action_cfg("count")]))
+            wait_until(lambda: rt1._actions["count"].client.server_is_ready())
+            await rt1.invoke("job-1", "count", {"order": 3}, patience_ms=15000)
+            first_run = await _drain_until_terminal(rt1, timeout=10.0)
+            assert first_run[-1].state == "succeeded"
+        finally:
+            rt1.stop()  # never delivered
+
+        rt2 = RosRuntime(
+            node_name="test_restart_undelivered_after_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            updates = await _drain_until_terminal(rt2, timeout=10.0)
+        finally:
+            rt2.stop()
+            stop_server()
+        return updates
+
+    updates = asyncio.run(body())
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "succeeded"
+    assert updates[-1].result["sequence"] == [0, 1, 1, 2]
 
 
 def test_a_bridge_restart_with_the_mapping_removed_lets_the_goal_appear_external():
