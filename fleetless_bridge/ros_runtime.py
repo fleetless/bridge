@@ -4759,21 +4759,24 @@ class RosRuntime:
         the bridge also holds no non-terminal own job for this slug**
         (`_slug_has_running_own_job`, fleetless#92). The tracker's own
         status view can lag the bridge's: right after a goal is accepted
-        — and, on a loaded machine, again on a later tick, since nothing
-        makes `_action/status` snapshots arrive on this method's own
-        cadence — `active_goal_ids()` can read empty for a tick even
-        though the job that goal belongs to is still running. Resetting
-        `liveness_confirmed_ready` on that tick alone was harmless (there
-        was nothing to lose yet); resetting it once it was already `True`
-        wiped a genuine "seen ready" back to "never seen", which restarts
-        this method at `ACTION_SERVER_DISCOVERY_GRACE_S` instead of the
-        3s debounce for a server that vanishes moments later — the
-        measured 33.02s in fleetless#92 (30s grace + 3s debounce) against
-        the documented 3-8s. A momentary gap in the tracker's own
-        bookkeeping is not evidence the server is gone; "no goal of any
-        kind left on the action" — this reset's actual job — is checked
-        against the bridge's own held jobs instead, not only the
-        tracker's. External goals are unaffected: an external goal is
+        `active_goal_ids()` reads empty for a tick or more although the
+        job that goal belongs to is running (measured in fleetless#92),
+        and nothing guarantees a later snapshot names it either — each
+        snapshot replaces the last wholesale (`GoalTracker._on_status`).
+        Resetting `liveness_confirmed_ready` on such a tick is harmless
+        while it is still `False`; resetting it once it is `True` turns
+        "seen ready" back into "never seen", so a server that vanishes
+        moments later is reported only after
+        `ACTION_SERVER_DISCOVERY_GRACE_S` + debounce (33s) instead of the
+        3s debounce. The 33.02s CI failures in fleetless#92 were this
+        reset wiping the liveness tests' hand-seeded `True` in the
+        post-acceptance gap; a real `True` wiped by a later gap was not
+        reproduced under load, so this guards a path that was shown
+        possible, not one that was observed. A momentary gap in the
+        tracker's own bookkeeping is not evidence the server is gone;
+        "no goal of any kind left on the action" — this reset's actual
+        job — is checked against the bridge's own held jobs instead, not
+        only the tracker's. External goals are unaffected: an external goal is
         only ever known through the tracker's status view in the first
         place, so a gap in that view already means this method knows of
         no external goal to protect."""
