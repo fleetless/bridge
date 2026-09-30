@@ -10,7 +10,7 @@ from fake_cloud import FakeCloud, sequence
 from helpers import make_client, run_until
 from test_client_datapoints import FakeRos, _run_one_exchange
 
-from fleetless_bridge.jobs import JobUpdate
+from fleetless_bridge.jobs import JobManager, JobUpdate
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_UNKNOWN,
     APPLY_ERROR_KIND_CAMERA,
@@ -166,6 +166,31 @@ def test_hello_names_a_terminal_job_with_its_actual_state():
     hello = asyncio.run(scenario())
     assert hello["active_jobs"] == [
         {"job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", "slug": "drive_to", "state": "succeeded"}
+    ]
+
+
+def test_hello_leaves_an_external_job_out():
+    fake_ros = FakeRos()
+    fake_ros.jobs = JobManager()
+    fake_ros.jobs.start("3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", "drive_to", "action")
+    fake_ros.jobs.register_external("4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70", "drive_to")
+
+    async def scenario():
+        hello_box = {}
+
+        async def behavior(session):
+            hello_box["hello"] = await session.recv_hello()
+            await session.accept()
+            await session.drain()
+
+        async with FakeCloud(behavior) as cloud:
+            client = make_client(cloud, ros=fake_ros)
+            await run_until(client, lambda: "hello" in hello_box)
+        return hello_box["hello"]
+
+    hello = asyncio.run(scenario())
+    assert hello["active_jobs"] == [
+        {"job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", "slug": "drive_to", "state": "running"}
     ]
 
 

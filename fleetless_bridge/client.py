@@ -1941,7 +1941,7 @@ class BridgeClient:
     def _active_jobs(self) -> List[Tuple[str, str, str]]:
         if self._ros is None:
             return []
-        return self._ros.jobs.active_jobs()
+        return self._ros.jobs.hello_jobs()
 
     def _dispatch_invoke(self, message: CloudInvoke) -> None:
         """Kicks the job off and returns immediately — completion arrives

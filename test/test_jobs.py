@@ -507,3 +507,14 @@ def test_on_finished_is_called_once_a_job_is_retired():
     assert retired == []
     jobs.mark_delivered(JobUpdate(job_id="job-1", slug="drive_to", state="succeeded", timestamp_ms=2))
     assert retired == ["job-1"]
+
+
+def test_hello_jobs_leave_external_jobs_out():
+    """`hello.active_jobs` has no `origin`, and the cloud keeps external
+    jobs in memory only: naming one there hands its reconciliation an id
+    it cannot place. The heartbeat reports it again, with its origin."""
+    jobs = JobManager()
+    jobs.start("own", "count", "action")
+    jobs.register_external("ext", "count")
+    assert jobs.hello_jobs() == [("own", "count", "running")]
+    assert jobs.active_jobs() == [("own", "count", "running"), ("ext", "count", "running")]

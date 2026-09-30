@@ -421,6 +421,22 @@ class JobManager:
                 (job_id, record.slug, record.state) for job_id, record in self._jobs.items()
             ]
 
+    def hello_jobs(self) -> List[Tuple[str, str, str]]:
+        """What `hello.active_jobs` sends: `active_jobs()` without the
+        external jobs. `activeJob` carries no `origin`, and an external
+        job is live-only in the cloud — never in `job_runs`, forgotten by
+        a cloud restart — so naming one in `hello` would hand the cloud's
+        reconciliation an id it cannot place (or take for a Fleetless
+        job). An external goal still active is reported again, with its
+        origin, by the next heartbeat tick; one that ended while
+        disconnected by its queued terminal `job_update`."""
+        with self._lock:
+            return [
+                (job_id, record.slug, record.state)
+                for job_id, record in self._jobs.items()
+                if record.origin != "external"
+            ]
+
     def emit(self, loop: asyncio.AbstractEventLoop, update: JobUpdate) -> None:
         """Queues the frame, and records this job's state as `update.state`
         immediately — `active_jobs()` must be able to say what the
