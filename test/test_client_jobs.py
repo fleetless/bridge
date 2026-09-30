@@ -69,6 +69,33 @@ def test_a_cancel_by_job_id_is_dispatched_to_the_ros_runtime():
     assert fake_ros.cancel_calls == [("drive_to", "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f")]
 
 
+def test_an_own_only_cancel_is_dispatched_with_the_flag():
+    fake_ros = FakeRos()
+
+    async def send_and_recv(session):
+        await session.send_cancel(
+            "drive_to", "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", own_only=True
+        )
+        return await session.recv_cancel_result()
+
+    payload = _run_one_exchange(send_and_recv, ros=fake_ros)
+    assert fake_ros.cancel_calls == [("drive_to", "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f")]
+    assert fake_ros.cancel_own_only == [True]
+    assert payload["goals"] == []
+    assert payload["error"] is None
+
+
+def test_a_cancel_without_own_only_is_dispatched_without_it():
+    fake_ros = FakeRos()
+
+    async def send_and_recv(session):
+        await session.send_cancel("drive_to", "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f")
+        return await session.recv_cancel_result()
+
+    _run_one_exchange(send_and_recv, ros=fake_ros)
+    assert fake_ros.cancel_own_only == [False]
+
+
 def test_a_cancel_is_answered_with_each_goals_return_code():
     """Accepted (0), refused (1) and unanswered (null) side by side, each
     under its own job and goal id, echoing the cancel's `request_id` —

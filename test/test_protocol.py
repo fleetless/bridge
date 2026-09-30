@@ -1259,6 +1259,68 @@ def test_cancel_with_an_unusable_request_id_is_unknown(request_id):
     assert isinstance(parse_cloud_message(payload), Unknown)
 
 
+def test_cancel_without_own_only_keeps_todays_meaning():
+    payload = json.dumps(
+        {"type": "cancel", "request_id": "cancel-1", "slug": "drive_to", "job_id": None}
+    )
+    assert parse_cloud_message(payload).own_only is False
+
+
+@pytest.mark.parametrize("own_only", [True, False])
+def test_cancel_carries_own_only(own_only):
+    payload = json.dumps(
+        {
+            "type": "cancel",
+            "request_id": "cancel-1",
+            "slug": "drive_to",
+            "job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+            "own_only": own_only,
+        }
+    )
+    assert parse_cloud_message(payload) == CloudCancel(
+        request_id="cancel-1",
+        slug="drive_to",
+        job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+        own_only=own_only,
+    )
+
+
+@pytest.mark.parametrize("own_only", [None, "true", 1, 0])
+def test_cancel_with_a_non_boolean_own_only_is_unknown(own_only):
+    payload = json.dumps(
+        {
+            "type": "cancel",
+            "request_id": "cancel-1",
+            "slug": "drive_to",
+            "job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+            "own_only": own_only,
+        }
+    )
+    assert isinstance(parse_cloud_message(payload), Unknown)
+
+
+def test_an_own_only_cancel_without_a_job_id_is_unknown():
+    """"Whatever runs" cannot be limited to own jobs without guessing;
+    the cloud never sends it."""
+    payload = json.dumps(
+        {"type": "cancel", "request_id": "cancel-1", "slug": "drive_to", "job_id": None, "own_only": True}
+    )
+    assert isinstance(parse_cloud_message(payload), Unknown)
+
+
+def test_an_own_only_cancel_matches_the_vendored_schema():
+    validate_frame(
+        "cloud-cancel",
+        {
+            "type": "cancel",
+            "request_id": "cancel-1",
+            "slug": "drive_to",
+            "job_id": "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+            "own_only": True,
+        },
+    )
+
+
 def test_publish_carries_the_slug_and_flat_message():
     payload = json.dumps(
         {"type": "publish", "slug": "drive", "message": {"linear_x": 0.2, "angular_z": 0.0}}

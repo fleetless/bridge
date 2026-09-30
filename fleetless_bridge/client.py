@@ -1982,7 +1982,9 @@ class BridgeClient:
         error: Optional[Tuple[str, str]] = None
         if self._ros is not None:
             try:
-                outcome = await self._ros.cancel_job(message.slug, message.job_id)
+                outcome = await self._ros.cancel_job(
+                    message.slug, message.job_id, own_only=message.own_only
+                )
             except Exception:  # noqa: BLE001 - answered as an error, not raised
                 log.exception("Cancel for slug %r failed", message.slug)
                 error = ("internal_error", "the bridge could not carry out the cancel")
