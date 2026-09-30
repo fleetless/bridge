@@ -1,3 +1,10 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.0.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(jobs): survive a momentary status gap for a still-running own job
+  * docs(jobs): state which 33s failure the liveness reset guard explains
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Wed, 30 Sep 2026 18:16:24 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * feat(jobs)!: a goal tracker per action, external goals, unknown jobs
