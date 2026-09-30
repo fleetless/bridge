@@ -65,13 +65,17 @@ def spun_node(ros):
         thread.join(timeout=5.0)
 
 
-def wait_until(condition, timeout: float = 5.0, interval: float = 0.02) -> None:
+def wait_until(condition, timeout: float = 5.0, interval: float = 0.02, message=None) -> None:
     """Poll `condition` until truthy — ROS graph discovery is asynchronous
     (DDS discovery between nodes), so a test that just created a
     publisher/subscription/action server must wait for the graph to catch up
-    rather than assert immediately."""
+    rather than assert immediately.
+
+    `message`: what the `AssertionError` says on timeout, instead of the
+    generic default — for a wait worth naming (which slug, which state) so
+    a failure reads as what did not happen, not just that a timeout fired."""
     deadline = time.monotonic() + timeout
     while not condition():
         if time.monotonic() > deadline:
-            raise AssertionError("condition never became true within {}s".format(timeout))
+            raise AssertionError(message or "condition never became true within {}s".format(timeout))
         time.sleep(interval)
