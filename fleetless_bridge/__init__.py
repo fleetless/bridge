@@ -6,4 +6,4 @@ bridge reports it to the cloud in the hello handshake, and a test keeps it in
 step with package.xml.
 """
 
-__version__ = "6.0.1"
+__version__ = "6.1.0"

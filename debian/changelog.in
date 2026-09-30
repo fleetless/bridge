@@ -1,3 +1,9 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.1.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * feat(jobs): an own_only cancel never reaches a goal the bridge did not start
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Wed, 30 Sep 2026 21:18:27 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.0.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * fix(jobs): survive a momentary status gap for a still-running own job
