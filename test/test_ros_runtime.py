@@ -2429,6 +2429,47 @@ def test_the_tracker_drops_feedback_of_goals_that_ended_or_left_the_status():
     assert remaining == {running}
 
 
+def test_a_late_status_snapshot_does_not_turn_an_ended_own_goal_into_an_external_job():
+    """The terminal report of an own job makes the tracker forget the
+    goal, but the status topic is a separate, unsynchronised stream: a
+    snapshot published just before the goal ended can arrive just after,
+    still naming it `EXECUTING`. Unattributed by then, the next tick
+    would mint it a second, external job for something that already
+    ended. A goal the tracker just forgot as own is not discovered again
+    until a snapshot names it ended or no longer names it."""
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        rt.set_robot_id("robot-xyz")
+        tracker = rt._actions["count"].tracker
+        goal_id = "11111111-1111-4111-8111-111111111111"
+        rt.jobs.start("job-1", "count", "action")
+        rt._job_goal_ids["job-1"] = goal_id
+        tracker.register_own_goal(goal_id, "job-1")
+        tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_EXECUTING)))
+        rt._emit_job("job-1", "count", "succeeded")
+        tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_EXECUTING)))  # late
+        rt._emit_job_heartbeats()
+        await asyncio.sleep(0.05)
+        after_late = []
+        while (update := rt.jobs.updates.try_get()) is not None:
+            after_late.append(update)
+        tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+        tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_EXECUTING)))  # reused id
+        rt._emit_job_heartbeats()
+        await asyncio.sleep(0.05)
+        rediscovered = rt.jobs.updates.try_get()
+        return after_late, rediscovered, goal_id
+
+    after_late, rediscovered, goal_id = run(body)
+    assert [(u.job_id, u.state) for u in after_late] == [("job-1", "succeeded")]
+    # Once a snapshot said the goal ended, the id is an ordinary goal id
+    # again — a goal active under it is discovered as usual.
+    assert rediscovered is not None
+    assert rediscovered.origin == "external"
+    assert rediscovered.goal_id == goal_id
+
+
 def test_a_flapping_external_goal_between_two_ticks_is_never_reported():
     """The one case where silence is correct, not a bug: a goal that both starts and fully ends
     well inside one 1 Hz heartbeat interval must never reach the cloud at
