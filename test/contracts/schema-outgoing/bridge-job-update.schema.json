@@ -21,7 +21,6 @@
       "type": "string",
       "enum": [
         "running",
-        "unknown",
         "succeeded",
         "failed",
         "cancelled",
