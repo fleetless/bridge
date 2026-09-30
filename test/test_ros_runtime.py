@@ -2400,6 +2400,101 @@ def test_a_bridge_restart_reattaches_to_a_still_active_persisted_goal():
     assert updates[-1].origin == "fleetless"
 
 
+async def _crash_mid_goal(state_dir, name, *, slug="count", job_id="job-1", order=5):
+    """Runs one `RosRuntime` on `state_dir` until `job_id` is `running`,
+    then stops it without settling anything — a crash, as far as the
+    persisted mapping is concerned. The action server is the caller's."""
+    rt = RosRuntime(node_name="{}_{}".format(name, id(object())), goal_state_dir=state_dir)
+    try:
+        rt.start(asyncio.get_event_loop())
+        rt.set_connected(True)
+        await rt.apply_actions(by_slug([_action_cfg(slug)]))
+        wait_until(lambda: rt._actions[slug].client.server_is_ready())
+        await rt.invoke(job_id, slug, {"order": order}, patience_ms=15000)
+        first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        assert first.state == "running"
+    finally:
+        rt.stop()
+
+
+def test_a_restarted_bridge_names_its_persisted_job_before_any_config_arrives():
+    """The cloud reconciles on `hello` and may ask `job_query` before the
+    first `config` frame has created a single action. A restarted bridge
+    that only learned its persisted jobs while applying that config would
+    say `active_jobs: []` and `unknown_job_ids: [job]` in that window —
+    and the cloud, told the bridge does not know the job, settles a job
+    that is still running `lost` for good. The mapping is read at
+    `start()`, so both answers already name the job `running`."""
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=20, step_delay=0.1, own_context=True)
+        try:
+            await _crash_mid_goal(state_dir, "test_restart_hello_before")
+            rt2 = RosRuntime(
+                node_name="test_restart_hello_after_{}".format(id(object())),
+                goal_state_dir=state_dir,
+            )
+            try:
+                rt2.start(asyncio.get_event_loop())
+                rt2.set_connected(True)
+                at_hello = rt2.jobs.active_jobs()
+                entries, unknown = await rt2.job_query(["job-1"])
+                await rt2.apply_actions(by_slug([_action_cfg("count")]))
+                updates = await _drain_until_terminal(rt2, timeout=10.0)
+            finally:
+                rt2.stop()
+        finally:
+            stop_server()
+        return at_hello, entries, unknown, updates
+
+    at_hello, entries, unknown, updates = asyncio.run(body())
+    assert at_hello == [("job-1", "count", "running")]
+    assert unknown == []
+    assert [(e.job_id, e.state) for e in entries] == [("job-1", "running")]
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "succeeded"
+
+
+def test_a_persisted_job_whose_slug_the_config_no_longer_has_is_lost_config_changed():
+    """The other end of registering persisted jobs at `start()`: a job
+    whose action the first `config` does not configure any more can never
+    be re-attached, so it is settled `lost`/`config_changed` — the same
+    word a running job gets when its slug is removed — instead of being
+    named `running` for ever. Its mapping entry goes once that is
+    delivered."""
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=20, step_delay=0.1, own_context=True)
+        try:
+            await _crash_mid_goal(state_dir, "test_restart_removed_before")
+            rt2 = RosRuntime(
+                node_name="test_restart_removed_after_{}".format(id(object())),
+                goal_state_dir=state_dir,
+            )
+            try:
+                rt2.start(asyncio.get_event_loop())
+                rt2.set_connected(True)
+                await rt2.apply_actions(by_slug([_action_cfg("other")]))
+                updates = await _drain_until_terminal(rt2, timeout=5.0)
+                rt2.jobs.mark_delivered(updates[-1])
+                path = rt2._goal_mapping_path
+                wait_until(lambda: "job-1" not in load_mapping(path), timeout=3.0)
+                slug_free = rt2.jobs.running_job_id("count") is None
+            finally:
+                rt2.stop()
+        finally:
+            stop_server()
+        return updates, slug_free
+
+    updates, slug_free = asyncio.run(body())
+    assert updates[-1].job_id == "job-1"
+    assert updates[-1].state == "lost"
+    assert updates[-1].error[0] == "config_changed"
+    assert slug_free
+
+
 def test_a_bridge_restart_fetches_the_result_of_a_goal_that_ended_while_down():
     """The goal finishes entirely while nothing is running, and the next
     process to read the persisted mapping still gets the real, true

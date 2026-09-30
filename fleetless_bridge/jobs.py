@@ -3,7 +3,10 @@
 
 Job state lives only here, only in memory — if this process restarts, it is
 gone, and `hello.active_jobs` (protocol.py) is how a fresh process tells the
-cloud so, rather than any frame this module sends (see `client.py`).
+cloud so, rather than any frame this module sends (see `client.py`). The one
+exception is an own action job still in the persisted goal mapping
+(`goal_state.py`): `RosRuntime.start()` registers each of those here again
+before the first `hello`, so the restarted process still names it.
 
 Two ROS-side execution paths — a goal lifecycle for actions, one call for
 services — both funnel into the same `JobUpdateQueue`: from the cloud's and

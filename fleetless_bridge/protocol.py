@@ -736,8 +736,9 @@ def hello_message(
 
     `active_jobs` is every job this process still has in memory (the format,
 ), as `(job_id, slug, state)` triples (renamed from
-    `active_job_ids`, which named only the id) — empty on a fresh process,
-    which is exactly what tells the cloud a job it believes running here was
+    `active_job_ids`, which named only the id) — on a fresh process only
+    the own action jobs its persisted goal mapping still names, which is
+    exactly what tells the cloud any other job it believes running here was
     actually lost. A reconnect of the *same* process lists its live jobs
     instead, so nothing is lost that is not really gone, and `state` is
     this process's own current answer for each — including a terminal one
