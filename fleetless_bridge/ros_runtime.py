@@ -1418,7 +1418,7 @@ class RosRuntime:
         # The in-memory mirror of the persisted job_id -> (slug, goal_id)
         # mapping (`goal_state.py`) — read once at `start()`, written back
         # (merged, never overwritten wholesale) on every own-goal send and
-        # settlement. Only Fleetless's own action jobs are ever entries
+        # on every delivered terminal report (`_on_job_delivered`). Only Fleetless's own action jobs are ever entries
         # here; see `goal_state.py`'s own docstring for why an external
         # goal's restart-survival is not a promise this makes.
         self._goal_mapping: Dict[str, Tuple[str, str]] = {}
@@ -1528,6 +1528,10 @@ class RosRuntime:
         self.samples = SampleQueue(maxsize=sample_queue_maxsize)
         self.backlog = BacklogStore()
         self.jobs = JobManager()
+        # D4: a job's persisted mapping entry goes when it is terminal *and
+        # reported* — delivery is the asyncio thread's event
+        # (`mark_delivered`), the mapping is the executor thread's state.
+        self.jobs.on_finished = self._on_job_delivered
         # slug -> the LivePublisher currently publishing it live — only
         # ever touched on the event loop thread (start_live/stop_live are
         # plain asyncio methods, never routed through _submit_async: joining
@@ -5950,25 +5954,48 @@ class RosRuntime:
 
     def _forget_goal_mapping(self, job_id: str, slug: str) -> None:
         """A job just reached a terminal state — the tracker no longer
-        needs to tell this job's own goal apart from an external one, and
-        the persisted mapping entry, if any (removed once the job is
-        terminal and reported), is dropped and the file rewritten.
+        needs to tell this job's own goal apart from an external one.
         A no-op for a service job or an action job settled before it ever
-        had a goal id — `self._job_goal_ids` simply has nothing to pop."""
+        had a goal id — `self._job_goal_ids` simply has nothing to pop.
+
+        The persisted mapping entry is **not** dropped here: D4 keeps it
+        until the job is terminal *and reported*. Its terminal update is
+        only queued at this point; a process that dies before
+        `mark_delivered` would otherwise take the outcome with it, and the
+        next process — finding no entry — could no longer name the job at
+        all, so the cloud would settle it `lost`. `_on_job_delivered`
+        drops the entry once delivery is confirmed."""
         goal_id = self._job_goal_ids.pop(job_id, None)
         if goal_id is None:
             return
         entry = self._actions.get(slug)
         if entry is not None and entry.tracker is not None:
             entry.tracker.forget_own_goal(goal_id)
+
+    def _on_job_delivered(self, job_id: str) -> None:
+        """`JobManager.on_finished`: `job_id`'s terminal update reached the
+        cloud. Called on the asyncio thread (`mark_delivered`), while the
+        mapping is executor-thread state, so the removal is handed to the
+        executor rather than done here. Nothing to hand over once the
+        runtime is stopped: the entry then simply stays for the next
+        process, which re-fetches and re-reports the outcome."""
+        if self._guard is None or self._stopped:
+            return
+        try:
+            self._enqueue(lambda: self._retire_goal_mapping(job_id))
+        except Exception:  # noqa: BLE001 - shutting down; the entry stays for the next start
+            log.debug("Could not hand the mapping removal of job %r to the executor", job_id, exc_info=True)
+
+    def _retire_goal_mapping(self, job_id: str) -> None:
         if self._goal_mapping.pop(job_id, None) is not None:
             self._save_goal_mapping()
 
     def _save_goal_mapping(self) -> None:
         """Writes the persisted mapping, and never raises for a write that
-        failed. Called from `_invoke_action` and from every terminal
-        report — the latter inside rclpy callbacks on the executor thread,
-        where an exception kills the thread and with it every subscription,
+        failed. Called from `_invoke_action` and from every delivered
+        terminal report (`_retire_goal_mapping`) — both on the executor
+        thread, the former sometimes inside an rclpy callback, where an
+        exception kills the thread and with it every subscription,
         failsafe and job on the robot. The mapping only buys restart
         survival: a job whose entry could not be written still runs and
         reports normally in this process, and after a restart its goal is
