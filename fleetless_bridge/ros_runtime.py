@@ -1534,7 +1534,7 @@ class RosRuntime:
         self.samples = SampleQueue(maxsize=sample_queue_maxsize)
         self.backlog = BacklogStore()
         self.jobs = JobManager()
-        # D4: a job's persisted mapping entry goes when it is terminal *and
+        # A job's persisted mapping entry goes when it is terminal *and
         # reported* — delivery is the asyncio thread's event
         # (`mark_delivered`), the mapping is the executor thread's state.
         self.jobs.on_finished = self._on_job_delivered
@@ -2755,25 +2755,26 @@ class RosRuntime:
         demonstrated it firing there. The guard exists because the check
         was simply absent, not because the race was measured — both facts
         belong here so neither gets overclaimed later."""
-        job_id = self.jobs.running_job_id(slug)
-        if job_id is None:
-            return
-        if self.jobs.state_of(job_id) != "running":
-            # Already terminal (or, if state_of returned None, already
-            # delivered out from under us between the two calls above) —
-            # someone else has already said, or is about to say, the true
-            # last word about this job. Nothing here may say a different
-            # one.
-            return
-        self._active_goals.pop(job_id, None)
-        self._goal_deadlines.pop(job_id, None)
-        self._pending_cancels.discard(job_id)
-        self._service_deadlines.pop(job_id, None)
-        # No per-job liveness state to drop any more — it lives on the
-        # `_ActionEntry`, which the caller destroys right after this call
-        # returns; see `RosRuntime.__init__`'s note beside
-        # `_server_lost_job_ids`.
-        self._emit_job(job_id, slug, "lost", error=("config_changed", reason))
+        # Every job held on the slug, not only the oldest: an action can
+        # hold an own job and external goals, or several external goals,
+        # at once, and each of them loses its tracker here.
+        for job_id in self.jobs.job_ids_on(slug):
+            if self.jobs.state_of(job_id) != "running":
+                # Already terminal (or, if state_of returned None, already
+                # delivered out from under us between the two calls) —
+                # someone else has already said, or is about to say, the
+                # true last word about this job. Nothing here may say a
+                # different one.
+                continue
+            self._active_goals.pop(job_id, None)
+            self._goal_deadlines.pop(job_id, None)
+            self._pending_cancels.discard(job_id)
+            self._service_deadlines.pop(job_id, None)
+            # No per-job liveness state to drop any more — it lives on the
+            # `_ActionEntry`, which the caller destroys right after this
+            # call returns; see `RosRuntime.__init__`'s note beside
+            # `_server_lost_job_ids`.
+            self._emit_job(job_id, slug, "lost", error=("config_changed", reason))
 
     # --- actions: apply, runs on the executor thread ------------------------
 
@@ -3077,21 +3078,27 @@ class RosRuntime:
         )
 
     def _invoke_action(self, job_id: str, slug: str, params_dict: dict, patience_ms: int) -> None:
-        existing_job_id = self.jobs.running_job_id(slug)
-        if existing_job_id is not None:
-            if existing_job_id == job_id:
-                return  # a redelivered invoke for the job already in flight
-            # The cloud enforces busy-per-slug before ever sending this;
-            # this is the defensive fallback for a race it lost.
-            self._emit_job(
-                job_id,
-                slug,
-                "failed",
-                error=("busy", "slug {!r} already has a running job".format(slug)),
-            )
+        if job_id in self.jobs.job_ids_on(slug):
+            return  # a redelivered invoke for the job already in flight
+        entry = self._actions[slug]
+        # The cloud enforces busy-per-slug before ever sending this; this
+        # is the defensive fallback for a race it lost, and it covers
+        # external goals too. Any goal active on the action counts, not only
+        # the jobs held for the slug: an external goal is only registered
+        # as a job at the next heartbeat tick, and not at all before the
+        # first `hello_ok` names the robot.
+        held = self.jobs.job_ids_on(slug)
+        active_goal_ids = entry.tracker.active_goal_ids() if entry.tracker is not None else set()
+        if held or active_goal_ids:
+            if held:
+                reason = "slug {!r} already has a running job ({})".format(slug, held[0])
+            else:
+                reason = "slug {!r}'s action already has an active goal ({})".format(
+                    slug, sorted(active_goal_ids)[0]
+                )
+            self._emit_job(job_id, slug, "failed", error=("busy", reason))
             return
 
-        entry = self._actions[slug]
         try:
             goal_msg = params.build_from_template(
                 entry.action_class.Goal,
@@ -3142,75 +3149,93 @@ class RosRuntime:
         `ClientGoalHandle` for it (a reconciled-from-persistence own job
         never gets one).
 
-        `job_id=None` still means "whatever is running on `slug`". A
-        named `job_id` that does not match what `self.jobs` currently
-        calls the slug's occupant is refused *unless* the tracker has no
-        active goal for that named id at all — an old job id whose slug is
-        now occupied by a different goal: the console only ever shows one
-        job per slug, so its cancel button must reach whatever is actually
-        running there, not fail silently over an id that is simply stale.
-        `cloudCancel` already carries `slug` alongside `job_id`; no
-        protocol change."""
+        `job_id=None` means "whatever runs on `slug`" — and an action can
+        run several goals at once (an own job and external goals, or
+        several external ones), so it cancels every goal active on the
+        action, and remembers the cancel for an own goal not yet accepted.
+
+        A named `job_id` this process holds on `slug` cancels exactly that
+        job. A named `job_id` it does not hold at all — an old job id
+        whose slug is now occupied by a different goal, the `unknown`
+        job the cloud holds `unknown` — falls back to cancelling the goals active on the
+        action: the console only ever shows one job per slug, so its
+        cancel button must reach whatever is actually running there, not
+        fail silently over an id that is simply stale. `cloudCancel`
+        already carries `slug` alongside `job_id`; no protocol change."""
         entry = self._actions.get(slug)
-        active_goal_ids = (
-            entry.tracker.active_goal_ids() if entry is not None and entry.tracker is not None else set()
-        )
-        running_job_id = self.jobs.running_job_id(slug)
-        target_job_id = job_id if job_id is not None else running_job_id
-        if target_job_id is None:
-            log.info("Cancel for slug %r: nothing running, silent no-op", slug)
+        tracker = entry.tracker if entry is not None else None
+        active_goal_ids = tracker.active_goal_ids() if tracker is not None else set()
+        held = self.jobs.job_ids_on(slug)
+
+        if job_id is None:
+            pending = [held_id for held_id in held if held_id in self._goal_deadlines]
+            if not active_goal_ids and not pending:
+                if held:
+                    log.info(
+                        "Cancel for slug %r (job %r): no ROS-level cancel exists for this job",
+                        slug, held[0],
+                    )
+                else:
+                    log.info("Cancel for slug %r: nothing running, silent no-op", slug)
+                return
+            for held_id in pending:
+                self._remember_pending_cancel(slug, held_id)
+            for goal_id in sorted(active_goal_ids):
+                tracker.cancel(goal_id)
             return
 
-        target_goal_id = self._job_goal_ids.get(target_job_id)
-        if job_id is not None and job_id != running_job_id and target_goal_id not in active_goal_ids:
+        if job_id not in held:
             if active_goal_ids:
                 log.warning(
-                    "Cancel for slug %r named job %r, which the tracker has no "
-                    "active goal for — cancelling every goal currently active "
-                    "on this action instead",
+                    "Cancel for slug %r named job %r, which this bridge does not hold — "
+                    "cancelling every goal currently active on this action instead",
                     slug, job_id,
                 )
-                for goal_id in list(active_goal_ids):
-                    entry.tracker.cancel(goal_id)
+                for goal_id in sorted(active_goal_ids):
+                    tracker.cancel(goal_id)
                 return
             # Distinguishable from the "nothing running" no-op above on
             # purpose: those two silences used to be the same message,
             # which is how a stale id and an idle slug both read as
             # "cancel did nothing", indistinguishably.
             log.warning(
-                "Cancel for slug %r named job %r, but %r is running — "
-                "refusing rather than cancelling the wrong job",
-                slug, job_id, running_job_id,
+                "Cancel for slug %r named job %r, which this bridge does not hold, and "
+                "no goal is active on the action — nothing to cancel",
+                slug, job_id,
             )
             return
 
-        if target_job_id in self._goal_deadlines:
-            # Sent, not yet accepted or rejected — there is no goal on the
-            # server to cancel *yet*, but there will be one, or a rejection
-            # that makes the question moot. Remembered rather than
-            # dropped; `_on_goal_response` applies it the instant the
-            # window closes either way.
-            self._pending_cancels.add(target_job_id)
-            log.info(
-                "Cancel for slug %r (job %r): the goal has not been "
-                "accepted yet — remembered, will apply once it is",
-                slug, target_job_id,
-            )
+        if job_id in self._goal_deadlines:
+            self._remember_pending_cancel(slug, job_id)
             return
 
-        if target_goal_id is not None and target_goal_id in active_goal_ids and entry is not None and entry.tracker is not None:
+        target_goal_id = self._job_goal_ids.get(job_id)
+        if target_goal_id is not None and tracker is not None:
             # The eventual "cancelled" job_update comes from the ordinary
             # status/result path once the server confirms — this call only
             # has to ask, not report; exactly one place still decides a
             # job's terminal state.
-            entry.tracker.cancel(target_goal_id)
+            tracker.cancel(target_goal_id)
             return
         # A service call, or any other kind with no ROS-level cancel — a
         # genuine no-op, not a dropped one; logged anyway so "cancel" is
         # discoverable in the logs for every branch that reaches here.
         log.info(
             "Cancel for slug %r (job %r): no ROS-level cancel exists for this job",
-            slug, target_job_id,
+            slug, job_id,
+        )
+
+    def _remember_pending_cancel(self, slug: str, job_id: str) -> None:
+        """Sent, not yet accepted or rejected — there is no goal on the
+        server to cancel *yet*, but there will be one, or a rejection that
+        makes the question moot. Remembered rather than dropped;
+        `_on_goal_response` applies it the instant the window closes
+        either way."""
+        self._pending_cancels.add(job_id)
+        log.info(
+            "Cancel for slug %r (job %r): the goal has not been "
+            "accepted yet — remembered, will apply once it is",
+            slug, job_id,
         )
 
     # --- action goal lifecycle: every callback below runs on the executor --
@@ -6067,7 +6092,7 @@ class RosRuntime:
         A no-op for a service job or an action job settled before it ever
         had a goal id — `self._job_goal_ids` simply has nothing to pop.
 
-        The persisted mapping entry is **not** dropped here: D4 keeps it
+        The persisted mapping entry is **not** dropped here: it is kept
         until the job is terminal *and reported*. Its terminal update is
         only queued at this point; a process that dies before
         `mark_delivered` would otherwise take the outcome with it, and the

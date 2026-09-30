@@ -850,6 +850,8 @@ def test_an_unchanged_action_keeps_the_same_client_object():
 
 
 def test_removing_an_actions_slug_while_a_job_is_running_settles_it_lost():
+    stopped = [False]
+
     async def body(rt):
         stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
         try:
@@ -881,7 +883,12 @@ def test_removing_an_actions_slug_while_a_job_is_running_settles_it_lost():
             after_delivery = rt.jobs.tracked_count()
 
             # (c) the slug accepts a new invoke — it has to be reconfigured
-            # first, since apply_actions([]) removed it entirely.
+            # first, since apply_actions([]) removed it entirely. The old
+            # server goes first: it is still running job-1's orphaned goal,
+            # and a goal active on the action rightly keeps the slug busy
+            # (the busy backstop covers every active goal).
+            stop_server()
+            stopped[0] = True
             stop_server_2 = _start_fibonacci_server(steps=3)
             try:
                 await rt.apply_actions(by_slug([_action_cfg("count")]))
@@ -892,7 +899,8 @@ def test_removing_an_actions_slug_while_a_job_is_running_settles_it_lost():
 
             return baseline, after_delivery, retry_updates
         finally:
-            stop_server()
+            if not stopped[0]:
+                stop_server()
 
     baseline, after_delivery, retry_updates = run(body)
     assert after_delivery == baseline  # (b)
@@ -2274,6 +2282,100 @@ def test_an_external_goal_occupies_its_slug_and_can_be_cancelled():
     updates = run(body)
     assert updates[-1].state == "cancelled"
     assert updates[-1].origin == "external"
+
+
+def test_an_invoke_is_refused_busy_while_an_external_goal_is_active_on_the_action():
+    """The bridge's own busy backstop covers external goals. The goal
+    is active on the action before any heartbeat tick registered it as a
+    job — here the robot id is not even known yet, so it never will be —
+    and the tracker's own view of the action is what refuses the invoke,
+    not only the jobs held for the slug."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                tracker = rt._actions["count"].tracker
+                wait_until(lambda: goal_id in tracker.active_goal_ids(), timeout=3.0)
+                await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+                update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=3.0)
+            finally:
+                stop_sender()
+            return update
+        finally:
+            stop_server()
+
+    update = run(body)
+    assert update.job_id == "job-1"
+    assert update.state == "failed"
+    assert update.error[0] == "busy"
+
+
+def test_cancel_by_slug_cancels_every_goal_active_on_the_action():
+    """Two goals active on one action at once — both external here — and
+    a cancel by slug (no `job_id`): each of them is cancelled, not only
+    the one the slug index happened to name."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, honor_cancel=True)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_a, _handle_a, stop_a = _send_goal_directly("/count", order=5)
+            goal_b, _handle_b, stop_b = _send_goal_directly("/count", order=5)
+            try:
+                wait_until(lambda: len(rt.jobs.job_ids_on("count")) == 2, timeout=3.0)
+                await rt.cancel_job("count", None)
+                ended = {}
+                while len(ended) < 2:
+                    update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+                    if update.state in ("succeeded", "failed", "cancelled", "lost"):
+                        ended[update.goal_id] = update.state
+            finally:
+                stop_a()
+                stop_b()
+            return ended, goal_a, goal_b
+        finally:
+            stop_server()
+
+    ended, goal_a, goal_b = run(body)
+    assert ended == {goal_a: "cancelled", goal_b: "cancelled"}
+
+
+def test_removing_an_action_settles_every_job_running_on_it():
+    """`_settle_orphaned_job` settles every job held on the slug, not only
+    the one the slug index named — otherwise the others stay `running`
+    with no tracker left to ever end them."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            goal_a, _handle_a, stop_a = _send_goal_directly("/count", order=5)
+            goal_b, _handle_b, stop_b = _send_goal_directly("/count", order=5)
+            try:
+                wait_until(lambda: len(rt.jobs.job_ids_on("count")) == 2, timeout=3.0)
+                await rt.apply_actions({})
+                ended = {}
+                while len(ended) < 2:
+                    update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+                    if update.state in ("succeeded", "failed", "cancelled", "lost"):
+                        ended[update.goal_id] = (update.state, update.error[0])
+            finally:
+                stop_a()
+                stop_b()
+            return ended, goal_a, goal_b
+        finally:
+            stop_server()
+
+    ended, goal_a, goal_b = run(body)
+    assert ended == {
+        goal_a: ("lost", "config_changed"),
+        goal_b: ("lost", "config_changed"),
+    }
 
 
 def test_a_flapping_external_goal_between_two_ticks_is_never_reported():
