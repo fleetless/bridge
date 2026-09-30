@@ -64,6 +64,7 @@ from fleetless_bridge import ros_runtime
 from fleetless_bridge.ros_runtime import (
     ACTION_SERVER_LIVENESS_DEBOUNCE_S,
     ASSET_UPLOAD_RATE_LIMIT_MAX_RETRIES,
+    CANCEL_RESULT_TIMEOUT_S,
     DAE_MAX_INTERNAL_REFERENCES_PER_SYNC,
     DEFAULT_URDF_TOPIC,
     JOB_HEARTBEAT_INTERVAL_MS,
@@ -78,6 +79,7 @@ from fleetless_bridge.ros_runtime import (
     UploadResult,
     external_job_id,
 )
+from fleetless_bridge.protocol import CancelResultEntry, cancel_result_message
 from fleetless_bridge import sampling
 from fleetless_bridge.goal_state import load_mapping
 from schemas import validate_frame
@@ -170,6 +172,7 @@ def _start_fibonacci_server(
     accept=True,
     accept_delay=0.0,
     honor_cancel=True,
+    cancel_delay=0.0,
     own_context=False,
 ):
     """A real Fibonacci action server on its own spinning node, so the
@@ -182,6 +185,10 @@ def _start_fibonacci_server(
     `accept_delay` holds the accept/reject decision open that long before
     answering — lets the goal-acceptance-timeout tests arrange a goal
     accepted *after* the bridge has already given up on it.
+
+    `cancel_delay` holds the answer to a cancel request open that long —
+    a server that has not answered by the bridge's `CANCEL_RESULT_TIMEOUT_S`
+    is reported with `return_code: null`.
 
     `own_context`: a restart test needs the server to outlive
     `RosRuntime.stop()`'s `rclpy.shutdown()`, which tears down the whole
@@ -233,6 +240,8 @@ def _start_fibonacci_server(
 
     def cancel_callback(goal_handle):
         cancel_requests.append(goal_handle)
+        if cancel_delay:
+            time.sleep(cancel_delay)
         return CancelResponse.ACCEPT if honor_cancel else CancelResponse.REJECT
 
     server = ActionServer(
@@ -1242,22 +1251,101 @@ def test_cancel_by_slug_issues_a_real_ros_goal_cancel():
             # chance of racing the goal's very first step.
             while len([u for u in updates if u.state == "running"]) < 2:
                 updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0))
-            await rt.cancel_job("count", None)
+            outcome = await rt.cancel_job("count", None)
             updates += await _drain_until_terminal(rt)
-            return updates
+            return updates, outcome, updates[-1].goal_id
         finally:
             stop_server()
 
-    updates = run(body)
+    updates, outcome, goal_id = run(body)
     assert updates[-1].state == "cancelled"
+    assert outcome.error is None
+    assert outcome.goals == [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=0)]
 
 
-def test_cancelling_a_slug_with_nothing_running_is_a_silent_no_op():
+def test_cancelling_a_slug_with_nothing_running_answers_with_no_goals_at_once():
+    """Nothing matched is an answer, not a failure: `goals: []`, no error,
+    and no wait for a bound that has nothing to bound."""
+
     async def body(rt):
         await rt.apply_actions(by_slug([_action_cfg("count")]))
-        await rt.cancel_job("count", None)  # nothing running — must not raise
+        started = time.monotonic()
+        outcome = await rt.cancel_job("count", None)
+        return outcome, time.monotonic() - started
 
-    run(body)  # must not raise
+    outcome, elapsed = run(body)
+    assert outcome.goals == []
+    assert outcome.error is None
+    assert elapsed < 1.0
+
+
+def test_a_cancel_for_an_unknown_slug_answers_unknown_slug():
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        return await rt.cancel_job("nothing_here", None)
+
+    outcome = run(body)
+    assert outcome.goals == []
+    assert outcome.error[0] == "unknown_slug"
+
+
+def test_the_cancel_answer_bound_stays_below_the_clouds_wait():
+    """The cloud waits `JOB_HEARTBEAT_TIMEOUT_MS` for a `cancel_result`
+    and then gives up on it; the bridge has to have answered by then,
+    link and executor hop included, or its answer lands on nobody."""
+    with (pathlib.Path(ros_runtime.__file__).parent / "contracts_constants.json").open() as handle:
+        cloud_wait_s = json.load(handle)["JOB_HEARTBEAT_TIMEOUT_MS"] / 1000.0
+    assert 0 < CANCEL_RESULT_TIMEOUT_S <= cloud_wait_s - 1.0
+
+
+def test_a_refused_cancel_is_reported_as_rejected():
+    """rclpy's action server answers a cancel its callback refused with
+    `ERROR_NONE` and an empty `goals_canceling` (Humble and Jazzy alike);
+    rclcpp says `ERROR_REJECTED`. Both are a refusal, and the cloud has to
+    hear one, never a success."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, honor_cancel=False)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            updates = []
+            while len([u for u in updates if u.state == "running"]) < 2:
+                updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0))
+            outcome = await rt.cancel_job("count", "job-1")
+            updates += await _drain_until_terminal(rt)
+            return updates, outcome, updates[-1].goal_id
+        finally:
+            stop_server()
+
+    updates, outcome, goal_id = run(body)
+    assert outcome.error is None
+    assert outcome.goals == [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=1)]
+    assert updates[-1].state == "succeeded"
+
+
+def test_a_cancel_the_server_does_not_answer_in_time_is_reported_with_a_null_code():
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.1, cancel_delay=2.0)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            updates = []
+            while len([u for u in updates if u.state == "running"]) < 2:
+                updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0))
+            with mock.patch.object(ros_runtime, "CANCEL_RESULT_TIMEOUT_S", 0.5):
+                started = time.monotonic()
+                outcome = await rt.cancel_job("count", "job-1")
+                elapsed = time.monotonic() - started
+            updates = await _drain_until_terminal(rt)
+            return outcome, elapsed, updates[-1].goal_id
+        finally:
+            stop_server()
+
+    outcome, elapsed, goal_id = run(body)
+    assert outcome.error is None
+    assert outcome.goals == [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=None)]
+    assert 0.4 < elapsed < 1.5
 
 
 def test_cancel_by_the_matching_job_id_issues_a_real_ros_goal_cancel():
@@ -1269,14 +1357,15 @@ def test_cancel_by_the_matching_job_id_issues_a_real_ros_goal_cancel():
             updates = []
             while len([u for u in updates if u.state == "running"]) < 2:
                 updates.append(await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0))
-            await rt.cancel_job("count", "job-1")
+            outcome = await rt.cancel_job("count", "job-1")
             updates += await _drain_until_terminal(rt)
-            return updates
+            return updates, outcome, updates[-1].goal_id
         finally:
             stop_server()
 
-    updates = run(body)
+    updates, outcome, goal_id = run(body)
     assert updates[-1].state == "cancelled"
+    assert outcome.goals == [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=0)]
 
 
 def test_cancel_by_a_non_matching_job_id_falls_back_to_the_external_goals_only():
@@ -1302,7 +1391,7 @@ def test_cancel_by_a_non_matching_job_id_falls_back_to_the_external_goals_only()
             try:
                 external = external_job_id("robot-xyz", "count", goal_id)
                 wait_until(lambda: external in rt.jobs.job_ids_on("count"), timeout=3.0)
-                await rt.cancel_job("count", "11111111-1111-4111-8111-111111111111")
+                outcome = await rt.cancel_job("count", "11111111-1111-4111-8111-111111111111")
                 ended = None
                 while ended is None:
                     update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
@@ -1314,15 +1403,21 @@ def test_cancel_by_a_non_matching_job_id_falls_back_to_the_external_goals_only()
                 ]
             finally:
                 stop_sender()
-            return ended, external, own_state, cancelled_goals, goal_id
+            return ended, external, own_state, cancelled_goals, goal_id, outcome
         finally:
             stop_server()
 
-    ended, external, own_state, cancelled_goals, goal_id = run(body)
+    ended, external, own_state, cancelled_goals, goal_id, outcome = run(body)
     assert ended.job_id == external
     assert ended.state == "cancelled"
     assert own_state == "running"
     assert cancelled_goals == [goal_id]
+    assert outcome.error is None
+    assert outcome.goals == [CancelResultEntry(job_id=external, goal_id=goal_id, return_code=0)]
+    validate_frame(
+        "bridge-cancel-result",
+        json.loads(cancel_result_message("req-1", "count", outcome.goals, outcome.error)),
+    )
 
 
 def test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug():
@@ -1343,13 +1438,16 @@ def test_cancel_by_a_non_matching_job_id_never_touches_a_different_slug():
             # so this must stay the ordinary idle no-op, not reach over to
             # "count", which is where the mismatched job_id actually came
             # from.
-            await rt.cancel_job("idle-slug-nothing-here", "job-1")
+            outcome = await rt.cancel_job("idle-slug-nothing-here", "job-1")
             await asyncio.sleep(0.2)
-            return rt.jobs.running_job_id("count")
+            return rt.jobs.running_job_id("count"), outcome
         finally:
             stop_server()
 
-    assert run(body) == "job-1"  # "count" untouched
+    running, outcome = run(body)
+    assert running == "job-1"  # "count" untouched
+    assert outcome.goals == []
+    assert outcome.error[0] == "unknown_slug"
 
 
 def test_a_non_matching_job_id_and_an_idle_slug_are_logged_distinguishably():
@@ -1427,14 +1525,59 @@ def test_a_cancel_arriving_before_acceptance_is_remembered_and_applied():
         try:
             await rt.apply_actions(by_slug([_action_cfg("count")]))
             await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
-            await rt.cancel_job("count", "job-1")  # the goal is not accepted yet
-            return await _drain_until_terminal(rt)
+            outcome = await rt.cancel_job("count", "job-1")  # the goal is not accepted yet
+            updates = await _drain_until_terminal(rt)
+            return updates, outcome, updates[-1].goal_id
         finally:
             stop_server()
 
-    updates = run(body)
+    updates, outcome, goal_id = run(body)
     assert updates[-1].job_id == "job-1"
     assert updates[-1].state == "cancelled"
+    # Answered by the cancel applied on acceptance, with the server's code.
+    assert outcome.goals == [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=0)]
+
+
+def test_two_cancels_before_acceptance_share_one_cancel_request():
+    """A cancel is idempotent: a second one for the same pending job does
+    not send a second request once the goal is accepted — both callers get
+    the answer to the one that went out."""
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, accept_delay=0.3)
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            first, second = await asyncio.gather(
+                rt.cancel_job("count", "job-1"), rt.cancel_job("count", "job-1")
+            )
+            updates = await _drain_until_terminal(rt)
+            return updates, first, second, len(stop_server.cancel_requests)
+        finally:
+            stop_server()
+
+    updates, first, second, requests = run(body)
+    assert updates[-1].state == "cancelled"
+    expected = [CancelResultEntry(job_id="job-1", goal_id=updates[-1].goal_id, return_code=0)]
+    assert first.goals == expected
+    assert second.goals == expected
+    assert requests == 1
+
+
+def test_a_cancel_on_an_action_whose_server_is_gone_answers_action_server_lost():
+    """Gone is what the liveness check already holds: the server was seen
+    unreachable (`liveness_since`) and the cancel service is not matched.
+    Nothing can be sent, so the cloud hears why instead of waiting on
+    answers that cannot come."""
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count", ros_name="/nobody_serves_this")]))
+        rt._actions["count"].liveness_since = time.monotonic()
+        return await rt.cancel_job("count", None)
+
+    outcome = run(body)
+    assert outcome.goals == []
+    assert outcome.error[0] == "action_server_lost"
 
 
 def test_a_cancel_by_slug_before_acceptance_is_also_remembered():
@@ -1446,14 +1589,16 @@ def test_a_cancel_by_slug_before_acceptance_is_also_remembered():
         try:
             await rt.apply_actions(by_slug([_action_cfg("count")]))
             await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
-            await rt.cancel_job("count", None)
-            return await _drain_until_terminal(rt)
+            outcome = await rt.cancel_job("count", None)
+            updates = await _drain_until_terminal(rt)
+            return updates, outcome, updates[-1].goal_id
         finally:
             stop_server()
 
-    updates = run(body)
+    updates, outcome, goal_id = run(body)
     assert updates[-1].job_id == "job-1"
     assert updates[-1].state == "cancelled"
+    assert outcome.goals == [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=0)]
 
 
 def test_a_pre_acceptance_cancel_for_a_goal_that_gets_rejected_does_nothing_odd():
@@ -1467,15 +1612,23 @@ def test_a_pre_acceptance_cancel_for_a_goal_that_gets_rejected_does_nothing_odd(
         try:
             await rt.apply_actions(by_slug([_action_cfg("count")]))
             await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
-            await rt.cancel_job("count", "job-1")
-            return await _drain_until_terminal(rt)
+            outcome = await rt.cancel_job("count", "job-1")
+            updates = await _drain_until_terminal(rt)
+            return updates, outcome, updates[-1].goal_id
         finally:
             stop_server()
 
-    updates = run(body)
+    updates, outcome, goal_id = run(body)
     assert updates[-1].job_id == "job-1"
     assert updates[-1].state == "failed"
     assert updates[-1].error[0] == "goal_rejected"
+    # The goal never existed on the server: nothing answered the cancel.
+    # Listed with `null` if the cancel found the goal still pending; not at
+    # all if the rejection got there first and the job was no longer held.
+    assert outcome.error is None
+    assert outcome.goals in (
+        [], [CancelResultEntry(job_id="job-1", goal_id=goal_id, return_code=None)]
+    )
 
 
 def test_a_pre_acceptance_cancel_and_a_no_ros_cancel_service_are_both_logged():
@@ -2341,7 +2494,7 @@ def test_cancel_by_slug_cancels_every_goal_active_on_the_action():
             goal_b, _handle_b, stop_b = _send_goal_directly("/count", order=5)
             try:
                 wait_until(lambda: len(rt.jobs.job_ids_on("count")) == 2, timeout=3.0)
-                await rt.cancel_job("count", None)
+                outcome = await rt.cancel_job("count", None)
                 ended = {}
                 while len(ended) < 2:
                     update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
@@ -2350,12 +2503,17 @@ def test_cancel_by_slug_cancels_every_goal_active_on_the_action():
             finally:
                 stop_a()
                 stop_b()
-            return ended, goal_a, goal_b
+            return ended, goal_a, goal_b, outcome
         finally:
             stop_server()
 
-    ended, goal_a, goal_b = run(body)
+    ended, goal_a, goal_b, outcome = run(body)
     assert ended == {goal_a: "cancelled", goal_b: "cancelled"}
+    assert outcome.error is None
+    assert sorted(outcome.goals) == sorted(
+        CancelResultEntry(job_id=external_job_id("robot-xyz", "count", g), goal_id=g, return_code=0)
+        for g in (goal_a, goal_b)
+    )
 
 
 def test_removing_an_action_settles_every_job_running_on_it():
@@ -3297,21 +3455,23 @@ def test_a_second_service_invoke_of_a_running_slug_is_refused_busy():
     assert busy.error[0] == "busy"
 
 
-def test_cancelling_a_running_service_call_is_a_silent_no_op():
-    # Services have no ROS-level cancel — cancel_job must not raise, and must
-    # not disturb the in-flight call.
+def test_cancelling_a_running_service_call_answers_not_cancellable():
+    # Services have no ROS-level cancel — cancel_job says so instead of
+    # pretending, and does not disturb the in-flight call.
     async def body(rt):
-        stop_server = _start_trigger_server()
+        stop_server = _start_trigger_server(delay=0.3)
         try:
             await rt.apply_services(by_slug([_service_cfg("do_it")]))
             await rt.invoke("job-1", "do_it", {}, patience_ms=15000)
-            await rt.cancel_job("do_it", None)
-            return await _drain_until_terminal(rt)
+            outcome = await rt.cancel_job("do_it", None)
+            return await _drain_until_terminal(rt), outcome
         finally:
             stop_server()
 
-    updates = run(body)
+    updates, outcome = run(body)
     assert updates[-1].state == "succeeded"
+    assert outcome.goals == []
+    assert outcome.error[0] == "not_cancellable"
 
 
 # --- 2n: service call patience ----------------------------------------------------

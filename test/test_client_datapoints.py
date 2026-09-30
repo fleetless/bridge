@@ -17,6 +17,7 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_KIND_DATAPOINT,
     LOW_BANDWIDTH_DEFAULTS,
     ApplyError,
+    CancelOutcome,
 )
 from fleetless_bridge.ros_runtime import BacklogStore, CameraStateQueue, SampleQueue
 from fleetless_bridge.sampling import Sample
@@ -81,6 +82,7 @@ class FakeRos:
         graph=None,
         resolve=None,
         job_query_result=None,
+        cancel_outcome=None,
     ) -> None:
         self.samples = SampleQueue(maxsize=10)
         self.snapshots = _FakeSnapshots()
@@ -102,6 +104,7 @@ class FakeRos:
         self.robot_id_calls = []
         self.job_query_calls = []
         self._job_query_result = job_query_result or ([], [])
+        self._cancel_outcome = cancel_outcome or CancelOutcome(goals=[])
         self.start_live_calls = []
         self.stop_live_calls = []
         self.stop_all_live_calls = 0
@@ -174,6 +177,7 @@ class FakeRos:
 
     async def cancel_job(self, slug, job_id):
         self.cancel_calls.append((slug, job_id))
+        return self._cancel_outcome
 
     async def job_query(self, job_ids):
         self.job_query_calls.append(list(job_ids))

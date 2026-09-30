@@ -16,6 +16,8 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_KIND_CAMERA,
     APPLY_ERROR_KIND_PUBLISHER,
     ApplyError,
+    CancelOutcome,
+    CancelResultEntry,
     JobStatusEntry,
 )
 
@@ -43,11 +45,17 @@ def test_a_cancel_is_dispatched_to_the_ros_runtime():
 
     async def send_and_recv(session):
         await session.send_cancel("drive_to")
-        await asyncio.sleep(0.05)
-        return True
+        return await session.recv_cancel_result()
 
-    _run_one_exchange(send_and_recv, ros=fake_ros)
+    payload = _run_one_exchange(send_and_recv, ros=fake_ros)
     assert fake_ros.cancel_calls == [("drive_to", None)]
+    assert payload == {
+        "type": "cancel_result",
+        "request_id": "cancel-1",
+        "slug": "drive_to",
+        "goals": [],
+        "error": None,
+    }
 
 
 def test_a_cancel_by_job_id_is_dispatched_to_the_ros_runtime():
@@ -55,11 +63,82 @@ def test_a_cancel_by_job_id_is_dispatched_to_the_ros_runtime():
 
     async def send_and_recv(session):
         await session.send_cancel("drive_to", "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f")
-        await asyncio.sleep(0.05)
-        return True
+        return await session.recv_cancel_result()
 
     _run_one_exchange(send_and_recv, ros=fake_ros)
     assert fake_ros.cancel_calls == [("drive_to", "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f")]
+
+
+def test_a_cancel_is_answered_with_each_goals_return_code():
+    """Accepted (0), refused (1) and unanswered (null) side by side, each
+    under its own job and goal id, echoing the cancel's `request_id` —
+    the cloud answers its caller from this frame alone, and validated
+    against the strict vendored `bridge-cancel-result` schema."""
+    fake_ros = FakeRos(
+        cancel_outcome=CancelOutcome(
+            goals=[
+                CancelResultEntry(
+                    job_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+                    goal_id="0b8a3f4e-1c2d-4e5f-8a9b-0c1d2e3f4a5b",
+                    return_code=0,
+                ),
+                CancelResultEntry(
+                    job_id="4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70",
+                    goal_id="1c9b4a5f-2d3e-4f60-9bac-1d2e3f4a5b6c",
+                    return_code=1,
+                ),
+                CancelResultEntry(
+                    job_id="5b3a0c4e-8f6d-4a2c-8eaf-3d4c5e6f7081",
+                    goal_id="2dac5b60-3e4f-4071-8cbd-2e3f4a5b6c7d",
+                    return_code=None,
+                ),
+            ]
+        )
+    )
+
+    async def send_and_recv(session):
+        await session.send_cancel("drive_to", None, request_id="req-7")
+        return await session.recv_cancel_result()
+
+    payload = _run_one_exchange(send_and_recv, ros=fake_ros)
+    assert payload["request_id"] == "req-7"
+    assert payload["slug"] == "drive_to"
+    assert payload["error"] is None
+    assert [g["return_code"] for g in payload["goals"]] == [0, 1, None]
+    assert payload["goals"][1] == {
+        "job_id": "4a2f9b3d-7e5c-4f1b-9d9f-2c3b4d5e6f70",
+        "goal_id": "1c9b4a5f-2d3e-4f60-9bac-1d2e3f4a5b6c",
+        "return_code": 1,
+    }
+
+
+def test_a_cancel_that_could_not_be_sent_is_answered_with_its_error():
+    fake_ros = FakeRos(
+        cancel_outcome=CancelOutcome(
+            goals=[], error=("unknown_slug", "no action is configured under slug 'drive_to'")
+        )
+    )
+
+    async def send_and_recv(session):
+        await session.send_cancel("drive_to")
+        return await session.recv_cancel_result()
+
+    payload = _run_one_exchange(send_and_recv, ros=fake_ros)
+    assert payload["goals"] == []
+    assert payload["error"] == {
+        "code": "unknown_slug",
+        "message": "no action is configured under slug 'drive_to'",
+    }
+
+
+def test_a_cancel_without_a_ros_runtime_is_answered_with_no_goals():
+    async def send_and_recv(session):
+        await session.send_cancel("drive_to")
+        return await session.recv_cancel_result()
+
+    payload = _run_one_exchange(send_and_recv, ros=None)
+    assert payload["goals"] == []
+    assert payload["error"] is None
 
 
 def test_a_job_query_is_answered_from_the_ros_runtime():
@@ -112,6 +191,7 @@ def test_invoke_cancel_and_publish_without_a_ros_runtime_do_not_crash_the_sessio
         await session.send_invoke("3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", "drive_to", {})
         await session.send_cancel("drive_to")
         await session.send_publish("drive", {})
+        await session.recv_cancel_result()
         # The session must still be alive to answer a plain ping afterwards.
         await session.ping(1)
         return await session.recv_pong()
