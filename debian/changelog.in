@@ -1,3 +1,21 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * feat(jobs)!: a goal tracker per action, external goals, unknown jobs
+  * fix(jobs): an unwritable state directory no longer kills the executor
+  * fix(jobs): keep a job's persisted goal mapping until its end is delivered
+  * fix(jobs): a restarted bridge names its persisted jobs from the first hello
+  * fix(jobs): a re-attached goal whose action server is gone ends lost
+  * fix(jobs): several goals on one action keep their slug bookkeeping
+  * fix(jobs): a cancel for a job the bridge does not hold spares own goals
+  * fix(jobs): hello.active_jobs leaves external jobs out
+  * fix(jobs): job_query answers an ended job with its result and error
+  * fix(jobs): the goal tracker forgets feedback of goals no longer active
+  * fix(jobs): a late status snapshot no longer mints an ended own goal a job
+  * fix(protocol): a cancel without a request_id is refused like any malformed frame
+  * feat(jobs): answer a cancel with each goal's CancelGoal return code
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Wed, 30 Sep 2026 09:17:23 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (5.0.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * fix(sampling): a non-finite float becomes null on the wire
