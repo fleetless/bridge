@@ -796,9 +796,9 @@ def _refusing_server(status, body):
 
 def test_the_urdf_upload_path_classifies_a_refusal_the_same_way():
     """Both refusal tests elsewhere drive the streaming path with a mesh.
-    The URDF goes through the in-memory one, and the cloud never refuses a
-    URDF today — which is exactly why this branch would otherwise be the one
-    a future cloud change hits unseen."""
+    The URDF goes through the in-memory one, and the cloud refuses a URDF
+    only for its own size (`file_too_large`) — which is exactly why this
+    branch would otherwise be the one a future cloud change hits unseen."""
     from fleetless_bridge.ros_runtime import RosRuntime
 
     url, stop = _refusing_server(
@@ -819,6 +819,119 @@ def test_a_bare_refusal_on_the_urdf_path_carries_no_invented_numbers():
     from fleetless_bridge.ros_runtime import RosRuntime
 
     url, stop = _refusing_server(413, None)
+    try:
+        result = RosRuntime._upload_asset_bytes(
+            url, "tok", "sync-1", "urdf", "robot_description", "text/xml", b"<robot/>",
+        )
+    finally:
+        stop()
+    assert (result.ok, result.refused, result.details) == (False, True, None)
+
+
+class _FakeRefusal:
+    """An `HTTPError` stand-in for `_refused`: a status and a bounded `read`."""
+
+    def __init__(self, code, body):
+        self.code = code
+        self._body = body if isinstance(body, bytes) else json.dumps(body).encode()
+
+    def read(self, limit):
+        return self._body[:limit]
+
+
+def _refusal_messages(fn):
+    """Runs `fn` with a handler on the module logger and returns its result
+    and the messages it logged; `caplog` is broken here (see
+    `test_a_non_matching_job_id_and_an_idle_slug_are_logged_distinguishably`)."""
+    import logging
+
+    class _Recording(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    handler = _Recording()
+    logger = logging.getLogger("fleetless_bridge.ros_runtime")
+    logger.addHandler(handler)
+    try:
+        result = fn()
+    finally:
+        logger.removeHandler(handler)
+    return result, handler.messages
+
+
+def test_file_too_large_logs_the_size_and_the_limit_and_carries_no_details():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    exc = _FakeRefusal(413, {
+        "code": "file_too_large",
+        "message": "This file is 1.4 GB. One file can be at most 1 GB.",
+        "details": {"max_bytes": 1000000000, "size_bytes": 1400000000},
+    })
+    result, messages = _refusal_messages(lambda: RosRuntime._refused("package://arm/huge.stl", exc))
+    assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert messages == [
+        "Asset upload for 'package://arm/huge.stl' refused: 1400000000 bytes is over the "
+        "cloud's 1000000000-byte limit for one file. Nothing about retrying changes that"
+    ]
+
+
+def test_file_too_large_without_a_size_logs_the_limit_only():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    exc = _FakeRefusal(413, {"code": "file_too_large", "details": {"max_bytes": 1000000000, "size_bytes": None}})
+    result, messages = _refusal_messages(lambda: RosRuntime._refused("robot_description", exc))
+    assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert messages == [
+        "Asset upload for 'robot_description' refused: it is over the cloud's "
+        "1000000000-byte limit for one file. Nothing about retrying changes that"
+    ]
+
+
+@pytest.mark.parametrize("max_bytes", ["1000000000", True, -1, 0, 1.5, None])
+def test_file_too_large_with_an_unreadable_limit_falls_back_to_the_bare_413_sentence(max_bytes):
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    exc = _FakeRefusal(413, {"code": "file_too_large", "details": {"max_bytes": max_bytes, "size_bytes": 5}})
+    result, messages = _refusal_messages(lambda: RosRuntime._refused("x", exc))
+    assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert messages == [
+        "Asset upload for 'x' refused: the cloud would not accept a body that large. "
+        "Nothing about retrying changes that"
+    ]
+
+
+def test_a_bare_413_keeps_the_old_sentence():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    result, messages = _refusal_messages(lambda: RosRuntime._refused("x", _FakeRefusal(413, b"")))
+    assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert messages == [
+        "Asset upload for 'x' refused: the cloud would not accept a body that large. "
+        "Nothing about retrying changes that"
+    ]
+
+
+def test_a_409_store_refusal_keeps_its_three_numbers():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    exc = _FakeRefusal(409, {"details": {"store_bytes": 1000, "used_bytes": 999, "size_bytes": 200}})
+    result, messages = _refusal_messages(lambda: RosRuntime._refused("x", exc))
+    assert result.details == {"store_bytes": 1000, "used_bytes": 999, "size_bytes": 200}
+    assert messages == [
+        "Asset upload for 'x' refused: 200 bytes does not fit the robot's 1000-byte asset store, 999 of which is in use"
+    ]
+
+
+def test_the_urdf_upload_path_reports_file_too_large_as_a_refusal():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    url, stop = _refusing_server(
+        413, {"code": "file_too_large", "details": {"max_bytes": 1000000000, "size_bytes": 1400000000}}
+    )
     try:
         result = RosRuntime._upload_asset_bytes(
             url, "tok", "sync-1", "urdf", "robot_description", "text/xml", b"<robot/>",

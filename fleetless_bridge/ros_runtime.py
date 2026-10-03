@@ -369,7 +369,7 @@ ASSET_UPLOAD_HEADERS = _CONTRACTS_CONSTANTS["ASSET_UPLOAD_HEADERS"]
 ROBOT_ASSET_STORE_BYTES = _CONTRACTS_CONSTANTS["ROBOT_ASSET_STORE_BYTES"]
 
 # How much of a refusal's body is read looking for the store's three
-# numbers. An error body is not a payload — the cloud's is a few hundred
+# numbers or the per-file limit. An error body is not a payload — the cloud's is a few hundred
 # bytes — and an unbounded `read()` on whatever a proxy decides to return
 # is the same shape as the buffering the per-file ceiling existed to
 # prevent, one layer over.
@@ -377,10 +377,10 @@ ASSET_REFUSAL_BODY_MAX_BYTES = 64 * 1024
 
 # The two statuses that mean "the cloud will not keep these bytes", as
 # opposed to "the transfer did not succeed". `409` is the store's own
-# refusal, which names its three numbers; `413` is the server's body
-# limit, which names nothing — reached only by a file so large that the
-# announced size never got weighed, and reported as a bare refusal rather
-# than a transfer failure precisely because retrying it is futile.
+# refusal, which names its three numbers. `413` is one file over the
+# cloud's per-file limit: `file_too_large`, which names that limit and the
+# file's size. An older cloud's `413` names nothing. Either way retrying
+# it is futile, so it is a refusal, not a transfer failure.
 ASSET_REFUSAL_STATUSES = frozenset({409, 413})
 
 # How large a `.dae` may be before this bridge stops scanning it for
@@ -1172,6 +1172,9 @@ class UploadResult(NamedTuple):
     failure would tell a reconciliation to retry something that will be
     refused again. Filling in numbers to avoid the empty case would be
     inventing them; the contract allows a bare `refused` for exactly this.
+    A `413 file_too_large` is the same: `refused=True, details=None`, since
+    the file is too large on its own and `details` carries only the store's
+    numbers.
     """
 
     ok: bool
@@ -6026,8 +6029,30 @@ class RosRuntime:
         uploaders have to say the same thing about it, and because neither
         status is a transfer failure: the cloud declined to keep these
         bytes, and telling a reconciliation to retry would mean retrying
-        forever for a file that can never fit."""
-        details = RosRuntime._store_refusal_details(exc)
+        forever for a file that can never fit.
+
+        `file_too_large` (`413`) is one file over the cloud's per-file limit.
+        It is logged with that limit, and its `details` stay `None`: the
+        sync result's `details` carry the store's three numbers and nothing
+        else, so a file that is too large on its own is a bare `refused`."""
+        body = RosRuntime._refusal_body(exc)
+        limit = RosRuntime._file_limit(body)
+        if limit is not None:
+            max_bytes, size_bytes = limit
+            if size_bytes is None:
+                log.warning(
+                    "Asset upload for %r refused: it is over the cloud's %d-byte "
+                    "limit for one file. Nothing about retrying changes that",
+                    name, max_bytes,
+                )
+            else:
+                log.warning(
+                    "Asset upload for %r refused: %d bytes is over the cloud's "
+                    "%d-byte limit for one file. Nothing about retrying changes that",
+                    name, size_bytes, max_bytes,
+                )
+            return UploadResult(False, refused=True, details=None)
+        details = RosRuntime._store_numbers(body)
         if details is None and exc.code == 413:
             log.warning(
                 "Asset upload for %r refused: the cloud would not accept a "
@@ -6049,28 +6074,42 @@ class RosRuntime:
         return UploadResult(False, refused=True, details=details)
 
     @staticmethod
-    def _store_refusal_details(exc: "urllib.error.HTTPError") -> Optional[Dict[str, int]]:
-        """The cloud's `{store_bytes, used_bytes, size_bytes}` out of a
-        `409`'s body, or `None` when it does not say.
+    def _refusal_body(exc: "urllib.error.HTTPError") -> Optional[Dict[str, Any]]:
+        """A refusal's JSON object body, or `None` when it is not one.
 
-        Read, not derived: this process cannot know what the robot's other
-        assets already occupy, which is the whole reason the cap moved to
-        the cloud. So every shape this cannot read — an older cloud, a
-        proxy's error page, a body too large to be one of these — comes
-        back `None`, and `UploadResult` still reports `refused`. Reading
-        the body is bounded (`ASSET_REFUSAL_BODY_MAX_BYTES`) because an
-        error body is not a payload, and an unbounded `read()` on one is
-        the same mistake the per-file ceiling existed to prevent.
-
-        All three keys or none: a partial `details` would satisfy neither
-        the contract nor a reader, and two thirds of an answer is worse
-        than admitting there is none."""
+        Read once, bounded (`ASSET_REFUSAL_BODY_MAX_BYTES`), because an
+        error body is not a payload and an unbounded `read()` on one is the
+        same mistake the per-file ceiling existed to prevent. Read once in
+        total because the body can be read only once, and two readers each
+        want a different part of it."""
         try:
             raw = exc.read(ASSET_REFUSAL_BODY_MAX_BYTES)
             body = json.loads(raw.decode("utf-8"))
         except Exception:  # noqa: BLE001 - any unreadable body means "it did not say"
             return None
-        details = body.get("details") if isinstance(body, dict) else None
+        return body if isinstance(body, dict) else None
+
+    @staticmethod
+    def _store_refusal_details(exc: "urllib.error.HTTPError") -> Optional[Dict[str, int]]:
+        """The cloud's `{store_bytes, used_bytes, size_bytes}` out of a
+        `409`'s body, or `None` when it does not say. See `_store_numbers`."""
+        return RosRuntime._store_numbers(RosRuntime._refusal_body(exc))
+
+    @staticmethod
+    def _store_numbers(body: Optional[Dict[str, Any]]) -> Optional[Dict[str, int]]:
+        """The cloud's `{store_bytes, used_bytes, size_bytes}` out of a
+        parsed refusal body, or `None` when it does not say.
+
+        Read, not derived: this process cannot know what the robot's other
+        assets already occupy, which is the whole reason the cap moved to
+        the cloud. So every shape this cannot read — an older cloud, a
+        proxy's error page, a body too large to be one of these — comes
+        back `None`, and `UploadResult` still reports `refused`.
+
+        All three keys or none: a partial `details` would satisfy neither
+        the contract nor a reader, and two thirds of an answer is worse
+        than admitting there is none."""
+        details = body.get("details") if body is not None else None
         if not isinstance(details, dict):
             return None
         numbers = {}
@@ -6080,6 +6119,30 @@ class RosRuntime:
                 return None
             numbers[key] = value
         return numbers
+
+    @staticmethod
+    def _file_limit(body: Optional[Dict[str, Any]]) -> Optional[Tuple[int, Optional[int]]]:
+        """`(max_bytes, size_bytes)` out of a `file_too_large` body, or `None`.
+
+        Read from the body, not from a vendored constant: the cloud is what
+        enforces the limit, and its answer names it. A `max_bytes` that is
+        not a positive integer makes the whole answer unreadable, so the
+        caller falls back to the bare-413 sentence. A `size_bytes` that is
+        not a positive integer reads as unknown, which is what the cloud
+        sends as `null` when the body limit stopped an upload with no size
+        announced."""
+        if body is None or body.get("code") != "file_too_large":
+            return None
+        details = body.get("details")
+        if not isinstance(details, dict):
+            return None
+        max_bytes = details.get("max_bytes")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+            return None
+        size_bytes = details.get("size_bytes")
+        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+            size_bytes = None
+        return max_bytes, size_bytes
 
     @staticmethod
     def _asset_upload_headers(
@@ -6094,12 +6157,12 @@ class RosRuntime:
         `Content-Length`, and it is here as well because the two are read
         at different moments: the cloud weighs this header against the
         robot's store *before* it accepts a body, and refuses a file that
-        cannot fit with a `409` naming the store's three numbers. Without
-        it nothing is weighed, and a file over the server's own body limit
-        comes back as a bare `413` with nothing in it — which this bridge would file
-        as a transfer failure and retry on every sync, forever, for a file
-        that can never fit. Both callers already know the number, so
-        neither pays a `stat` for it.
+        cannot fit with a `409` naming the store's three numbers, and one
+        over its per-file limit with `413 file_too_large`, naming the limit
+        and the size. Without it nothing is weighed, and the server's body
+        limit is the only thing that stops such a file; its answer can then
+        name the limit but not the size. Both callers already know the
+        number, so neither pays a `stat` for it.
 
         Header names from `ASSET_UPLOAD_HEADERS` (vendored from the wire
         contracts' own `constants.json`), not hand-typed and not from

@@ -142,7 +142,7 @@ ASSET_FAILURE_KIND_UPLOAD_FAILED = "upload_failed"  # the bytes exist; the trans
 # cloud's three. There was a fourth kind, `too_large`, for a per-file
 # ceiling the bridge enforced itself; the store replaced it, and the
 # bridge no longer knows a limit to compare anything against.
-ASSET_FAILURE_KIND_REFUSED = "refused"  # never attempted — the store was full, or a producer-side ceiling
+ASSET_FAILURE_KIND_REFUSED = "refused"  # never attempted — the store was full, the file was over the cloud's per-file limit, or a producer-side ceiling
 
 # Which kind of exposure a `config_applied` error belongs to (contracts
 # `applyErrorKind`) — a closed enum, unlike `ApplyError.code` below. Known at
@@ -1148,6 +1148,8 @@ def bridge_asset_progress_message(
     arrived. This bridge cannot derive any of them — it does not know what
     the robot's other assets already cost — so a refusal it could not read
     reports `refused` with no details rather than a number it made up.
+    A `file_too_large` refusal is `refused` with `None`: the limit is in
+    the bridge's log, not on the wire.
 
     `state` is `'running' | 'finished' | 'refused_busy'` — three values
     because a plain `finished: bool` had nowhere to put a refusal. A second
