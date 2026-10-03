@@ -6155,12 +6155,13 @@ class RosRuntime:
 
         **`size` is announced, not only sent.** It is the same number as
         `Content-Length`, and it is here as well because the two are read
-        at different moments: the cloud weighs this header against the
-        robot's store *before* it accepts a body, and refuses a file that
-        cannot fit with a `409` naming the store's three numbers, and one
-        over its per-file limit with `413 file_too_large`, naming the limit
-        and the size. Without it nothing is weighed, and the server's body
-        limit is the only thing that stops such a file; its answer can then
+        at different moments: the cloud weighs this header against its
+        per-file limit *before* it accepts a body, and refuses a file over
+        it with `413 file_too_large`, naming the limit and the size. The
+        store is weighed only after the body arrived, and a file that does
+        not fit it is refused with a `409` naming the store's three numbers.
+        Without the header the per-file limit is not weighed early, and the
+        server's body limit is what stops such a file; its answer can then
         name the limit but not the size. Both callers already know the
         number, so neither pays a `stat` for it.
 
