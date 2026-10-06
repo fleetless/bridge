@@ -11,6 +11,7 @@ need the helper node to be spinning, only subscribing does.
 """
 import asyncio
 import concurrent.futures
+import dataclasses
 import http.server
 import json
 import logging
@@ -25,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import uuid
+from typing import Any, Callable
 from unittest import mock
 
 import cv2
@@ -482,19 +484,30 @@ def _start_trigger_server(*, service_name="/do_it", success=True, message="done"
 
 
 #: How long a witness waits for a sample the bridge has already published on a
-#: publisher that is still alive. Reliable DDS repairs a sample dropped on first
-#: send at the writer's next heartbeat, which Fast DDS sends every 3 s by
-#: default, so on a busy machine a failsafe can reach its witness two or three
-#: seconds after it fired -- late, not lost, and not twice. A 2 s wait races that
-#: repair. This bounds "at all", not latency: a failsafe that is never published
+#: publisher that is still alive, once both sides have matched
+#: (`_wait_until_matched`). A sample written before the witness has matched
+#: the writer is not owed to it and does not arrive late -- it does not
+#: arrive, so no length of this wait would cover that case. This bounds "at
+#: all" on a loaded machine, not latency: a failsafe that is never published
 #: still fails the wait.
 DELIVERY_TIMEOUT_S = 10.0
 
 
-def _start_independent_subscriber(topic, msg_type, own_context=False):
-    """A subscriber on its own node/executor/thread — not the bridge's, so it
-    is a real independent witness to what lands on a topic. Returns
-    `(received_list, stop_fn)`; `received_list` grows in place.
+@dataclasses.dataclass
+class _Witness:
+    """An independent subscriber -- see `_start_witness`. `received` grows in
+    place; `node` is the witness's own node, for questions only it can answer."""
+
+    topic: str
+    received: list
+    subscription: Any
+    node: Any
+    stop: Callable[[], None]
+
+
+def _start_witness(topic, msg_type, own_context=False):
+    """A subscriber on its own node/executor/thread -- not the bridge's, so it
+    is a real independent witness to what lands on a topic.
 
     `own_context=True` puts it on a separate `rclpy.Context` as well, which is
     closer to a robot's own node (still the same process). A witness to a
@@ -504,7 +517,11 @@ def _start_independent_subscriber(topic, msg_type, own_context=False):
     `test_stop_fires_the_failsafe_for_an_armed_publisher_before_shutting_down`
     observes from its own context for the same reason. Whether such a sample
     arrives at all is the bridge's part: a removed publisher keeps its handle
-    until its last failsafe is acknowledged (`PARTING_FAILSAFE_ACK_TIMEOUT_S`)."""
+    until its last failsafe is acknowledged (`PARTING_FAILSAFE_ACK_TIMEOUT_S`).
+
+    A witness on its own context discovers the bridge's publisher on its own
+    schedule: before a test publishes once and waits for that one sample, it
+    waits for `_wait_until_matched`, not only for the publisher's side."""
     context = None
     if own_context:
         context = rclpy.Context()
@@ -524,7 +541,60 @@ def _start_independent_subscriber(topic, msg_type, own_context=False):
             rclpy.shutdown(context=context)
         thread.join(timeout=5.0)
 
-    return received, subscription, stop
+    return _Witness(topic=topic, received=received, subscription=subscription, node=node, stop=stop)
+
+
+def _start_independent_subscriber(topic, msg_type, own_context=False):
+    """`_start_witness`, as the `(received, subscription, stop)` triple most
+    tests here unpack."""
+    witness = _start_witness(topic, msg_type, own_context=own_context)
+    return witness.received, witness.subscription, witness.stop
+
+
+def _wait_until_matched(publisher, witness, timeout=5.0):
+    """Waits until `publisher` and `witness` have matched EACH OTHER.
+
+    `publisher.get_subscription_count() > 0` says the writer has matched the
+    reader; it does not say the reader has matched the writer, and discovery
+    across two contexts is not symmetric in time. A sample written in that gap
+    reaches a reader that does not know the writer yet, and is not repaired
+    later: on jazzy (unlike humble and lyrical, which block through the
+    reader-side match) `wait_for_all_acked()` returns before the reader-side
+    match completes, so the sample can be written while the reader is not yet
+    in the writer's matched-reader set at all, and DDS's reliable-delivery
+    repair only resends samples to readers matched at send time -- a reader
+    that matches afterward is never sent that sample, not merely delayed. A
+    test that publishes exactly once and waits for that sample therefore waits
+    for both sides first.
+
+    The reader's side is the subscription's own matched-publisher count where
+    rclpy has one (`Subscription.get_publisher_count`, rclpy 7 and later).
+    rclpy 3 (Humble) has none; there the witness node's graph stands in for it
+    -- discovery of the publisher by the witness's participant, one step short
+    of the reader's own match."""
+
+    def publisher_side():
+        return publisher.get_subscription_count() > 0
+
+    def witness_side():
+        count = getattr(witness.subscription, "get_publisher_count", None)
+        if count is not None:
+            return count() > 0
+        return witness.node.count_publishers(witness.topic) > 0
+
+    try:
+        wait_until(lambda: publisher_side() and witness_side(), timeout=timeout)
+    except AssertionError:
+        unmatched = []
+        if not publisher_side():
+            unmatched.append("the publisher has not matched the witness")
+        if not witness_side():
+            unmatched.append("the witness has not matched the publisher")
+        raise AssertionError("{}: {} within {}s".format(
+            witness.topic,
+            " and ".join(unmatched) or "both sides matched only after the deadline",
+            timeout,
+        )) from None
 
 
 async def _drain_until_terminal(rt, timeout=5.0):
@@ -4310,6 +4380,79 @@ def test_retargeting_a_publishers_topic_replaces_the_handle():
     assert topic == "/cmd_vel2"
 
 
+# --- the witness's own helpers ------------------------------------------------
+
+
+class _StubPublisher:
+    def __init__(self, count):
+        self.count = count
+
+    def get_subscription_count(self):
+        return self.count
+
+
+class _StubSubscription:
+    """rclpy 7+ shape: the subscription counts the publishers it matched."""
+
+    def __init__(self, count):
+        self.count = count
+
+    def get_publisher_count(self):
+        return self.count
+
+
+class _StubNode:
+    """What the Humble fallback asks instead: the witness node's graph."""
+
+    def __init__(self, count):
+        self.count = count
+        self.asked = []
+
+    def count_publishers(self, topic):
+        self.asked.append(topic)
+        return self.count
+
+
+def _stub_witness(subscription, node=None, topic="/cmd_vel"):
+    return _Witness(topic=topic, received=[], subscription=subscription, node=node, stop=lambda: None)
+
+
+def test_a_matched_wait_returns_once_both_sides_have_matched():
+    _wait_until_matched(_StubPublisher(1), _stub_witness(_StubSubscription(1)), timeout=0.2)
+
+
+def test_a_matched_wait_names_the_topic_and_a_witness_that_has_not_matched():
+    with pytest.raises(AssertionError) as raised:
+        _wait_until_matched(_StubPublisher(1), _stub_witness(_StubSubscription(0)), timeout=0.1)
+    message = str(raised.value)
+    assert message.startswith("/cmd_vel: ")
+    assert "the witness has not matched the publisher" in message
+    assert "the publisher has not matched the witness" not in message
+
+
+def test_a_matched_wait_names_a_publisher_that_has_not_matched():
+    with pytest.raises(AssertionError) as raised:
+        _wait_until_matched(_StubPublisher(0), _stub_witness(_StubSubscription(1)), timeout=0.1)
+    message = str(raised.value)
+    assert "the publisher has not matched the witness" in message
+    assert "the witness has not matched the publisher" not in message
+
+
+def test_a_matched_wait_names_both_sides_when_neither_matched():
+    with pytest.raises(AssertionError) as raised:
+        _wait_until_matched(_StubPublisher(0), _stub_witness(_StubSubscription(0)), timeout=0.1)
+    message = str(raised.value)
+    assert "the publisher has not matched the witness and the witness has not matched the publisher" in message
+
+
+def test_a_matched_wait_without_a_reader_side_count_asks_the_witness_graph():
+    node = _StubNode(1)
+    _wait_until_matched(_StubPublisher(1), _stub_witness(object(), node=node), timeout=0.2)
+    assert node.asked and set(node.asked) == {"/cmd_vel"}
+    with pytest.raises(AssertionError, match="the witness has not matched the publisher"):
+        _wait_until_matched(_StubPublisher(1), _stub_witness(object(), node=_StubNode(0)), timeout=0.1)
+
+
 # --- publish: a real message lands on the topic -----------------------------------
 
 
@@ -4478,17 +4621,16 @@ def test_removing_an_armed_publisher_fires_its_failsafe_before_teardown():
         # below: the watchdog's own failsafe could stand in for a parting one
         # that never fired.
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=60_000)]))
-        received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist, own_context=True)
+        witness = _start_witness("/cmd_vel", Twist, own_context=True)
+        received = witness.received
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            _wait_until_matched(rt._publishers["drive"].handle, witness)
             await rt.publish("drive", {"speed": 1.0})
-            # The bridge's side seeing a match does not mean this side has:
-            # discovery across contexts is not symmetric in time.
             wait_until(lambda: len(received) == 1, timeout=DELIVERY_TIMEOUT_S)
             await rt.apply_publishers(by_slug([]))  # removed well before the timeout would elapse
             await asyncio.sleep(0.2)
         finally:
-            stop_sub()
+            witness.stop()
         return received
 
     received = run(body)
@@ -4504,9 +4646,10 @@ def test_a_removed_armed_publisher_is_destroyed_once_its_failsafe_is_acknowledge
 
     async def body(rt):
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=60_000)]))
-        received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist, own_context=True)
+        witness = _start_witness("/cmd_vel", Twist, own_context=True)
+        received = witness.received
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            _wait_until_matched(rt._publishers["drive"].handle, witness)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) == 1, timeout=DELIVERY_TIMEOUT_S)
             await rt.apply_publishers(by_slug([]))
@@ -4521,7 +4664,7 @@ def test_a_removed_armed_publisher_is_destroyed_once_its_failsafe_is_acknowledge
             # often enough to go red on a busy runner -- which is what it did.
             wait_until(lambda: len(received) == 2, timeout=DELIVERY_TIMEOUT_S)
         finally:
-            stop_sub()
+            witness.stop()
         return received
 
     received = run(body)
@@ -4595,9 +4738,10 @@ def test_a_driven_publisher_can_change_its_type_on_the_same_topic():
 
     async def body(rt):
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=60_000)]))
-        received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist, own_context=True)
+        witness = _start_witness("/cmd_vel", Twist, own_context=True)
+        received = witness.received
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            _wait_until_matched(rt._publishers["drive"].handle, witness)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) == 1, timeout=DELIVERY_TIMEOUT_S)
             errors = await rt.apply_publishers(by_slug([_publisher_cfg(
@@ -4611,7 +4755,7 @@ def test_a_driven_publisher_can_change_its_type_on_the_same_topic():
             wait_until(lambda: len(received) >= 2, timeout=DELIVERY_TIMEOUT_S)
             type_now = rt._publishers["drive"].type_name if "drive" in rt._publishers else None
         finally:
-            stop_sub()
+            witness.stop()
         return errors, received, type_now
 
     errors, received, type_now = run(body)
@@ -4648,12 +4792,13 @@ def test_retargeting_an_armed_publisher_fires_the_failsafe_on_the_old_topic():
     async def body(rt):
         # Unreachable timeout, as in the removal test above.
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", topic="/cmd_vel", timeout_ms=60_000)]))
-        old_received, _, stop_old = _start_independent_subscriber("/cmd_vel", Twist, own_context=True)
+        old_witness = _start_witness("/cmd_vel", Twist, own_context=True)
         new_received, _, stop_new = _start_independent_subscriber("/cmd_vel2", Twist, own_context=True)
+        old_received = old_witness.received
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            _wait_until_matched(rt._publishers["drive"].handle, old_witness)
             await rt.publish("drive", {"speed": 1.0})
-            wait_until(lambda: len(old_received) == 1, timeout=DELIVERY_TIMEOUT_S)  # this side matched too, not only the bridge's
+            wait_until(lambda: len(old_received) == 1, timeout=DELIVERY_TIMEOUT_S)
             # A short timeout on the new topic, so a retarget that carried the
             # armed state across would fire the watchdog there within the
             # sleep -- and the bridge's own entry says it directly.
@@ -4672,7 +4817,7 @@ def test_retargeting_an_armed_publisher_fires_the_failsafe_on_the_old_topic():
             # "new topic stays silent" is no less rigorously checked.
             wait_until(lambda: len(old_received) == 2, timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S / 2)
         finally:
-            stop_old()
+            old_witness.stop()
             stop_new()
         return old_received, new_received
 
@@ -6440,22 +6585,15 @@ def test_stop_fires_the_failsafe_for_an_armed_publisher_before_shutting_down():
     context down moments after firing the failsafe, which a same-context
     observer would race against for no reason relevant to what this test
     is actually about."""
-    obs_context = rclpy.Context()
-    rclpy.init(context=obs_context)
-    obs_node = rclpy.create_node("test_stop_failsafe_observer", context=obs_context)
-    executor = MultiThreadedExecutor(context=obs_context)
-    executor.add_node(obs_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
-    thread.start()
-    received = []
-    obs_node.create_subscription(Twist, "/cmd_vel", received.append, 10)
+    witness = _start_witness("/cmd_vel", Twist, own_context=True)
+    received = witness.received
 
     async def scenario():
         rt = RosRuntime(node_name="test_stop_failsafe")
         rt.start(asyncio.get_event_loop())
         rt.set_connected(True)
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=60_000)]))
-        wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+        _wait_until_matched(rt._publishers["drive"].handle, witness)
         await rt.publish("drive", {"speed": 1.0})
         rt.stop()
 
@@ -6463,10 +6601,7 @@ def test_stop_fires_the_failsafe_for_an_armed_publisher_before_shutting_down():
         asyncio.run(scenario())
         wait_until(lambda: len(received) >= 2, timeout=2.0)
     finally:
-        executor.shutdown()
-        obs_node.destroy_node()
-        rclpy.shutdown(context=obs_context)
-        thread.join(timeout=5.0)
+        witness.stop()
 
     assert len(received) == 2  # the real publish, then the parting failsafe
     assert received[0].linear.x == pytest.approx(1.0)
