@@ -557,15 +557,15 @@ def _wait_until_matched(publisher, witness, timeout=5.0):
     `publisher.get_subscription_count() > 0` says the writer has matched the
     reader; it does not say the reader has matched the writer, and discovery
     across two contexts is not symmetric in time. A sample written in that gap
-    reaches a reader that does not know the writer yet, and is not repaired
-    later: on jazzy (unlike humble and lyrical, which block through the
-    reader-side match) `wait_for_all_acked()` returns before the reader-side
-    match completes, so the sample can be written while the reader is not yet
-    in the writer's matched-reader set at all, and DDS's reliable-delivery
-    repair only resends samples to readers matched at send time -- a reader
-    that matches afterward is never sent that sample, not merely delayed. A
-    test that publishes exactly once and waits for that sample therefore waits
-    for both sides first.
+    reaches a reader that does not know the writer yet, and whether it is
+    repaired afterwards depends on the Fast DDS version (fleetless#257,
+    measured with the reader still unmatched at the publish): with
+    `ros-jazzy-fastrtps` 2.14.6 it arrived, 19 of 19; with 2.14.7, which the
+    Jazzy sync of 2026-10-06 installed, it never does, 19 of 19 -- not late,
+    not after 10 s, while the writer's `wait_for_all_acked()` already returns
+    True for it. Humble (Fast DDS 2.6) and Lyrical (3.6) deliver it. A test
+    that publishes exactly once and waits for that sample therefore waits for
+    both sides first, which is right on every one of these versions.
 
     The reader's side is the subscription's own matched-publisher count where
     rclpy has one (`Subscription.get_publisher_count`, rclpy 7 and later).
