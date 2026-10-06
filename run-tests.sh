@@ -24,6 +24,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 . tools/distros.sh
+. tools/test-image-report.sh
 
 DISTRO=humble
 # `first` rather than `${1:-}` twice: under `set -u`, `${1#--distro=}` on a run
@@ -68,10 +69,14 @@ IMAGE="fleetless-bridge-dev-$DISTRO"
 # `python3-jsonschema` turned out to be a public rosdep key on its own.)
 # `fleetless_distro_require` above is still what refuses an unsupported
 # distribution before this line ever runs.
+fleetless_pull_base_image "ros:$DISTRO"
 $DOCKER build -q -t "$IMAGE" \
     --build-arg "ROS_DISTRO_TAG=$DISTRO" \
     -f Dockerfile.dev . >/dev/null
 echo "run-tests.sh: ROS distribution $DISTRO (image $IMAGE)" >&2
+# Which base image and which middleware this run ran on -- the evidence two
+# runs of one commit need to be told apart (tools/test-image-report.sh).
+fleetless_report_test_image "ros:$DISTRO" "$IMAGE" "$DISTRO"
 
 # ROS_DOMAIN_ID: every test file that touches rclpy runs a real node on
 # a real DDS domain, with real UDP multicast discovery — and by default that

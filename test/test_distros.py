@@ -8,6 +8,7 @@ there builds a package that is wrong but builds clean — `ros-<typo>-rclpy`, a
 numpy bound fatal on one Ubuntu release and fine on another. So these checks
 test the *rendered* result, not the table's text.
 """
+import os
 import pathlib
 import re
 import shutil
@@ -259,6 +260,129 @@ def test_run_tests_and_build_deb_both_refuse_an_unknown_distribution():
         )
         # Nothing was built or pulled on the way to the refusal.
         assert "Unable to find image" not in r.stderr
+
+
+# ---------------------------------------------------------------------------
+# What a test run ran on: tools/test-image-report.sh, sourced by run-tests.sh
+# ---------------------------------------------------------------------------
+
+#: Stands in for `docker`. Logs every call, answers the four questions the
+#: report asks, and can be told to fail each of them. Run as `bash <file>` so
+#: DOCKER is two words, the way `sudo docker` is.
+FAKE_DOCKER = r'''
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+  pull)
+    exit "${FAKE_PULL_STATUS:-0}" ;;
+  image)
+    fmt=$4 ref=$5
+    case "$fmt" in
+      *RepoDigests*)
+        [ -z "${FAKE_NO_DIGEST:-}" ] || exit 1
+        [ "$ref" = ros:jazzy ] && echo "ros@sha256:1111" ;;
+      *RootFS*)
+        if [ "$ref" = ros:jazzy ]; then echo "sha256:b1 sha256:b2"
+        else echo "${FAKE_IMAGE_LAYERS:-sha256:b1 sha256:b2 sha256:t1}"; fi ;;
+    esac ;;
+  run)
+    [ -z "${FAKE_NO_DPKG:-}" ] || exit 2
+    printf 'ii  ros-jazzy-fastrtps 2.14.7-1noble.20260911.035053\n'
+    printf 'un  ros-jazzy-fastrtps-doc \n'
+    printf 'ii  ros-jazzy-rclpy 7.1.12-1noble.20260912.162354\n'
+    # dpkg-query's own status when one of its patterns matched nothing
+    exit 1 ;;
+esac
+'''
+
+
+def _report(tmp_path, call, **env_extra):
+    """Sources the helper under run-tests.sh's own shell options, makes one
+    call, then echoes `after` -- so a helper that aborts the script shows up as
+    a missing `after`, not as a pass."""
+    fake = tmp_path / "fake-docker.sh"
+    fake.write_text(FAKE_DOCKER)
+    log = tmp_path / "docker.log"
+    log.write_text("")
+    env = dict(os.environ, DOCKER="bash {}".format(fake), FAKE_DOCKER_LOG=str(log), **env_extra)
+    script = "set -euo pipefail\n. {}\n{}\necho after\n".format(
+        ROOT / "tools" / "test-image-report.sh", call)
+    r = subprocess.run(["bash", "-c", script], cwd=str(tmp_path), env=env,
+                       capture_output=True, text=True)
+    return r, log.read_text()
+
+
+REPORT = "fleetless_report_test_image ros:jazzy fleetless-bridge-dev-jazzy jazzy"
+
+
+def test_the_test_job_names_its_base_image_digest_and_package_versions(tmp_path):
+    r, _ = _report(tmp_path, REPORT)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "after\n"
+    assert ("run-tests.sh: base image ros:jazzy = ros@sha256:1111 "
+            "(test image fleetless-bridge-dev-jazzy is built on it)") in r.stderr
+    assert "run-tests.sh: package ros-jazzy-fastrtps 2.14.7-1noble.20260911.035053" in r.stderr
+    assert "run-tests.sh: package ros-jazzy-rclpy 7.1.12-1noble.20260912.162354" in r.stderr
+    # Known to dpkg but not installed: not something this run ran.
+    assert "fastrtps-doc" not in r.stderr
+
+
+def test_package_globs_reach_dpkg_unexpanded_and_cover_every_family(tmp_path):
+    # Files a careless unquoted glob would expand to, in the caller's cwd.
+    for name in ("ros-jazzy-rmw-planted", "ros-jazzy-rcl-planted"):
+        (tmp_path / name).write_text("")
+    r, log = _report(tmp_path, REPORT)
+    assert r.returncode == 0, r.stderr
+    run_call = [line for line in log.splitlines() if line.startswith("run ")]
+    assert len(run_call) == 1, log
+    for family in ("rmw", "rcl", "fastrtps", "fastdds", "fastcdr", "cyclonedds"):
+        assert "ros-jazzy-{}*".format(family) in run_call[0].split(), run_call[0]
+    assert "planted" not in log
+
+
+def test_a_test_image_not_built_on_the_reported_base_says_so(tmp_path):
+    r, _ = _report(tmp_path, REPORT, FAKE_IMAGE_LAYERS="sha256:x1 sha256:t1")
+    assert r.returncode == 0, r.stderr
+    assert "(test image fleetless-bridge-dev-jazzy is NOT built on it" in r.stderr
+
+
+def test_an_unreadable_digest_is_one_line_and_the_run_goes_on(tmp_path):
+    r, _ = _report(tmp_path, REPORT, FAKE_NO_DIGEST="1")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "after\n"
+    lines = [l for l in r.stderr.splitlines() if "base image" in l]
+    assert lines == ["run-tests.sh: base image ros:jazzy: digest unknown "
+                     "(no local copy with a registry digest)"]
+    assert "run-tests.sh: package ros-jazzy-rclpy" in r.stderr  # the versions still come
+
+
+def test_unreadable_package_versions_are_one_line_and_the_run_goes_on(tmp_path):
+    r, _ = _report(tmp_path, REPORT, FAKE_NO_DPKG="1")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "after\n"
+    assert "run-tests.sh: package " not in r.stderr
+    assert r.stderr.count(
+        "run-tests.sh: ROS/DDS package versions of fleetless-bridge-dev-jazzy: could not be read") == 1
+
+
+def test_a_failed_pull_is_one_line_and_the_run_goes_on(tmp_path):
+    r, log = _report(tmp_path, "fleetless_pull_base_image ros:jazzy", FAKE_PULL_STATUS="1")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "after\n"
+    assert r.stderr.splitlines() == [
+        "run-tests.sh: could not pull ros:jazzy; building on the local copy, if there is one"]
+    assert log.splitlines() == ["pull -q ros:jazzy"]
+
+
+def test_run_tests_pulls_before_the_build_and_reports_once_after_it():
+    text = (ROOT / "run-tests.sh").read_text()
+    assert ". tools/test-image-report.sh" in text
+    build = text.index("$DOCKER build")
+    pull = text.index('fleetless_pull_base_image "ros:$DISTRO"')
+    report_call = 'fleetless_report_test_image "ros:$DISTRO" "$IMAGE" "$DISTRO"'
+    assert text.count(report_call) == 1
+    assert pull < build < text.index(report_call)
+    # The reference reported is the one the image is built from.
+    assert "FROM ros:${ROS_DISTRO_TAG}" in (ROOT / "Dockerfile.dev").read_text()
 
 
 # ---------------------------------------------------------------------------
