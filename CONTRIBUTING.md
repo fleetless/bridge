@@ -108,10 +108,12 @@ and wrong (exit 1). See `apt/README.md`.
 **Release**, in the Actions tab, releases `main`: the version comes from the
 Conventional Commits since the last tag, a release PR writes it into
 `fleetless_bridge/__init__.py`, `package.xml` and a new `debian/changelog.in`
-entry, and merging it tags, packages and publishes to apt through the ops
-repository. A robot takes the new version within minutes of that publish.
-Nobody runs this by hand outside the button — see
-`.github/workflows/release.yml` for what it does and in what order.
+entry, and merging it tags and packages the release. A release is recorded
+for staging first; apt publishes it when the staging generation that
+carries it is promoted to production, on André's approval. Robots take it
+within minutes of that publish. Nobody runs this by hand outside the
+button — see `.github/workflows/release.yml` for what it does and in what
+order.
 
 ## Commit messages
 

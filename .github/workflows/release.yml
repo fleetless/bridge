@@ -259,7 +259,7 @@ jobs:
           set -euo pipefail
           node .github/release/bridge-version.mjs notes > "$RUNNER_TEMP/notes.md"
           node .github/release/release.mjs github-release --version "$VERSION" --dir dist --notes-file "$RUNNER_TEMP/notes.md"
-      - name: ask the ops repository to publish it to apt
+      - name: ask the ops repository to record it for staging
         id: dispatch
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -280,7 +280,7 @@ jobs:
             cat dist/SHA256SUMS 2>/dev/null || echo "no SHA256SUMS: packaging did not finish"
             echo '```'
             if [ "$DISPATCHED" = true ]; then
-              echo "- dispatched \`bridge-release\` to fleetless/fleetless: publish-apt.yml publishes, then installs from the served suite"
+              echo "- dispatched \`bridge-release\` to fleetless/fleetless: record-release.yml records it into staging; apt publishes only when it is promoted (promote.yml)"
             else
               echo "- not dispatched: the run did not reach the ask-the-ops-repository step"
             fi
