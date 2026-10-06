@@ -420,6 +420,18 @@ pytest_args=("$@")
 # command that widened the mount looked identical to the one that did not.
 run_args=(-v "$PWD":/ws -w /ws)
 
+# A worktree's `.git` is a FILE naming the main checkout's git directory by
+# absolute host path (`gitdir: /path/to/clone/.git/worktrees/<name>`) — not
+# translated into /ws, and not under $PWD, so the mount above never reaches
+# it, and `git ls-files` (test_license_headers.py, test_published_prose.py)
+# answers `fatal: not a git repository: <path>` before a single test runs
+# (#66). A normal clone's `.git` is a directory, already inside $PWD and
+# already mounted — nothing to add, which is also what CI checks out.
+if [ -f .git ]; then
+    GIT_COMMON_DIR="$(git rev-parse --path-format=absolute --git-common-dir)"
+    run_args+=(-v "$GIT_COMMON_DIR":"$GIT_COMMON_DIR":ro)
+fi
+
 # test_contracts_sync.py compares the vendored schemas, the vendored constants
 # and PROTOCOL_VERSION against a real @fleetless/contracts package. It needs to
 # be told where one is, and there is exactly one way to tell it:
