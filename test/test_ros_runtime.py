@@ -486,12 +486,17 @@ def _start_trigger_server(*, service_name="/do_it", success=True, message="done"
 
 
 #: How long a witness waits for a sample the bridge has already published on a
-#: publisher that is still alive, once both sides have matched
-#: (`_wait_until_matched`). A sample written before the witness has matched
-#: the writer is not owed to it and does not arrive late -- it does not
-#: arrive, so no length of this wait would cover that case. This bounds "at
-#: all" on a loaded machine, not latency: a failsafe that is never published
-#: still fails the wait.
+#: publisher that is still alive. This bounds "at all" on a loaded machine, not
+#: latency: a failsafe that is never published still fails the wait.
+#:
+#: A witness in the test process (`_start_witness`) does not get a sample
+#: written before it has matched the writer on `ros-jazzy-fastrtps` 2.14.7 --
+#: not late, not at all, so no length of this wait would cover it -- and the
+#: tests that use one wait for `_wait_until_matched` first. That loss belongs
+#: to delivery within one process. A subscriber in another process, as on a
+#: robot (`_start_witness_process`), gets the same sample repaired once it has
+#: matched: 189 ms after the publish in the median and 524 ms at most without
+#: packet loss, well inside this timeout (fleetless/fleetless#287).
 DELIVERY_TIMEOUT_S = 10.0
 
 
@@ -512,10 +517,14 @@ def _start_witness(topic, msg_type, own_context=False):
     is a real independent witness to what lands on a topic.
 
     `own_context=True` puts it on a separate `rclpy.Context` as well, which is
-    closer to a robot's own node (still the same process). A witness to a
-    message published immediately before its publisher is destroyed needs that:
-    on the bridge's context the subscriber learns of the removal at once, and a
-    sample it has acknowledged but not yet taken can go with it.
+    closer to a robot's own node -- but still the same process, and Fast DDS
+    delivers a sample to a reader in the writer's own process on a path of its
+    own (see `_wait_until_matched`). A witness here therefore cannot say
+    whether a robot receives something; `_start_witness_process` can. A
+    witness to a message published immediately before its publisher is
+    destroyed needs that: on the bridge's context the subscriber learns of the
+    removal at once, and a sample it has acknowledged but not yet taken can go
+    with it.
     `test_stop_fires_the_failsafe_for_an_armed_publisher_before_shutting_down`
     observes from its own context for the same reason. Whether such a sample
     arrives at all is the bridge's part: a removed publisher keeps its handle
@@ -686,15 +695,28 @@ def _wait_until_matched(publisher, witness, timeout=5.0):
     `publisher.get_subscription_count() > 0` says the writer has matched the
     reader; it does not say the reader has matched the writer, and discovery
     across two contexts is not symmetric in time. A sample written in that gap
-    reaches a reader that does not know the writer yet, and whether it is
-    repaired afterwards depends on the Fast DDS version (fleetless#257,
-    measured with the reader still unmatched at the publish): with
-    `ros-jazzy-fastrtps` 2.14.6 it arrived, 19 of 19; with 2.14.7, which the
-    Jazzy sync of 2026-10-06 installed, it never does, 19 of 19 -- not late,
-    not after 10 s, while the writer's `wait_for_all_acked()` already returns
-    True for it. Humble (Fast DDS 2.6) and Lyrical (3.6) deliver it. A test
-    that publishes exactly once and waits for that sample therefore waits for
-    both sides first, which is right on every one of these versions.
+    reaches a reader that does not know the writer yet.
+
+    For a reader in the writer's own process -- every `_start_witness`,
+    whether on its own context or not -- whether that sample arrives depends
+    on the Fast DDS version (fleetless#257, fleetless/fleetless#287). Fast DDS
+    hands a sample to a reader in its own process directly. Since
+    `ros-jazzy-fastrtps` 2.14.7, which the Jazzy sync of 2026-10-06
+    installed, a reader that has not matched the writer yet reports such a
+    sample as processed, the writer takes that as an acknowledgement, and the
+    sample is never repaired: with two contexts in one process it arrived in
+    0 of 25 attempts on 2.14.7, against 29 of 29 on 2.14.6, while the writer's
+    `wait_for_all_acked()` returned True at once. Humble (Fast DDS 2.6) and
+    Lyrical (3.6) deliver it.
+
+    A reader in another process -- which is what a robot's subscriber is --
+    does not lose it: the sample travels over a transport and is repaired
+    once the reader has matched, 479 of 479 across all four combinations of
+    2.14.6 and 2.14.7 on the two sides.
+    `test_a_command_published_at_the_bridges_match_reaches_a_subscriber_in_another_process`
+    keeps that in the suite. This helper is for a test that publishes exactly
+    once to a witness in the test process and waits for that sample: it waits
+    for both sides first, which is right on every one of these versions.
 
     The reader's side is the subscription's own matched-publisher count where
     rclpy has one (`Subscription.get_publisher_count`, rclpy 7 and later).
