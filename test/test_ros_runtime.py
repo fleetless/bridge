@@ -4650,12 +4650,15 @@ def test_a_stopped_witness_process_is_gone_and_a_wait_that_runs_out_says_what_di
 
 def test_a_command_published_at_the_bridges_match_reaches_a_subscriber_in_another_process():
     """A robot's subscriber is another process. One command, published the
-    moment the bridge's publisher has matched it -- typically before the
+    moment the bridge's publisher has matched it -- often before the
     subscriber has matched the bridge -- reaches it.
 
     The subscriber is started after the publisher on purpose: in that order
-    the writer usually matches first, so most runs publish in the gap before
-    the reader has matched the writer. That gap is where a witness in the
+    the writer often matches first, and the run then publishes in the gap
+    before the reader has matched the writer -- in 50 of 50 runs on jazzy and
+    on lyrical, and in 26 of 50 on humble, where the two sides mostly match
+    within a millisecond of each other and the other 24 runs could not be
+    resolved. That gap is where a witness in the
     test process loses the sample on `ros-jazzy-fastrtps` 2.14.7 (see
     `_wait_until_matched`); between two processes the sample is repaired once
     the reader has matched (fleetless/fleetless#287). The order of the two
@@ -4693,9 +4696,18 @@ def test_a_command_published_at_the_bridges_match_reaches_a_subscriber_in_anothe
                 "the command published at the bridge's match never reached the subscriber in another process",
             )
             matched = witness.first("matched")
-            before = matched is None or matched["t"] > t_pub
-            print("witness order: publish {} the witness's match (t_pub={:.6f}, matched={}, rx={:.6f})".format(
-                "before" if before else "after",
+            # The witness polls for its match, so its `matched` event can come
+            # after the match itself. A command that arrived before that event
+            # reached a reader that had matched already: whether the publish
+            # was before that match is then not known.
+            if matched is not None and matched["t"] <= t_pub:
+                order = "publish after the witness's match"
+            elif matched is None or matched["t"] > rx["t"]:
+                order = "not resolved, the command arrived before the witness reported its match"
+            else:
+                order = "publish before the witness's match"
+            print("witness order: {} (t_pub={:.6f}, matched={}, rx={:.6f})".format(
+                order,
                 t_pub,
                 "{:.6f}".format(matched["t"]) if matched else "none",
                 rx["t"],
