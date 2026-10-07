@@ -495,8 +495,9 @@ def _start_trigger_server(*, service_name="/do_it", success=True, message="done"
 #: tests that use one wait for `_wait_until_matched` first. That loss belongs
 #: to delivery within one process. A subscriber in another process, as on a
 #: robot (`_start_witness_process`), gets the same sample repaired once it has
-#: matched: 189 ms after the publish in the median and 524 ms at most without
-#: packet loss, well inside this timeout (fleetless/fleetless#287).
+#: matched: on jazzy, with both processes on one machine, 189 ms after the
+#: publish in the median and 524 ms at most without packet loss, well inside
+#: this timeout (fleetless/fleetless#287).
 DELIVERY_TIMEOUT_S = 10.0
 
 
@@ -697,10 +698,12 @@ def _wait_until_matched(publisher, witness, timeout=5.0):
     across two contexts is not symmetric in time. A sample written in that gap
     reaches a reader that does not know the writer yet.
 
-    For a reader in the writer's own process -- every `_start_witness`,
-    whether on its own context or not -- whether that sample arrives depends
-    on the Fast DDS version (fleetless#257, fleetless/fleetless#287). Fast DDS
-    hands a sample to a reader in its own process directly. Since
+    For a reader in the writer's own process on another context -- a
+    `_start_witness(..., own_context=True)`, which every caller of this helper
+    uses -- whether that sample arrives depends on the Fast DDS version
+    (fleetless#257, fleetless/fleetless#287). A witness on the bridge's own
+    context was not measured. Fast DDS hands a sample to a reader in its own
+    process directly. Since
     `ros-jazzy-fastrtps` 2.14.7, which the Jazzy sync of 2026-10-06
     installed, a reader that has not matched the writer yet reports such a
     sample as processed, the writer takes that as an acknowledgement, and the
