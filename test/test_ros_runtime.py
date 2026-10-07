@@ -20,6 +20,8 @@ import pathlib
 import posixpath
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -549,6 +551,133 @@ def _start_independent_subscriber(topic, msg_type, own_context=False):
     tests here unpack."""
     witness = _start_witness(topic, msg_type, own_context=own_context)
     return witness.received, witness.subscription, witness.stop
+
+
+#: `test/witness_process.py`: a subscriber that runs as a process of its own.
+WITNESS_PROCESS = pathlib.Path(__file__).with_name("witness_process.py")
+
+#: How long a witness process may take from its start to `ready`: an
+#: interpreter start, the rclpy import and a DDS participant on a loaded
+#: runner. It bounds "at all", not speed.
+WITNESS_PROCESS_READY_TIMEOUT_S = 30.0
+
+#: How long `stop()` waits for the process after SIGTERM, and again after
+#: SIGKILL.
+WITNESS_PROCESS_STOP_TIMEOUT_S = 5.0
+
+
+class _WitnessProcess:
+    """A subscriber in another process -- see `_start_witness_process`.
+    `events` grows in place, one dict per line the process wrote."""
+
+    def __init__(self, topic, process):
+        self.topic = topic
+        self.process = process
+        self.events = []
+        self.stderr_lines = []
+        self._stopped = False
+        self._readers = [
+            threading.Thread(target=self._read_stdout, daemon=True),
+            threading.Thread(target=self._read_stderr, daemon=True),
+        ]
+        for reader in self._readers:
+            reader.start()
+
+    def _read_stdout(self):
+        for line in self.process.stdout:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                event = {"ev": "unparsed", "line": line.rstrip("\n")}
+            self.events.append(event)
+
+    def _read_stderr(self):
+        for line in self.process.stderr:
+            self.stderr_lines.append(line.rstrip("\n"))
+
+    def first(self, ev):
+        return next((event for event in list(self.events) if event.get("ev") == ev), None)
+
+    def received(self):
+        return [event for event in list(self.events) if event.get("ev") == "rx"]
+
+    def describe(self):
+        code = self.process.poll()
+        state = "still running" if code is None else "exited with code {}".format(code)
+        matched = self.first("matched")
+        events = list(self.events)
+        return "witness process on {} {}; {}; received {}; last event {}; stderr: {}".format(
+            self.topic,
+            state,
+            "matched at t={:.6f}".format(matched["t"]) if matched else "never matched",
+            [event.get("x") for event in self.received()],
+            events[-1] if events else None,
+            "\n".join(self.stderr_lines).strip() or "(empty)",
+        )
+
+    def wait_for(self, ev, timeout, what):
+        # Stops waiting as soon as the process is gone: a dead witness will
+        # not report anything, and its exit code says more than a timeout.
+        try:
+            wait_until(
+                lambda: self.first(ev) is not None or self.process.poll() is not None,
+                timeout=timeout,
+                interval=0.001,
+            )
+        except AssertionError:
+            pass
+        event = self.first(ev)
+        if event is None:
+            if self.process.poll() is not None:
+                # Let the readers drain what the process wrote before it died.
+                for reader in self._readers:
+                    reader.join(timeout=WITNESS_PROCESS_STOP_TIMEOUT_S)
+            raise AssertionError("{} within {}s: {}".format(what, timeout, self.describe()))
+        return event
+
+    def stop(self):
+        """Terminates the process, waits a bounded time, kills it if it is
+        still there, and joins the reader threads. Raises if the process is
+        alive after all that: no witness process outlives its test."""
+        if self._stopped:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=WITNESS_PROCESS_STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                try:
+                    self.process.wait(timeout=WITNESS_PROCESS_STOP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    pass
+        if self.process.poll() is None:
+            raise AssertionError("the witness process on {} (pid {}) is still alive after SIGKILL".format(
+                self.topic, self.process.pid))
+        for reader in self._readers:
+            reader.join(timeout=WITNESS_PROCESS_STOP_TIMEOUT_S)
+        self.process.stdout.close()
+        self.process.stderr.close()
+        self._stopped = True
+
+
+def _start_witness_process(topic):
+    """A `geometry_msgs/msg/Twist` subscriber on `topic` in a process of its
+    own (`test/witness_process.py`), as a robot's subscriber is.
+
+    Started with `sys.executable` and this process's environment, so it is in
+    the same ROS domain and uses the same RMW and Fast DDS as the bridge under
+    test. Does not wait for it: `wait_for("ready", ...)` does. Every caller
+    calls `stop()` in `finally`."""
+    process = subprocess.Popen(
+        [sys.executable, str(WITNESS_PROCESS), topic],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=os.environ.copy(),
+    )
+    return _WitnessProcess(topic, process)
 
 
 def _wait_until_matched(publisher, witness, timeout=5.0):
@@ -4451,6 +4580,44 @@ def test_a_matched_wait_without_a_reader_side_count_asks_the_witness_graph():
     assert node.asked and set(node.asked) == {"/cmd_vel"}
     with pytest.raises(AssertionError, match="the witness has not matched the publisher"):
         _wait_until_matched(_StubPublisher(1), _stub_witness(object(), node=_StubNode(0)), timeout=0.1)
+
+
+def test_a_witness_process_that_cannot_subscribe_fails_its_wait_with_its_exit_code_and_stderr():
+    """A witness process that dies before `ready` must fail the wait at once
+    and say why -- not sit out the timeout and report a bare timeout. A topic
+    name rclpy refuses is a real way to make it die."""
+    witness = _start_witness_process("/not a topic")
+    try:
+        started = time.monotonic()
+        with pytest.raises(AssertionError) as raised:
+            witness.wait_for("ready", WITNESS_PROCESS_READY_TIMEOUT_S, "the witness process never became ready")
+        # Failed because the process exited, not because the timeout ran out.
+        assert time.monotonic() - started < WITNESS_PROCESS_READY_TIMEOUT_S / 2
+    finally:
+        witness.stop()
+    message = str(raised.value)
+    assert message.startswith("the witness process never became ready within ")
+    assert "/not a topic" in message
+    assert "exited with code 1" in message
+    assert "InvalidTopicNameException" in message
+
+
+def test_a_stopped_witness_process_is_gone_and_a_wait_that_runs_out_says_what_did_not_happen():
+    """`stop()` leaves no process behind, and a wait for an event that never
+    comes names what did not happen and that the process is still running."""
+    witness = _start_witness_process("/witness_process/silent")
+    try:
+        witness.wait_for("ready", WITNESS_PROCESS_READY_TIMEOUT_S, "the witness process never became ready")
+        with pytest.raises(AssertionError) as raised:
+            witness.wait_for("rx", 0.3, "the witness process received nothing")
+    finally:
+        witness.stop()
+    message = str(raised.value)
+    assert message.startswith("the witness process received nothing within 0.3s: ")
+    assert "still running" in message
+    assert "received []" in message
+    assert witness.process.poll() is not None
+    witness.stop()  # a second stop is harmless
 
 
 # --- publish: a real message lands on the topic -----------------------------------
