@@ -4623,6 +4623,66 @@ def test_a_stopped_witness_process_is_gone_and_a_wait_that_runs_out_says_what_di
 # --- publish: a real message lands on the topic -----------------------------------
 
 
+def test_a_command_published_at_the_bridges_match_reaches_a_subscriber_in_another_process():
+    """A robot's subscriber is another process. One command, published the
+    moment the bridge's publisher has matched it -- typically before the
+    subscriber has matched the bridge -- reaches it.
+
+    The subscriber is started after the publisher on purpose: in that order
+    the writer usually matches first, so most runs publish in the gap before
+    the reader has matched the writer. That gap is where a witness in the
+    test process loses the sample on `ros-jazzy-fastrtps` 2.14.7 (see
+    `_wait_until_matched`); between two processes the sample is repaired once
+    the reader has matched (fleetless/fleetless#287). The order of the two
+    matches is not in this test's hands, so it is printed, not asserted.
+
+    One command only: with the bridge's history depth of 10, a stream sent
+    faster than it can be repaired is overwritten on every version, which is
+    the QoS and not a fault."""
+    topic = "/witness_process/cmd_vel"
+
+    async def body(rt):
+        # A failsafe timeout the test cannot reach: no failsafe may stand in
+        # for the command.
+        assert await rt.apply_publishers(by_slug([_publisher_cfg("drive", topic=topic, timeout_ms=60_000)])) == []
+        handle = rt._publishers["drive"].handle
+        witness = _start_witness_process(topic)
+        try:
+            witness.wait_for("ready", WITNESS_PROCESS_READY_TIMEOUT_S, "the witness process never became ready")
+            # The bridge's side only, and finely: waiting for both sides here
+            # would close the gap this test is about.
+            try:
+                wait_until(
+                    lambda: handle.get_subscription_count() > 0,
+                    timeout=WITNESS_PROCESS_READY_TIMEOUT_S,
+                    interval=0.001,
+                )
+            except AssertionError:
+                raise AssertionError("{}: the bridge's publisher never matched the witness process within {}s: {}".format(
+                    topic, WITNESS_PROCESS_READY_TIMEOUT_S, witness.describe())) from None
+            t_pub = time.monotonic()
+            await rt.publish("drive", {"speed": 1.0})
+            rx = witness.wait_for(
+                "rx",
+                DELIVERY_TIMEOUT_S,
+                "the command published at the bridge's match never reached the subscriber in another process",
+            )
+            matched = witness.first("matched")
+            before = matched is None or matched["t"] > t_pub
+            print("witness order: publish {} the witness's match (t_pub={:.6f}, matched={}, rx={:.6f})".format(
+                "before" if before else "after",
+                t_pub,
+                "{:.6f}".format(matched["t"]) if matched else "none",
+                rx["t"],
+            ))
+            return rx
+        finally:
+            witness.stop()
+
+    rx = run(body)
+    assert rx["x"] == pytest.approx(1.0)
+
+
 def test_publish_sends_a_real_message_an_independent_subscriber_observes():
     async def body(rt):
         assert await rt.apply_publishers(by_slug([_publisher_cfg("drive")])) == []
