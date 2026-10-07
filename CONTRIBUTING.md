@@ -9,8 +9,8 @@ The canonical repository is
 **Pull requests are welcome** — we read them, review them, land them.
 
 **CI runs the suite, the packaging and the release logic's own tests on
-every push and every pull request** (`.github/workflows/verify.yml`, three
-ROS distributions in parallel). That doesn't make running them yourself
+every pull request and every push to `main`** (`.github/workflows/verify.yml`,
+three ROS distributions in parallel). That doesn't make running them yourself
 optional — a red pipeline ten minutes after you pushed is a worse loop than
 a red test on your own machine, and the pipeline runs the same commands
 this file does. The checks:

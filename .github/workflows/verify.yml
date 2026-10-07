@@ -1,20 +1,22 @@
-# The suite on every push, once per ROS distribution, then the packages.
+# The suite on every pull request and every push to main, once per ROS
+# distribution, then the packages.
 #
 # **One job per distribution.** A green Humble run says nothing about Jazzy
 # (run-tests.sh): each distribution has its own image, its own Python and its
 # own site directory. The matrix is held against tools/distros.sh by
 # test/test_ci_workflows.py.
 #
-# **The packages on every push, not only on a release.** ci/package.sh builds
-# all three and installs each from a throwaway repository, so a packaging
-# break is found by the commit that made it rather than by the release after
-# it.
+# **The packages on every pull request and every push to main, not only on
+# a release.** ci/package.sh builds all three and installs each from a
+# throwaway repository, so a packaging break is found by the commit that
+# made it rather than by the release after it.
 #
-# release.yml never calls this file. Its release branch and its release PR
-# trigger this workflow the ordinary way (push, pull_request), and the
-# required `verify` check below is what release.mjs's merge-pr waits on
-# before merging and tagging. The release job then packages the merged
-# commit itself, once, and those are the bytes it releases.
+# release.yml never calls this file. Its release PR triggers this workflow
+# the ordinary way (pull_request) -- the release branch's own push no
+# longer does, push runs only on main -- and the required `verify` check
+# below is what release.mjs's merge-pr waits on before merging and tagging.
+# The release job then packages the merged commit itself, once, and those
+# are the bytes it releases.
 #
 # **Hosted runners, because the bridge is public.** A pull request is a
 # stranger's code, and a build runner on private hardware would run it inside
