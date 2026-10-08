@@ -19,7 +19,7 @@
 #
 # The release itself publishes nothing to apt. The ops repository publishes
 # it when the staging generation that carries it is promoted to production
-# (promote.yml there, on André's approval); only then does a robot take the
+# (promote.yml there, a person's decision); only then does a robot take the
 # new version, within minutes. reprepro refuses a second build of a version,
 # so the install check above stays the check of the build. publish-apt.yml
 # installs from the served suite after that publish, as before.
