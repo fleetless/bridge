@@ -14,14 +14,15 @@
 # refuse it (apt/verify-suites.sh), so the build is checked before anything
 # is published. The packages and SHA256SUMS become the GitHub release,
 # uploaded with this workflow's GITHUB_TOKEN, because the ops repository
-# refuses any other uploader. Then the ops repository is asked to publish
-# them to apt.
+# refuses any other uploader. Then the ops repository is asked to record
+# the release for staging.
 #
-# That publish is no longer a separate decision. A robot takes a new version
-# within minutes, and reprepro refuses a second build of a version, so the
-# check that used to be a person looking at the release is now the install
-# check above. publish-apt.yml installs from the served suite afterwards, as
-# before.
+# The release itself publishes nothing to apt. The ops repository publishes
+# it when the staging generation that carries it is promoted to production
+# (promote.yml there, on André's approval); only then does a robot take the
+# new version, within minutes. reprepro refuses a second build of a version,
+# so the install check above stays the check of the build. publish-apt.yml
+# installs from the served suite after that publish, as before.
 #
 # A run that failed can be started again: an open release PR is reused and
 # rebuilt on the current `main` (auto-merge enabled again), a merged release
