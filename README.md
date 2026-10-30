@@ -6,11 +6,29 @@
 realtime API. The bridge is the ROS 2 node that makes that possible: it opens
 one WebSocket to the cloud, identifies the robot with its token, and from then
 on does exactly what the published configuration names. It samples topics
-into datapoints, runs services and actions as jobs, publishes messages with a
-failsafe, streams cameras, and uploads URDF and mesh assets when asked.
+into datapoints, runs services and actions as jobs, publishes messages,
+streams cameras, and uploads URDF and mesh assets when asked. An optional
+publisher timeout message is an operating aid sent by the running bridge
+process; it cannot respond if that process or the robot computer fails.
 
 It talks ROS on one side and the Fleetless wire protocol on the other, and
 nothing else. Shipped as `ros-<distro>-fleetless-bridge`, Python, Apache-2.0.
+
+## Safety notice
+
+Version 1.0 — Effective from 1 November 2026
+
+Fleetless is not a safety function. It is not a safety component, a safety-rated controller or an emergency-stop system, and it does not replace the risk assessment of your robot and its surroundings.
+
+- Commands sent through Fleetless can be delayed, lost or executed out of order, for example when a network connection drops.
+- Every robot must reach, on its own, the safe state defined in its risk assessment when the connection to Fleetless is lost or the bridge stops working. Depending on the robot, stopping at once is not always the safe state.
+- The failsafe message of a bridge publisher is an operating aid, not a safety function. It is sent by the bridge process and cannot be sent if that process or the robot's computer fails.
+- Keep a physical emergency stop within reach whenever a robot can move.
+- AI agents that control robots through Fleetless can make mistakes. Use an AI agent to move a robot only while a person supervises every motion and can stop the robot at once. Do not let AI agents move robots unattended. Where Fleetless allows it, for example through the roles of an app, limit what an AI agent may do.
+
+Commands may also be executed more than once, and displayed status may be stale. Safety functions, including the response to communication loss, must be implemented independently of Fleetless and validated for the specific robot and its hazards. Human supervision and an emergency stop do not replace the required protective measures. Nothing in this notice excludes our liability under mandatory law.
+
+You are responsible for the safe integration and operation of your robots, as described in section 8 of our [Terms of Service](https://fleetless.dev/terms).
 
 ## 🐢 Supported ROS 2 distributions
 
@@ -119,17 +137,20 @@ low_bandwidth:
   camera: stop
 ```
 
-A datapoint that must keep its rate whatever the link is doing says so for
-itself, and is the one thing the cap does not touch:
+A datapoint that should bypass the bridge's low-bandwidth sampling cap says
+so for itself:
 
 ```yaml
 datapoints:
-  emergency_stop:
-    topic: /estop
-    type: std_msgs/msg/Bool
+  motor_temperature:
+    topic: /motor_temperature
+    type: std_msgs/msg/Float32
     field: data
     low_bandwidth: keep
 ```
+
+`keep` only bypasses that sampling cap. Network delay, loss and stale status
+are still possible. Do not use it as an emergency-stop or other safety path.
 
 A `camera_start` that arrives while the mode holds is refused, under
 `reduce` as much as under `stop`: a new stream is new uplink, and the mode
