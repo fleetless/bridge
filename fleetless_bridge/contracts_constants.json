@@ -23,6 +23,7 @@
     "size": "x-fleetless-asset-size"
   },
   "ROBOT_ASSET_STORE_BYTES": 1000000000,
+  "ASSET_FILE_MAX_BYTES": 1000000000,
   "SNAPSHOT_HEADERS": {
     "ageMs": "x-fleetless-age-ms",
     "timestampMs": "x-fleetless-timestamp-ms",

@@ -95,22 +95,21 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@5.2.0
-            at commit c6cbb3a (tag v5.2.0)
+    Source: @fleetless/contracts@8.1.0
+            at commit ab8deb7 (tag v8.1.0)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-These bytes are the 5.2.0 release: `cloud-cancel` (`cancel`) gains an
-optional `own_only`, absent meaning `false`, today's meaning — with `true`
-the bridge is to cancel only a job it holds as its own, never falling back
-to every external goal on the action. `LATEST_BRIDGE_VERSION` is `6.1.0`,
-the first bridge that honours it. Protocol stays 5, and no other frame
-moves. The version is 5.2.0, not 5.1.0, because 5.1.0 was already taken by
-fleetless#85 by the time this feature released. Diffed field-for-field
-against the `5.1.0-next.2` pre-release this pin replaces (`AGENTS.md`,
-"Unpublished contracts or sdk") — identical bytes, only the version moved.
-The sync test compares against whatever `$FLEETLESS_CONTRACTS_DIR` points
-at and checks that tree's own version against this line, so only a
-checkout or a tarball of 5.2.0 agrees with it.
+Diffed field-for-field against the 5.2.0 bytes this pin replaces: the
+twenty-eight `schema/` files and the fifteen `schema-outgoing/` files are
+byte-identical — none of the releases between 5.2.0 and 8.1.0 touched a
+frame the bridge speaks or an outgoing shape it validates against.
+`constants.json` gains one key, `ASSET_FILE_MAX_BYTES` (one gigabyte, the
+per-file cap on an asset upload — the cloud's size refusal reads it, this
+package only carries it along). `PROTOCOL_VERSION` stays 5,
+`LATEST_BRIDGE_VERSION` stays `6.1.0`, and no other constant moved. The
+sync test compares against whatever `$FLEETLESS_CONTRACTS_DIR` points at
+and checks that tree's own version against this line, so only a checkout
+or a tarball of 8.1.0 agrees with it.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a
