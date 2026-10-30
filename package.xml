@@ -3,7 +3,7 @@
 <package format="3">
   <name>fleetless_bridge</name>
   <version>6.1.0</version>
-  <description>Fleetless Bridge: connects a ROS2 robot to the Fleetless cloud.</description>
+  <description>Fleetless Bridge: connects a ROS 2 robot to the Fleetless cloud. Not a safety function — read the safety notice: https://docs.fleetless.dev/#safety-notice</description>
   <maintainer email="andre@dehne-robotik.de">Andre Dehne</maintainer>
   <license>Apache-2.0</license>
   <!-- The manifest is what a ROS user reads on the robot itself

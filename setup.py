@@ -44,7 +44,7 @@ setup(
     # `setuptools` stays because `setup.py` itself needs it.
     install_requires=["setuptools"],
     zip_safe=True,
-    description="Fleetless Bridge: connects a ROS2 robot to the Fleetless cloud.",
+    description="Fleetless Bridge: connects a ROS 2 robot to the Fleetless cloud. Not a safety function — read the safety notice: https://docs.fleetless.dev/#safety-notice",
     license="Apache-2.0",
     author="Dehne Robotik GmbH",
     author_email="hello@fleetless.dev",
