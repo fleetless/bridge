@@ -23,9 +23,13 @@ done
 VERSION=$(sed -n '1s/.*(\(.*\)).*/\1/p' debian/changelog.in)   # 3.1.0-0@DEB_CODENAME@
 UPSTREAM=${VERSION%%-*}
 names=()
+debs=()
 for d in $FLEETLESS_DISTROS; do
-    names+=("ros-$d-fleetless-bridge_${UPSTREAM}-0$(fleetless_distro_field "$d" codename)_all.deb")
+    name="ros-$d-fleetless-bridge_${UPSTREAM}-0$(fleetless_distro_field "$d" codename)_all.deb"
+    names+=("$name")
+    debs+=("dist/$name")
 done
+python3 ci/check-deb-description.py "${debs[@]}"
 (cd dist && sha256sum "${names[@]}" > SHA256SUMS)
 
 # verify-suites.sh writes its work under build/, not dist/. Anything else in
