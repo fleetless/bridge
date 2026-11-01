@@ -1,3 +1,15 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.2.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(assets): log file_too_large with the cloud's per-file limit
+  * docs(assets): the cloud weighs the announced size against the file limit
+  * docs: correct stale 'every push' wording after verify's trigger change
+  * docs(bridge): warn in package descriptions
+  * docs(bridge): publish approved safety notice
+  * docs(bridge): include safety notice in Debian metadata
+  * feat(discovery): ship scoped Fast DDS action-server lease profile
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Sun, 01 Nov 2026 17:21:01 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.1.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * feat(jobs): an own_only cancel never reaches a goal the bridge did not start
