@@ -85,7 +85,7 @@ from fleetless_bridge.ros_runtime import (
 )
 from fleetless_bridge.protocol import CancelOutcome, CancelResultEntry, cancel_result_message
 from fleetless_bridge import sampling
-from fleetless_bridge.goal_state import load_mapping
+from fleetless_bridge.goal_state import load_mapping, mapping_path, save_mapping
 from schemas import validate_frame
 
 FIBONACCI_TYPE = "example_interfaces/action/Fibonacci"
@@ -3553,6 +3553,39 @@ def test_an_unwritable_state_directory_neither_kills_the_executor_nor_the_job():
 
 # --- restart reconciliation: the persisted job/goal mapping survives a
 # process restart --------------------------------------------------------
+
+
+def test_terminal_result_restart_uses_observed_status_instead_of_old_discovery_deadline():
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        goal_id = "11111111-1111-4111-8111-111111111111"
+        save_mapping(mapping_path(state_dir), {"job-1": ("count", goal_id)})
+        rt = RosRuntime(node_name="test_terminal_result_restart", goal_state_dir=state_dir)
+        try:
+            rt.start(asyncio.get_event_loop())
+            rt.set_connected(True)
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            assert rt.jobs.state_of("job-1") == "running"
+            tracker = rt._actions["count"].tracker
+            tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+            observed = tracker.terminal_seen_at(goal_id)
+            # Reconciliation began before this status arrived. Its older
+            # discovery deadline must yield to the terminal-result bound.
+            rt._reconciling["job-1"][2] = observed - 1
+            rt._check_reconciled_goals()
+            assert rt.jobs.state_of("job-1") == "running"
+            rt._check_terminal_result_timeouts(observed + ros_runtime.TERMINAL_RESULT_WAIT_S)
+            update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+            tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+            rt._check_terminal_result_timeouts(observed + ros_runtime.TERMINAL_RESULT_WAIT_S + 1)
+            return update, rt.jobs.updates.try_get(), rt._reconciling
+        finally:
+            rt.stop()
+
+    update, leftover, reconciling = asyncio.run(body())
+    assert (update.state, update.error[0]) == ("lost", "job_lost")
+    assert leftover is None
+    assert "job-1" not in reconciling
 
 
 def test_a_bridge_restart_reattaches_to_a_still_active_persisted_goal():
