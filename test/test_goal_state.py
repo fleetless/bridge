@@ -2,7 +2,7 @@
 """goal_state.py in isolation — plain file I/O, no ROS dependency."""
 import json
 
-from fleetless_bridge.goal_state import load_mapping, save_mapping
+from fleetless_bridge.goal_state import load_mapping, load_terminal_observations, save_mapping
 
 
 def test_round_trips_a_mapping(tmp_path):
@@ -10,6 +10,22 @@ def test_round_trips_a_mapping(tmp_path):
     mapping = {"job-1": ("drive_to", "goal-a"), "job-2": ("dock", "goal-b")}
     save_mapping(path, mapping)
     assert load_mapping(path) == mapping
+
+
+def test_terminal_observation_round_trips_alongside_legacy_mapping_entries(tmp_path):
+    path = tmp_path / "goal_state.json"
+    mapping = {"job-1": ("drive_to", "goal-a"), "job-2": ("dock", "goal-b")}
+    save_mapping(path, mapping, {"job-1": 1793574000.25})
+    assert load_mapping(path) == mapping
+    assert load_terminal_observations(path) == {"job-1": 1793574000.25}
+    assert json.loads(path.read_text(encoding="utf-8"))["job-2"] == ["dock", "goal-b"]
+
+
+def test_invalid_observation_does_not_discard_a_valid_goal_mapping(tmp_path):
+    path = tmp_path / "goal_state.json"
+    path.write_text(json.dumps({"job-1": ["drive_to", "goal-a", "bad"]}), encoding="utf-8")
+    assert load_mapping(path) == {"job-1": ("drive_to", "goal-a")}
+    assert load_terminal_observations(path) == {}
 
 
 def test_a_missing_file_loads_as_empty(tmp_path):

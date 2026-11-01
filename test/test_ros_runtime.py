@@ -85,7 +85,9 @@ from fleetless_bridge.ros_runtime import (
 )
 from fleetless_bridge.protocol import CancelOutcome, CancelResultEntry, cancel_result_message
 from fleetless_bridge import sampling
-from fleetless_bridge.goal_state import load_mapping, mapping_path, save_mapping
+from fleetless_bridge.goal_state import (
+    load_mapping, load_terminal_observations, mapping_path, save_mapping,
+)
 from schemas import validate_frame
 
 FIBONACCI_TYPE = "example_interfaces/action/Fibonacci"
@@ -3553,6 +3555,88 @@ def test_an_unwritable_state_directory_neither_kills_the_executor_nor_the_job():
 
 # --- restart reconciliation: the persisted job/goal mapping survives a
 # process restart --------------------------------------------------------
+
+
+@pytest.mark.parametrize("repeat_status", [False, True], ids=["no-new-status", "repeated-status"])
+def test_terminal_result_deadline_survives_restart(repeat_status):
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        goal_id = "11111111-1111-4111-8111-111111111111"
+        save_mapping(mapping_path(state_dir), {"job-1": ("count", goal_id)})
+        rt1 = RosRuntime(node_name="test_terminal_before_restart", goal_state_dir=state_dir)
+        try:
+            rt1.start(asyncio.get_event_loop())
+            await rt1.apply_actions(by_slug([_action_cfg("count")]))
+            tracker = rt1._actions["count"].tracker
+            tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+            first_seen = tracker.terminal_seen_at(goal_id)
+        finally:
+            rt1.stop()
+
+        # Model five seconds of downtime without sleeping. The first
+        # process must have written the observation before the clock shift.
+        persisted = load_terminal_observations(mapping_path(state_dir))["job-1"]
+        assert abs(persisted - time.time()) < 1
+        save_mapping(
+            mapping_path(state_dir), {"job-1": ("count", goal_id)},
+            {"job-1": persisted - 5},
+        )
+
+        rt2 = RosRuntime(node_name="test_terminal_after_restart", goal_state_dir=state_dir)
+        try:
+            rt2.start(asyncio.get_event_loop())
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            tracker = rt2._actions["count"].tracker
+            restored = tracker.terminal_seen_at(goal_id)
+            assert restored is not None
+            assert abs(restored - (first_seen - 5)) < 1
+            if repeat_status:
+                tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+                assert tracker.terminal_seen_at(goal_id) == restored
+            rt2._reconciling["job-1"][2] = restored - 1
+            rt2._check_reconciled_goals()
+            assert rt2.jobs.state_of("job-1") == "running"
+            rt2._check_terminal_result_timeouts(restored + ros_runtime.TERMINAL_RESULT_WAIT_S - 0.001)
+            assert rt2.jobs.state_of("job-1") == "running"
+            rt2._check_terminal_result_timeouts(restored + ros_runtime.TERMINAL_RESULT_WAIT_S)
+            rt2._check_terminal_result_timeouts(restored + ros_runtime.TERMINAL_RESULT_WAIT_S + 1)
+            update = await asyncio.wait_for(rt2.jobs.updates.get(), timeout=2.0)
+            return update, rt2.jobs.updates.try_get()
+        finally:
+            rt2.stop()
+
+    update, leftover = asyncio.run(body())
+    assert (update.state, update.error[0]) == ("lost", "job_lost")
+    assert leftover is None
+
+
+def test_restarted_terminal_goal_accepts_a_result_before_its_original_deadline():
+    from types import SimpleNamespace
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        goal_id = "11111111-1111-4111-8111-111111111111"
+        save_mapping(
+            mapping_path(state_dir), {"job-1": ("count", goal_id)}, {"job-1": time.time()},
+        )
+        rt = RosRuntime(node_name="test_terminal_result_after_restart", goal_state_dir=state_dir)
+        try:
+            rt.start(asyncio.get_event_loop())
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            observed = rt._actions["count"].tracker.terminal_seen_at(goal_id)
+            assert observed is not None
+            future = SimpleNamespace(result=lambda: SimpleNamespace(
+                status=GoalStatus.STATUS_SUCCEEDED, result=Fibonacci.Result(),
+            ))
+            rt._on_reconciled_goal_result("job-1", "count", future)
+            rt._check_terminal_result_timeouts(observed + ros_runtime.TERMINAL_RESULT_WAIT_S)
+            return await rt.jobs.updates.get(), rt.jobs.updates.try_get()
+        finally:
+            rt.stop()
+
+    update, leftover = asyncio.run(body())
+    assert update.state == "succeeded"
+    assert leftover is None
 
 
 def test_terminal_result_restart_uses_observed_status_instead_of_old_discovery_deadline():
