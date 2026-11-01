@@ -1,3 +1,13 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.2.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(jobs): prepare job_lost result settlement
+  * fix(jobs): retain first terminal status observation
+  * fix(jobs): bound missing action results after terminal status
+  * fix(jobs): prefer terminal result bound after restart
+  * fix(jobs): retain terminal deadline across bridge restarts
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Sun, 01 Nov 2026 23:57:37 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.2.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * fix(assets): log file_too_large with the cloud's per-file limit
