@@ -777,6 +777,9 @@ class _Subscription:
 _ACTIVE_GOAL_STATUSES = frozenset(
     {GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING, GoalStatus.STATUS_CANCELING}
 )
+_TERMINAL_GOAL_STATUSES = frozenset(
+    {GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_ABORTED, GoalStatus.STATUS_CANCELED}
+)
 
 
 def _goal_id_str(goal_id_msg) -> str:
@@ -900,6 +903,9 @@ class GoalTracker:
         # thing that tells an own goal apart from an external one once both
         # are enumerated by this same tracker.
         self._own_job_ids: Dict[str, str] = {}
+        # First terminal status seen for an own goal. A later snapshot may
+        # omit that goal, but its result can still be outstanding.
+        self._terminal_seen_at: Dict[str, float] = {}
         # Goal ids `forget_own_goal` just dropped, until a status snapshot
         # names the goal ended or no longer names it — see there. A dict
         # used as an ordered set, capped at `_RECENTLY_OWN_LIMIT` (oldest
@@ -942,6 +948,10 @@ class GoalTracker:
         self._status = {
             _goal_id_str(entry.goal_info.goal_id): entry.status for entry in msg.status_list
         }
+        now = time.monotonic()
+        for goal_id, status in self._status.items():
+            if goal_id in self._own_job_ids and status in _TERMINAL_GOAL_STATUSES:
+                self._terminal_seen_at.setdefault(goal_id, now)
         # Feedback is kept only for goals this snapshot names active:
         # `_feedback` is keyed by every goal id the feedback topic ever
         # named, external goals included, and nothing else ever forgets
@@ -994,12 +1004,16 @@ class GoalTracker:
                 del self._recently_own[next(iter(self._recently_own))]
         self._feedback.pop(goal_id, None)
         self._status.pop(goal_id, None)
+        self._terminal_seen_at.pop(goal_id, None)
 
     def job_id_for(self, goal_id: str) -> Optional[str]:
         return self._own_job_ids.get(goal_id)
 
     def is_own(self, goal_id: str) -> bool:
         return goal_id in self._own_job_ids
+
+    def terminal_seen_at(self, goal_id: str) -> Optional[float]:
+        return self._terminal_seen_at.get(goal_id)
 
     def active_goal_ids(self) -> Set[str]:
         """Every goal `_action/status` currently names
