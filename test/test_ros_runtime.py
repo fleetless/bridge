@@ -3371,6 +3371,43 @@ def test_external_goals_are_dropped_as_lost_when_their_action_server_is_lost(mon
     assert updates[-1].error[0] == "action_server_lost"
 
 
+def test_two_goals_on_one_disappearing_action_server_settle_together(monkeypatch):
+    """One server's disappearance ends its own and external goals in one debounce."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_LIVENESS_DEBOUNCE_S", 0.5)
+
+    async def body(rt):
+        stop_server = _start_fibonacci_server(steps=200, step_delay=0.05)
+        stopped = False
+        try:
+            await rt.apply_actions(by_slug([_action_cfg("count")]))
+            rt.set_robot_id("robot-xyz")
+            await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+            own_running = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+            assert own_running.state == "running"
+            external_goal_id, _goal_handle, stop_sender = _send_goal_directly("/count", order=5)
+            try:
+                entry = rt._actions["count"]
+                wait_until(lambda: len(entry.tracker.active_goal_ids()) == 2, timeout=5.0)
+                wait_until(lambda: entry.liveness_confirmed_ready, timeout=5.0)
+                stop_server()
+                stopped = True
+                terminal = {}
+                while len(terminal) < 2:
+                    update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=10.0)
+                    if update.state == "lost":
+                        terminal[update.job_id] = update
+                return terminal, external_goal_id
+            finally:
+                stop_sender()
+        finally:
+            if not stopped:
+                stop_server()
+
+    terminal, external_goal_id = run(body)
+    assert set(terminal) == {"job-1", external_job_id("robot-xyz", "count", external_goal_id)}
+    assert all(update.error[0] == "action_server_lost" for update in terminal.values())
+
+
 def test_an_unwritable_state_directory_neither_kills_the_executor_nor_the_job():
     """The persisted mapping is a restart-survival aid, not a precondition
     for running a goal: a state directory that cannot be written (full

@@ -93,10 +93,9 @@ Set them in the launch file or in the environment.
 Fast DDS participant profile for a robot's selected action-server process
 and its Fleetless Bridge process. It advertises a 1 s participant lease
 every 250 ms. The bridge retains its 3 s liveness debounce, so a missed
-announcement alone does not end a job. Apply it only after measuring
-discovery and false-loss behavior on that robot's link; the five-second
-acceptance result and fixture are recorded in
-`docs/action-server-liveness-measurement.md`.
+announcement alone does not end a job. In three simulator kill tests, jobs
+settled in 3.840–4.065 s. Measure discovery and false-loss behavior on the
+robot's own link before enabling the profile there.
 
 In a ROS launch file, add
 `additional_env={'FASTRTPS_DEFAULT_PROFILES_FILE': profile_path}` to the
