@@ -2900,6 +2900,65 @@ def test_terminal_result_unavailable_settles_once_and_ignores_a_late_result():
     assert "job-1" not in reconciling
 
 
+def test_terminal_result_timeout_settles_one_goal_despite_another_active_goal():
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        tracker = rt._actions["count"].tracker
+        first = "11111111-1111-4111-8111-111111111111"
+        second = "22222222-2222-4222-8222-222222222222"
+        for job_id, goal_id in (("job-1", first), ("job-2", second)):
+            rt.jobs.start(job_id, "count", "action")
+            rt._job_goal_ids[job_id] = goal_id
+            tracker.register_own_goal(goal_id, job_id)
+        tracker._on_status(_status_array(
+            (first, GoalStatus.STATUS_SUCCEEDED),
+            (second, GoalStatus.STATUS_EXECUTING),
+        ))
+        observed = tracker.terminal_seen_at(first)
+        tracker._on_status(_status_array((second, GoalStatus.STATUS_EXECUTING)))
+        rt._check_terminal_result_timeouts(observed + ros_runtime.TERMINAL_RESULT_WAIT_S - 0.001)
+        assert rt.jobs.state_of("job-1") == "running"
+        rt._check_terminal_result_timeouts(observed + ros_runtime.TERMINAL_RESULT_WAIT_S)
+        rt._check_terminal_result_timeouts(observed + ros_runtime.TERMINAL_RESULT_WAIT_S + 1)
+        update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+
+        class _LateFuture:
+            def result(self):
+                raise AssertionError("late result must not be read")
+
+        rt._on_action_result("job-1", "count", _LateFuture())
+        return update, rt.jobs.updates.try_get(), rt.jobs.state_of("job-2")
+
+    update, leftover, other_state = run(body)
+    assert (update.state, update.error[0]) == ("lost", "job_lost")
+    assert leftover is None
+    assert other_state == "running"
+
+
+def test_terminal_result_timeout_leaves_a_normal_result_unchanged():
+    from types import SimpleNamespace
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        tracker = rt._actions["count"].tracker
+        goal_id = "11111111-1111-4111-8111-111111111111"
+        rt.jobs.start("job-1", "count", "action")
+        rt._job_goal_ids["job-1"] = goal_id
+        tracker.register_own_goal(goal_id, "job-1")
+        tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+        observed = tracker.terminal_seen_at(goal_id)
+        future = SimpleNamespace(result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_SUCCEEDED, result=Fibonacci.Result(),
+        ))
+        rt._on_action_result("job-1", "count", future)
+        rt._check_terminal_result_timeouts(observed + ros_runtime.TERMINAL_RESULT_WAIT_S)
+        return await rt.jobs.updates.get(), rt.jobs.updates.try_get()
+
+    update, leftover = run(body)
+    assert update.state == "succeeded"
+    assert leftover is None
+
+
 def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job():
     """"server_is_ready() raising: treated as not-ready for the debounce,
     and logged once per job" (spec, "Error handling") — not once per tick,

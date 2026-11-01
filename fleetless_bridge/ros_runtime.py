@@ -209,6 +209,12 @@ ACTION_SERVER_LIVENESS_DEBOUNCE_S = 3.0
 # discovery gap, and bounds that case at grace plus debounce.
 ACTION_SERVER_DISCOVERY_GRACE_S = 30.0
 
+# A terminal status proves the action stopped, but says nothing about the
+# result payload. Give its result service this long to answer before reporting
+# an unknown outcome. This clock starts at the first terminal status, not at
+# a later snapshot or a reconnect.
+TERMINAL_RESULT_WAIT_S = 10.0
+
 
 # How often, at most, a failed write of the persisted goal mapping is
 # logged (`RosRuntime._save_goal_mapping`). A state directory that cannot
@@ -4632,6 +4638,7 @@ class RosRuntime:
         self._check_failsafes()
         self._check_goal_timeouts()
         self._check_service_timeouts()
+        self._check_terminal_result_timeouts()
         self._check_action_server_liveness()
         self._check_reconciled_goals()
 
@@ -4741,6 +4748,29 @@ class RosRuntime:
                     "the service did not respond within {:.0f}s".format(patience_s),
                 ),
             )
+
+    def _check_terminal_result_timeouts(self, now: Optional[float] = None) -> None:
+        """Settle own goals whose observed terminal status outlived its result.
+
+        This scan is independent of `active_goal_ids()`: a terminal goal
+        leaves that set, and another active goal on the same action must not
+        hide the missing result. Tests pass a clock value directly to check
+        the exact boundary without changing the ROS executor's clock.
+        """
+        if now is None:
+            now = time.monotonic()
+        for job_id, slug, state in self.jobs.active_jobs():
+            if state != "running" or self.jobs.origin_of(job_id) == "external":
+                continue
+            goal_id = self._job_goal_ids.get(job_id)
+            if goal_id is None:
+                continue
+            entry = self._actions.get(slug)
+            if entry is None or entry.tracker is None:
+                continue
+            observed_at = entry.tracker.terminal_seen_at(goal_id)
+            if observed_at is not None and now - observed_at >= TERMINAL_RESULT_WAIT_S:
+                self._settle_terminal_result_unavailable(job_id, slug)
 
     def _slug_has_running_own_job(self, slug: str) -> bool:
         """Whether the bridge itself still holds a non-terminal *own* job
