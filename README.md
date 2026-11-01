@@ -87,6 +87,29 @@ the console decides what it exposes; the bridge only follows.
 
 Set them in the launch file or in the environment.
 
+### Fast DDS action-server discovery profile
+
+`share/fleetless_bridge/fastdds/action-server-liveness.xml` is an **opt-in**
+Fast DDS participant profile for a robot's selected action-server process
+and its Fleetless Bridge process. It advertises a 1 s participant lease
+every 250 ms. The bridge retains its 3 s liveness debounce, so a missed
+announcement alone does not end a job. Apply it only after measuring
+discovery and false-loss behavior on that robot's link; the five-second
+acceptance result and fixture are recorded in
+`docs/action-server-liveness-measurement.md`.
+
+In a ROS launch file, add
+`additional_env={'FASTRTPS_DEFAULT_PROFILES_FILE': profile_path}` to the
+`Node` actions for the chosen action server and the Fleetless Bridge. Resolve
+`profile_path` from the installed `fleetless_bridge` package share directory.
+Do not export this variable for a whole robot launch or use it as a global
+machine environment: it changes every participant in each affected process.
+An action server sharing a process with unrelated ROS nodes cannot be scoped
+independently through this profile; place it in its own process first.
+
+To roll back, remove those two `additional_env` entries and restart the two
+processes. Their ordinary Fast DDS discovery settings then apply again.
+
 ## 🐌 Low-bandwidth mode
 
 Some uplinks are only nominally up. When the lag the cloud measures stays

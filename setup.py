@@ -32,6 +32,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/bridge.launch.py"]),
+        ("share/" + package_name + "/fastdds", ["fastdds/action-server-liveness.xml"]),
     ],
     # **This is not the dependency list, and it never was.** The runtime
     # dependencies are declared in `package.xml`, which is what rosdep reads
