@@ -88,28 +88,24 @@ required and keeps `additionalProperties: false`, so `schemas.py`'s
 `validate_frame` checks an outgoing frame (`OUTGOING_FRAME_NAMES`) against
 this stricter copy by default, catching a missing or misspelled field here
 instead of letting it reach the cloud's own parser, which would just
-silently drop it. `schema/`'s copies of the same fourteen stay in service
+silently drop it. `schema/`'s copies of the same fifteen stay in service
 too, for the rarer test that deliberately proves what the *contract*
 tolerates rather than what this bridge's own serializer produces
 (`strict=False`).
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@8.1.0
-            at commit ab8deb7 (tag v8.1.0)
+    Source: @fleetless/contracts@9.1.0
+            at commit 7da5f385125f38eb3aae6e1c34332f5071518692 (tag v9.1.0)
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-Diffed field-for-field against the 5.2.0 bytes this pin replaces: the
-twenty-eight `schema/` files and the fifteen `schema-outgoing/` files are
-byte-identical — none of the releases between 5.2.0 and 8.1.0 touched a
-frame the bridge speaks or an outgoing shape it validates against.
-`constants.json` gains one key, `ASSET_FILE_MAX_BYTES` (one gigabyte, the
-per-file cap on an asset upload — the cloud's size refusal reads it, this
-package only carries it along). `PROTOCOL_VERSION` stays 5,
-`LATEST_BRIDGE_VERSION` stays `6.1.0`, and no other constant moved. The
-sync test compares against whatever `$FLEETLESS_CONTRACTS_DIR` points at
-and checks that tree's own version against this line, so only a checkout
-or a tarball of 8.1.0 agrees with it.
+Compared with the 8.1.0 bytes this pin replaces, only
+`schema/cloud-config.schema.json` differs: description text names the current
+MCP tools. The other twenty-seven input schemas, all fifteen outgoing schemas,
+and `constants.json` are byte-identical. `PROTOCOL_VERSION` stays 5 and
+`LATEST_BRIDGE_VERSION` stays `6.1.0`. The sync test compares against whatever
+`$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version against
+this line, so only a checkout or tarball of 9.1.0 agrees with it.
 
 An **exact npm version**, not a git revision. The contracts package is
 published; a revision of the repository that produced it is not something a
