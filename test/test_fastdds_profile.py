@@ -4,6 +4,11 @@
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+from fleetless_bridge.ros_runtime import (
+    ACTION_SERVER_LIVENESS_DEBOUNCE_S,
+    FAILSAFE_CHECK_INTERVAL_S,
+)
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = ROOT / "fastdds" / "action-server-liveness.xml"
@@ -26,7 +31,7 @@ def test_fastdds_profile_advertises_a_scoped_short_lease():
     lease = _duration(config.find("dds:leaseDuration", NS))
     announcement = _duration(config.find("dds:leaseAnnouncement", NS))
     assert 0 < announcement < lease <= 1.5
-    assert lease + 3.0 + 0.1 <= 5.0
+    assert lease + ACTION_SERVER_LIVENESS_DEBOUNCE_S + FAILSAFE_CHECK_INTERVAL_S <= 5.0
 
 
 def test_fastdds_profile_is_in_the_bridge_package():
