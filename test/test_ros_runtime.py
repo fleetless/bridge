@@ -2872,6 +2872,34 @@ def test_a_late_result_after_action_server_lost_is_silently_ignored():
     assert leftover is None  # no further frame for job-1
 
 
+def test_terminal_result_unavailable_settles_once_and_ignores_a_late_result():
+    async def body(rt):
+        rt.jobs.start("job-1", "count", "action")
+        rt._active_goals["job-1"] = object()
+        rt._reconciling["job-1"] = ["count", "goal-1", None, True]
+
+        rt._settle_terminal_result_unavailable("job-1", "count")
+        rt._settle_terminal_result_unavailable("job-1", "count")
+        update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+
+        class _FakeFuture:
+            def result(self):
+                raise AssertionError("a late result must not be read")
+
+        rt._on_action_result("job-1", "count", _FakeFuture())
+        await asyncio.sleep(0)
+        return update, rt.jobs.updates.try_get(), rt._active_goals, rt._reconciling
+
+    update, leftover, active_goals, reconciling = run(body)
+    assert update.state == "lost"
+    assert update.error[0] == "job_lost"
+    assert "terminal status" in update.error[1]
+    assert "result was unavailable" in update.error[1]
+    assert leftover is None
+    assert "job-1" not in active_goals
+    assert "job-1" not in reconciling
+
+
 def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job():
     """"server_is_ready() raising: treated as not-ready for the debounce,
     and logged once per job" (spec, "Error handling") — not once per tick,

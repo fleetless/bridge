@@ -1722,6 +1722,22 @@ def test_job_update_carries_a_code_and_message_on_failure():
     }
 
 
+def test_job_update_carries_job_lost_after_terminal_result_unavailable():
+    message = "a terminal status was observed, but its result was unavailable within the bounded wait"
+    payload = json.loads(
+        job_update_message(
+            "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
+            "count",
+            "lost",
+            error=("job_lost", message),
+            timestamp_ms=1786400000000,
+        )
+    )
+    validate_frame("bridge-job-update", payload)
+    assert payload["state"] == "lost"
+    assert payload["error"] == {"code": "job_lost", "message": message}
+
+
 def test_job_update_error_with_details_nests_it_inside_the_error_object():
     # a documented payload (job_queue_full's {limit, queued}) must ride inside
     # `error`, not as a sibling field and not folded into the message string.

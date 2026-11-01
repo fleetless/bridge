@@ -3638,15 +3638,27 @@ class RosRuntime:
             return None
         return float(value)
 
+    def _settle_terminal_result_unavailable(self, job_id: str, slug: str) -> None:
+        """Called after a terminal goal status outlasts the bounded result wait.
+
+        The status alone cannot establish the outcome. The caller owns the
+        observation and timer; this path records the loss only once.
+        """
+        if self.jobs.state_of(job_id) != "running":
+            return
+        self._active_goals.pop(job_id, None)
+        self._reconciling.pop(job_id, None)
+        self._emit_job(
+            job_id, slug, "lost",
+            error=("job_lost", "a terminal status was observed, but its result was unavailable within the bounded wait"),
+        )
+
     def _on_action_result(self, job_id: str, slug: str, future) -> None:
         self._active_goals.pop(job_id, None)
-        if job_id in self._server_lost_job_ids:
-            # This job's action server was already declared gone — the
-            # cloud was told `lost`/`action_server_lost` and the slug was
-            # freed for a new invoke. A result arriving after that is a
-            # late arrival that must be ignored — reporting anything here
-            # now would be a second, contradicting word about a job already
-            # settled, for a slug that may already be running something else.
+        if job_id in self._server_lost_job_ids or self.jobs.state_of(job_id) != "running":
+            # The job was already settled, whether by a vanished action
+            # server or by an unavailable terminal result. A late result
+            # must not contradict the terminal update already sent.
             return
         try:
             response = future.result()
