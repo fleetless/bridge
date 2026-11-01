@@ -3,7 +3,8 @@
 Plain file I/O, no ROS dependency, so it is easy to unit-test in
 isolation from `ros_runtime.py` (already 5000+ lines and
 executor-thread-sensitive) — this module only reads and writes one small
-JSON file.
+JSON file. A third element, when present, is the first observed terminal
+status as Unix seconds; legacy two-element entries remain readable.
 
 Written before a goal is sent, so a mapping entry always exists by the time
 there is anything to lose; removed once the job is terminal *and reported*.
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import pathlib
 from typing import Dict, Optional, Tuple
@@ -52,13 +54,8 @@ def mapping_path(directory: Optional[pathlib.Path] = None) -> pathlib.Path:
     return (directory if directory is not None else state_dir()) / _MAPPING_FILENAME
 
 
-def load_mapping(path: pathlib.Path) -> Dict[str, Tuple[str, str]]:
-    """`job_id -> (slug, goal_id)`, or `{}` if the file is missing, unreadable
-    or corrupt — matching the bridge's general "never crash the process
-    over housekeeping" posture. A malformed entry (wrong shape, wrong
-    types) is dropped individually rather than invalidating the whole
-    file: one bad line losing only itself is a smaller loss than one bad
-    line losing every other job's restart-survival too."""
+def _read_entries(path: pathlib.Path) -> dict:
+    """Read the shared goal-state file for either projection below."""
     try:
         with path.open("r", encoding="utf-8") as handle:
             raw = json.load(handle)
@@ -70,13 +67,23 @@ def load_mapping(path: pathlib.Path) -> Dict[str, Tuple[str, str]]:
     if not isinstance(raw, dict):
         log.warning("The goal-state mapping at %s is not a JSON object — starting empty", path)
         return {}
+    return raw
+
+
+def load_mapping(path: pathlib.Path) -> Dict[str, Tuple[str, str]]:
+    """`job_id -> (slug, goal_id)`, or `{}` if the file is missing, unreadable
+    or corrupt — matching the bridge's general "never crash the process
+    over housekeeping" posture. A malformed entry (wrong shape, wrong
+    types) is dropped individually rather than invalidating the whole
+    file: one bad line losing only itself is a smaller loss than one bad
+    line losing every other job's restart-survival too."""
     mapping: Dict[str, Tuple[str, str]] = {}
-    for job_id, entry in raw.items():
+    for job_id, entry in _read_entries(path).items():
         if (
             isinstance(job_id, str)
             and isinstance(entry, list)
-            and len(entry) == 2
-            and all(isinstance(x, str) and x for x in entry)
+            and len(entry) in (2, 3)
+            and all(isinstance(x, str) and x for x in entry[:2])
         ):
             mapping[job_id] = (entry[0], entry[1])
         else:
@@ -84,7 +91,25 @@ def load_mapping(path: pathlib.Path) -> Dict[str, Tuple[str, str]]:
     return mapping
 
 
-def save_mapping(path: pathlib.Path, mapping: Dict[str, Tuple[str, str]]) -> None:
+def _valid_observation(value: object) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and value > 0
+
+
+def load_terminal_observations(path: pathlib.Path) -> Dict[str, float]:
+    """Wall-clock first terminal observations for mapped own goals only."""
+    observations: Dict[str, float] = {}
+    for job_id, entry in _read_entries(path).items():
+        if (isinstance(job_id, str) and isinstance(entry, list) and len(entry) == 3
+                and all(isinstance(x, str) and x for x in entry[:2])
+                and _valid_observation(entry[2])):
+            observations[job_id] = float(entry[2])
+    return observations
+
+
+def save_mapping(
+    path: pathlib.Path, mapping: Dict[str, Tuple[str, str]],
+    terminal_observations: Optional[Dict[str, float]] = None,
+) -> None:
     """Atomic and durable: write to a temp file in the same directory,
     fsync it, `os.replace` it over the old file, then fsync the directory —
     a reader (this process's own next startup) never sees a half-written
@@ -99,7 +124,11 @@ def save_mapping(path: pathlib.Path, mapping: Dict[str, Tuple[str, str]]) -> Non
     executor thread."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
-    payload = {job_id: [slug, goal_id] for job_id, (slug, goal_id) in mapping.items()}
+    observations = terminal_observations or {}
+    payload = {
+        job_id: [slug, goal_id] + ([observations[job_id]] if job_id in observations else [])
+        for job_id, (slug, goal_id) in mapping.items()
+    }
     with tmp_path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle)
         handle.flush()

@@ -121,7 +121,9 @@ from unique_identifier_msgs.msg import UUID as RosUUID
 
 from fleetless_bridge import camera, camera_sources, introspection, live, params, sampling
 from fleetless_bridge.jobs import JobManager, JobUpdate
-from fleetless_bridge.goal_state import load_mapping, mapping_path, save_mapping
+from fleetless_bridge.goal_state import (
+    load_mapping, load_terminal_observations, mapping_path, save_mapping,
+)
 from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
@@ -892,7 +894,10 @@ class GoalTracker:
     existing send path tells this tracker which goal ids are its own, so
     the discovery loop (B2) does not mistake them for someone else's."""
 
-    def __init__(self, node, action_class: type, ros_name: str) -> None:
+    def __init__(
+        self, node, action_class: type, ros_name: str,
+        on_terminal_status: Optional[Callable[[str, float], None]] = None,
+    ) -> None:
         self._action_class = action_class
         self._ros_name = ros_name
         # goal_id (str) -> action_msgs.msg.GoalStatus.status (int), for
@@ -912,6 +917,7 @@ class GoalTracker:
         # First terminal status seen for an own goal. A later snapshot may
         # omit that goal, but its result can still be outstanding.
         self._terminal_seen_at: Dict[str, float] = {}
+        self._on_terminal_status = on_terminal_status
         # Goal ids `forget_own_goal` just dropped, until a status snapshot
         # names the goal ended or no longer names it — see there. A dict
         # used as an ordered set, capped at `_RECENTLY_OWN_LIMIT` (oldest
@@ -956,8 +962,11 @@ class GoalTracker:
         }
         now = time.monotonic()
         for goal_id, status in self._status.items():
-            if goal_id in self._own_job_ids and status in _TERMINAL_GOAL_STATUSES:
-                self._terminal_seen_at.setdefault(goal_id, now)
+            if (goal_id in self._own_job_ids and status in _TERMINAL_GOAL_STATUSES
+                    and goal_id not in self._terminal_seen_at):
+                self._terminal_seen_at[goal_id] = now
+                if self._on_terminal_status is not None:
+                    self._on_terminal_status(self._own_job_ids[goal_id], time.time())
         # Feedback is kept only for goals this snapshot names active:
         # `_feedback` is keyed by every goal id the feedback topic ever
         # named, external goals included, and nothing else ever forgets
@@ -1020,6 +1029,11 @@ class GoalTracker:
 
     def terminal_seen_at(self, goal_id: str) -> Optional[float]:
         return self._terminal_seen_at.get(goal_id)
+
+    def restore_terminal_seen_at(self, goal_id: str, observed_wall: float) -> None:
+        """Rebuild the monotonic deadline after a process restart."""
+        elapsed = max(0.0, time.time() - observed_wall)
+        self._terminal_seen_at.setdefault(goal_id, time.monotonic() - elapsed)
 
     def active_goal_ids(self) -> Set[str]:
         """Every goal `_action/status` currently names
@@ -1548,6 +1562,7 @@ class RosRuntime:
         # here; see `goal_state.py`'s own docstring for why an external
         # goal's restart-survival is not a promise this makes.
         self._goal_mapping: Dict[str, Tuple[str, str]] = {}
+        self._terminal_observations: Dict[str, float] = {}
         self._goal_mapping_path: Optional[pathlib.Path] = None
         # job_id -> (slug, goal_id): the persisted entries `start()` found,
         # registered as running jobs but not yet re-attached to their goal
@@ -1766,6 +1781,7 @@ class RosRuntime:
         # `_settle_unreconciled_goals`.
         self._goal_mapping_path = mapping_path(self._goal_state_dir_override)
         self._goal_mapping = load_mapping(self._goal_mapping_path)
+        self._terminal_observations = load_terminal_observations(self._goal_mapping_path)
         for job_id, (slug, goal_id) in self._goal_mapping.items():
             self.jobs.start(job_id, slug, "action")
             self._job_goal_ids[job_id] = goal_id
@@ -3022,7 +3038,9 @@ class RosRuntime:
         )
 
         client = ActionClient(self._node, action_class, cfg.ros_name)
-        tracker = GoalTracker(self._node, action_class, cfg.ros_name)
+        tracker = GoalTracker(
+            self._node, action_class, cfg.ros_name, self._record_terminal_observation,
+        )
         entry = _ActionEntry(
             ros_name=cfg.ros_name,
             type_name=cfg.type,
@@ -3066,6 +3084,9 @@ class RosRuntime:
             if self.jobs.state_of(job_id) != "running":
                 continue  # already settled, nothing left to re-attach
             entry.tracker.register_own_goal(goal_id, job_id)
+            observed_wall = self._terminal_observations.get(job_id)
+            if observed_wall is not None:
+                entry.tracker.restore_terminal_seen_at(goal_id, observed_wall)
             deadline = (
                 time.monotonic() + ACTION_SERVER_DISCOVERY_GRACE_S + ACTION_SERVER_LIVENESS_DEBOUNCE_S
             )
@@ -6574,6 +6595,12 @@ class RosRuntime:
 
     def _retire_goal_mapping(self, job_id: str) -> None:
         if self._goal_mapping.pop(job_id, None) is not None:
+            self._terminal_observations.pop(job_id, None)
+            self._save_goal_mapping()
+
+    def _record_terminal_observation(self, job_id: str, observed_wall: float) -> None:
+        if job_id in self._goal_mapping and job_id not in self._terminal_observations:
+            self._terminal_observations[job_id] = observed_wall
             self._save_goal_mapping()
 
     def _save_goal_mapping(self) -> None:
@@ -6591,7 +6618,7 @@ class RosRuntime:
         if self._goal_mapping_path is None:
             return
         try:
-            save_mapping(self._goal_mapping_path, self._goal_mapping)
+            save_mapping(self._goal_mapping_path, self._goal_mapping, self._terminal_observations)
         except OSError:
             now = time.monotonic()
             last = self._goal_mapping_error_logged_at
