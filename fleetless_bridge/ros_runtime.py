@@ -3085,6 +3085,9 @@ class RosRuntime:
           (its result request, already sent or sent as soon as the
           service matches, answers when the goal ends, however long that
           takes);
+        - disarms the old discovery deadline once a terminal status is
+          observed: the separate terminal-result bound now decides when
+          the missing result becomes `job_lost`;
         - otherwise, past the deadline — `ACTION_SERVER_DISCOVERY_GRACE_S`
           plus `ACTION_SERVER_LIVENESS_DEBOUNCE_S`, the bound a goal whose
           server was never seen ready gets — ends the job
@@ -3111,6 +3114,9 @@ class RosRuntime:
                         job_id, slug, future
                     ),
                 )
+            if entry.tracker.terminal_seen_at(goal_id) is not None:
+                record[2] = None
+                continue
             if deadline is None:
                 continue
             if goal_id in entry.tracker.active_goal_ids():
