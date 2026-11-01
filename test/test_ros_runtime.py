@@ -3202,6 +3202,30 @@ def _status_array(*entries):
     return msg
 
 
+def test_first_terminal_status_observation_survives_duplicate_and_missing_snapshots():
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        tracker = rt._actions["count"].tracker
+        first = "11111111-1111-4111-8111-111111111111"
+        second = "22222222-2222-4222-8222-222222222222"
+        tracker.register_own_goal(first, "job-1")
+        tracker.register_own_goal(second, "job-2")
+        tracker._on_status(_status_array(
+            (first, GoalStatus.STATUS_SUCCEEDED),
+            (second, GoalStatus.STATUS_EXECUTING),
+        ))
+        observed = tracker.terminal_seen_at(first)
+        assert observed is not None
+        assert tracker.terminal_seen_at(second) is None
+        tracker._on_status(_status_array((first, GoalStatus.STATUS_SUCCEEDED)))
+        tracker._on_status(_status_array((second, GoalStatus.STATUS_EXECUTING)))
+        assert tracker.terminal_seen_at(first) == observed
+        tracker.forget_own_goal(first)
+        assert tracker.terminal_seen_at(first) is None
+
+    run(body)
+
+
 def test_the_tracker_drops_feedback_of_goals_that_ended_or_left_the_status():
     """`_feedback` is keyed by every goal id the feedback topic ever
     named — external goals included, which nothing ever forgets
