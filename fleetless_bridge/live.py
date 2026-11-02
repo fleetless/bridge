@@ -408,7 +408,7 @@ class LivePublisher:
                 stun_servers = [
                     IceServer(urls=tuple(
                         url for url in server.urls
-                        if url.lower().startswith(("stun:", "stuns:"))
+                        if url.startswith("stun:")
                     ))
                     for server in join.ice_servers
                 ]
