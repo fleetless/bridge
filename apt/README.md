@@ -1,7 +1,7 @@
-# apt.fleetless.dev — the bridge's apt repository
+# registry.fleetless.dev/apt — the bridge's apt repository
 
 `ros-<distro>-fleetless-bridge` is published as a signed Debian package at
-`apt.fleetless.dev`, served over HTTPS and managed with
+`registry.fleetless.dev/apt`, served over HTTPS and managed with
 [reprepro](https://salsa.debian.org/debian/reprepro). The component is `main`
 and the package is `Architecture: all` — one build serves amd64 and arm64.
 
@@ -25,9 +25,9 @@ change together, and nothing else does:
 
 ```sh
 export ROS_DISTRO=humble          # or jazzy, or lyrical
-curl -fsSL https://apt.fleetless.dev/key.gpg \
+curl -fsSL https://registry.fleetless.dev/apt/key.gpg \
   | sudo tee /usr/share/keyrings/fleetless.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/fleetless.gpg] https://apt.fleetless.dev $ROS_DISTRO main" \
+echo "deb [signed-by=/usr/share/keyrings/fleetless.gpg] https://registry.fleetless.dev/apt $ROS_DISTRO main" \
   | sudo tee /etc/apt/sources.list.d/fleetless.list
 sudo apt update && sudo apt install "ros-$ROS_DISTRO-fleetless-bridge"
 ```
@@ -122,8 +122,8 @@ re-signed and not changed.
 ### Asking a served repository whether the suites are right
 
 ```sh
-./apt/check-suites.sh https://apt.fleetless.dev
-./apt/check-suites.sh https://apt.fleetless.dev --require-published
+./apt/check-suites.sh https://registry.fleetless.dev/apt
+./apt/check-suites.sh https://registry.fleetless.dev/apt --require-published
 ```
 
 It reads each `dists/<suite>/main/binary-<arch>/Packages` and requires the
