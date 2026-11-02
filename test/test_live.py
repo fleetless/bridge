@@ -20,7 +20,9 @@ import traceback
 import numpy as np
 import pytest
 from aioice import stun
+from aiortc import RTCIceServer
 from aiortc.mediastreams import MediaStreamError
+from aiortc.rtcicetransport import connection_kwargs
 
 from fleetless_bridge.camera import LatestFrameHolder
 from fleetless_bridge.live import (
@@ -28,6 +30,7 @@ from fleetless_bridge.live import (
     CameraTrack,
     LivePublisher,
     LiveStartError,
+    _default_connection_factory,
 )
 from fleetless_bridge.livekit_signal import IceServer, JoinInfo
 
@@ -372,6 +375,15 @@ def test_turn_fallback_reports_second_failure_and_tears_down(second_failure, err
     (JoinInfo(ice_servers=(IceServer(urls=(
         "turn:turn.example:3478", "https://other.example/ice",
     )),)), _turn_failure()),
+    (JoinInfo(ice_servers=(IceServer(urls=(
+        "turn:turn.example:3478", "stuns:secure.example:5349",
+    )),)), _turn_failure()),
+    (JoinInfo(ice_servers=(IceServer(urls=(
+        "turn:turn.example:3478", "STUN:stun.example:3478",
+    )),)), _turn_failure()),
+    (JoinInfo(ice_servers=(IceServer(urls=(
+        "turn:turn.example:3478", "STUNS:secure.example:5349",
+    )),)), _turn_failure()),
 ])
 def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure):
     async def scenario():
@@ -389,14 +401,17 @@ def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure
     assert signal.close_calls == 1
 
 
-def test_turn_fallback_keeps_only_stun_and_stuns_from_mixed_ice_urls():
+def test_turn_fallback_keeps_only_usable_stun_from_mixed_ice_urls():
     async def scenario():
         join = JoinInfo(ice_servers=(
             IceServer(urls=(
                 "turn:turn.example:3478", "https://other.example/ice",
                 "stun:stun.example:3478",
             )),
-            IceServer(urls=("STUNS:secure.example:5349", "ftp://other.example/ice")),
+            IceServer(urls=(
+                "stuns:secure.example:5349", "STUN:upper.example:3478",
+                "STUNS:upper.example:5349", "ftp://other.example/ice",
+            )),
         ))
         signal = _FakeSignal(join=join)
         first = _FakeConnection(fail_local=_turn_failure())
@@ -408,8 +423,22 @@ def test_turn_fallback_keeps_only_stun_and_stuns_from_mixed_ice_urls():
 
     second = asyncio.run(scenario())
     assert [url for server in second.ice_servers for url in server.urls] == [
-        "stun:stun.example:3478", "STUNS:secure.example:5349",
+        "stun:stun.example:3478",
     ]
+
+    # Exercise the same aiortc parser and peer factory that production uses.
+    # A fake peer alone accepts schemes that aiortc ignores or rejects.
+    rtc_servers = [RTCIceServer(urls=list(server.urls)) for server in second.ice_servers]
+    assert connection_kwargs(rtc_servers)["stun_server"] == ("stun.example", 3478)
+
+    async def real_peer():
+        pc = _default_connection_factory(second.ice_servers)
+        try:
+            pc.addTrack(CameraTrack(64, 48, 10))
+        finally:
+            await pc.close()
+
+    asyncio.run(real_peer())
 
 
 def test_turn_fallback_logs_timeout_without_credentials():
