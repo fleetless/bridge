@@ -1851,8 +1851,8 @@ def test_asset_progress_message_carries_structured_failed_entries():
         bridge_asset_progress_message(
             "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", 2, 3,
             [
-                ("package://pkg/gone.stl", "unresolvable", None),
-                ("package://pkg/here.stl", "upload_failed", None),
+                ("package://pkg/gone.stl", "unresolvable", None, None),
+                ("package://pkg/here.stl", "upload_failed", None, None),
             ],
             "finished",
         )
@@ -1890,6 +1890,7 @@ def test_asset_progress_message_carries_the_store_numbers_on_a_refusal():
                         "used_bytes": 900000000,
                         "size_bytes": 193886766,
                     },
+                    None,
                 ),
             ],
             "running",
@@ -1906,6 +1907,24 @@ def test_asset_progress_message_carries_the_store_numbers_on_a_refusal():
                 "size_bytes": 193886766,
             },
         }
+    ]
+
+
+def test_asset_progress_message_carries_file_limit_on_only_the_matching_refusal():
+    payload = json.loads(bridge_asset_progress_message(
+        "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", 2, 2,
+        [
+            ("package://pkg/huge.stl", "refused", None,
+             {"max_bytes": 1000000000, "size_bytes": None}),
+            ("package://pkg/other.stl", "refused", None, None),
+        ],
+        "finished",
+    ))
+    validate_frame("bridge-asset-progress", payload)
+    assert payload["failed"] == [
+        {"reference": "package://pkg/huge.stl", "kind": "refused", "details": None,
+         "file_limit": {"max_bytes": 1000000000, "size_bytes": None}},
+        {"reference": "package://pkg/other.stl", "kind": "refused", "details": None},
     ]
 
 

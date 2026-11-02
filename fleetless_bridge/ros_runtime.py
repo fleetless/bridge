@@ -136,6 +136,8 @@ from fleetless_bridge.protocol import (
     ASSET_FAILURE_KIND_REFUSED,
     ASSET_FAILURE_KIND_UNRESOLVABLE,
     ASSET_FAILURE_KIND_UPLOAD_FAILED,
+    AssetFailureTuple,
+    FileLimit,
     CAMERA_STATE_CAUSE_COMMAND,
     CAMERA_STATE_CAUSE_CONFIG_CHANGE,
     CAMERA_STATE_CAUSE_LIVE_LOST,
@@ -1206,28 +1208,28 @@ class UploadResult(NamedTuple):
     failure would tell a reconciliation to retry something that will be
     refused again. Filling in numbers to avoid the empty case would be
     inventing them; the contract allows a bare `refused` for exactly this.
-    A `413 file_too_large` is the same: `refused=True, details=None`, since
-    the file is too large on its own and `details` carries only the store's
-    numbers.
+    A readable `413 file_too_large` uses `file_limit` for the cloud's
+    per-file numbers; `details` still carries only store numbers.
     """
 
     ok: bool
     refused: bool = False
     details: Optional[Dict[str, int]] = None
+    file_limit: Optional[FileLimit] = None
 
 
-def _upload_failure(result: UploadResult) -> Tuple[str, Optional[Dict[str, int]]]:
-    """The `(kind, details)` an unsuccessful `UploadResult` is reported as.
+def _upload_failure(result: UploadResult) -> Tuple[str, Optional[Dict[str, int]], Optional[FileLimit]]:
+    """The `(kind, details, file_limit)` an unsuccessful upload reports.
 
     One place, because both upload sites — a top-level mesh and a
     `.dae`-internal texture — have to classify the same outcome the same
     way, and they used to do it with a bool each and no classification at
     all."""
     if result.refused:
-        return ASSET_FAILURE_KIND_REFUSED, result.details
+        return ASSET_FAILURE_KIND_REFUSED, result.details, result.file_limit
     # The bytes exist and resolved; the transfer itself is what did not
     # succeed — transient, and the asset is still wanted.
-    return ASSET_FAILURE_KIND_UPLOAD_FAILED, None
+    return ASSET_FAILURE_KIND_UPLOAD_FAILED, None, None
 
 
 @dataclass(frozen=True)
@@ -1303,12 +1305,13 @@ class AssetProgress:
     URI — each frame is a self-consistent snapshot of the whole sync so
     far, not a delta a receiver has to fold together correctly itself.
 
-    `failed` entries are `(reference, kind, details)` triples, not bare
+    `failed` entries are `(reference, kind, details, file_limit)` entries, not bare
     strings — `kind` is one of the `ASSET_FAILURE_KIND_*` constants in
     `protocol.py`, and `details` is non-`None` on exactly one case: an
     `ASSET_FAILURE_KIND_REFUSED` entry the robot's asset store had no room
     for, carrying the cloud's own `{"store_bytes", "used_bytes",
-    "size_bytes"}`. Six producers used to write three different facts into
+    "size_bytes"}`. `file_limit` carries only a readable Cloud 413 limit.
+    Six producers used to write three different facts into
     a flat list of strings indistinguishably; see `_run_asset_sync`'s own
     call sites for which producer emits which kind and why.
 
@@ -1321,7 +1324,7 @@ class AssetProgress:
     sync_id: str
     done: int
     total: int
-    failed: Tuple[Tuple[str, str, Optional[Dict[str, int]]], ...]
+    failed: Tuple[AssetFailureTuple, ...]
     state: str
 
 
@@ -5427,7 +5430,7 @@ class RosRuntime:
         # `kind` is one of `ASSET_FAILURE_KIND_*` (protocol.py); only
         # `ASSET_FAILURE_KIND_UNRESOLVABLE` may ever be treated as "this
         # reference is gone for good" by a reconciliation.
-        failed: List[Tuple[str, str, Optional[Dict[str, int]]]] = []
+        failed: List[AssetFailureTuple] = []
         # Provisional until the pre-scan below finalises them — correct
         # even if the exception guard fires mid-pre-scan, since nothing
         # from the pre-scan has been promised to the cloud in a `report()`
@@ -5481,7 +5484,8 @@ class RosRuntime:
             )
 
         def record_failure(
-            reference: str, kind: str, details: Optional[Dict[str, int]] = None
+            reference: str, kind: str, details: Optional[Dict[str, int]] = None,
+            file_limit: Optional[FileLimit] = None,
         ) -> None:
             # appends to `failed`, respecting `MESH_MAX_FAILED_PER_
             # SYNC`. Once the ceiling is hit, every further failure
@@ -5502,7 +5506,7 @@ class RosRuntime:
             # frame, not a promise every individual fact survives it.
             nonlocal mesh_failed_count, mesh_failure_overflow_reported
             if mesh_failed_count < MESH_MAX_FAILED_PER_SYNC:
-                failed.append((reference, kind, details))
+                failed.append((reference, kind, details, file_limit))
                 mesh_failed_count += 1
             elif not mesh_failure_overflow_reported:
                 failed.append((
@@ -5510,6 +5514,7 @@ class RosRuntime:
                     "or upload in this sync — additional failures are not "
                     "listed individually".format(MESH_MAX_FAILED_PER_SYNC),
                     ASSET_FAILURE_KIND_REFUSED,
+                    None,
                     None,
                 ))
                 mesh_failure_overflow_reported = True
@@ -5661,8 +5666,8 @@ class RosRuntime:
                     # stands a real chance of delivering it. `_upload_
                     # failure` tells a store refusal from a transfer that
                     # did not succeed.
-                    kind, details = _upload_failure(urdf_result)
-                    failed.append((URDF_ASSET_NAME, kind, details))
+                    kind, details, file_limit = _upload_failure(urdf_result)
+                    failed.append((URDF_ASSET_NAME, kind, details, file_limit))
             else:
                 # An asset_request should not normally arrive with no URDF
                 # ever detected (availability reporting tells the cloud one exists at
@@ -5676,7 +5681,7 @@ class RosRuntime:
                 log.warning(
                     "asset_request for sync %r arrived with no URDF cached to send", sync_id
                 )
-                failed.append((URDF_ASSET_NAME, ASSET_FAILURE_KIND_UPLOAD_FAILED, None))
+                failed.append((URDF_ASSET_NAME, ASSET_FAILURE_KIND_UPLOAD_FAILED, None, None))
             remaining.pop(0)
             done += 1
             report()
@@ -5761,7 +5766,7 @@ class RosRuntime:
                             if texture_name in refused_sentinels
                             else ASSET_FAILURE_KIND_UNRESOLVABLE
                         )
-                        failed.append((texture_name, failure_kind, None))
+                        failed.append((texture_name, failure_kind, None, None))
                     else:
                         # A `.dae`-internal texture is read and uploaded
                         # the same way as a top-level mesh, through the
@@ -5777,8 +5782,8 @@ class RosRuntime:
                             texture_name, "texture", texture_media_type, texture_path, texture_size,
                         )
                         if not texture_result.ok:
-                            kind, details = _upload_failure(texture_result)
-                            failed.append((texture_name, kind, details))
+                            kind, details, file_limit = _upload_failure(texture_result)
+                            failed.append((texture_name, kind, details, file_limit))
                     remaining.pop(0)
                     done += 1
                     report()
@@ -6115,34 +6120,36 @@ class RosRuntime:
         forever for a file that can never fit.
 
         `file_too_large` (`413`) is one file over the cloud's per-file limit.
-        It is logged with that limit, and its `details` stay `None`: the
-        sync result's `details` carry the store's three numbers and nothing
-        else, so a file that is too large on its own is a bare `refused`."""
+        It is logged with that limit and carries the cloud's numbers in
+        `file_limit`. `details` remains reserved for store refusals."""
         body = RosRuntime._refusal_body(exc)
-        limit = RosRuntime._file_limit(body)
-        if limit is not None:
-            max_bytes, size_bytes = limit
-            if size_bytes is None:
-                log.warning(
-                    "Asset upload for %r refused: it is over the cloud's %d-byte "
-                    "limit for one file. Nothing about retrying changes that",
-                    name, max_bytes,
-                )
-            else:
-                log.warning(
-                    "Asset upload for %r refused: %d bytes is over the cloud's "
-                    "%d-byte limit for one file. Nothing about retrying changes that",
-                    name, size_bytes, max_bytes,
-                )
-            return UploadResult(False, refused=True, details=None)
-        details = RosRuntime._store_numbers(body)
-        if details is None and exc.code == 413:
+        if exc.code == 413:
+            limit = RosRuntime._file_limit(body)
+            if limit is not None:
+                max_bytes, size_bytes = limit
+                if size_bytes is None:
+                    log.warning(
+                        "Asset upload for %r refused: it is over the cloud's %d-byte "
+                        "limit for one file. Nothing about retrying changes that",
+                        name, max_bytes,
+                    )
+                else:
+                    log.warning(
+                        "Asset upload for %r refused: %d bytes is over the cloud's "
+                        "%d-byte limit for one file. Nothing about retrying changes that",
+                        name, size_bytes, max_bytes,
+                    )
+                return UploadResult(False, refused=True, file_limit={
+                    "max_bytes": max_bytes, "size_bytes": size_bytes,
+                })
             log.warning(
                 "Asset upload for %r refused: the cloud would not accept a "
                 "body that large. Nothing about retrying changes that",
                 name,
             )
-        elif details is None:
+            return UploadResult(False, refused=True)
+        details = RosRuntime._store_numbers(body)
+        if details is None:
             log.warning(
                 "Asset upload for %r refused (HTTP %d): the refusal did not "
                 "say how much of the robot's asset store is left",
@@ -6166,7 +6173,9 @@ class RosRuntime:
         total because the body can be read only once, and two readers each
         want a different part of it."""
         try:
-            raw = exc.read(ASSET_REFUSAL_BODY_MAX_BYTES)
+            raw = exc.read(ASSET_REFUSAL_BODY_MAX_BYTES + 1)
+            if len(raw) > ASSET_REFUSAL_BODY_MAX_BYTES:
+                return None
             body = json.loads(raw.decode("utf-8"))
         except Exception:  # noqa: BLE001 - any unreadable body means "it did not say"
             return None

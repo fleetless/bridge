@@ -873,6 +873,7 @@ def test_file_too_large_logs_the_size_and_the_limit_and_carries_no_details():
     })
     result, messages = _refusal_messages(lambda: RosRuntime._refused("package://arm/huge.stl", exc))
     assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert result.file_limit == {"max_bytes": 1000000000, "size_bytes": 1400000000}
     assert messages == [
         "Asset upload for 'package://arm/huge.stl' refused: 1400000000 bytes is over the "
         "cloud's 1000000000-byte limit for one file. Nothing about retrying changes that"
@@ -885,6 +886,7 @@ def test_file_too_large_without_a_size_logs_the_limit_only():
     exc = _FakeRefusal(413, {"code": "file_too_large", "details": {"max_bytes": 1000000000, "size_bytes": None}})
     result, messages = _refusal_messages(lambda: RosRuntime._refused("robot_description", exc))
     assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert result.file_limit == {"max_bytes": 1000000000, "size_bytes": None}
     assert messages == [
         "Asset upload for 'robot_description' refused: it is over the cloud's "
         "1000000000-byte limit for one file. Nothing about retrying changes that"
@@ -898,6 +900,7 @@ def test_file_too_large_with_an_unreadable_limit_falls_back_to_the_bare_413_sent
     exc = _FakeRefusal(413, {"code": "file_too_large", "details": {"max_bytes": max_bytes, "size_bytes": 5}})
     result, messages = _refusal_messages(lambda: RosRuntime._refused("x", exc))
     assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert result.file_limit is None
     assert messages == [
         "Asset upload for 'x' refused: the cloud would not accept a body that large. "
         "Nothing about retrying changes that"
@@ -909,6 +912,7 @@ def test_a_bare_413_keeps_the_old_sentence():
 
     result, messages = _refusal_messages(lambda: RosRuntime._refused("x", _FakeRefusal(413, b"")))
     assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert result.file_limit is None
     assert messages == [
         "Asset upload for 'x' refused: the cloud would not accept a body that large. "
         "Nothing about retrying changes that"
@@ -921,6 +925,7 @@ def test_a_409_store_refusal_keeps_its_three_numbers():
     exc = _FakeRefusal(409, {"details": {"store_bytes": 1000, "used_bytes": 999, "size_bytes": 200}})
     result, messages = _refusal_messages(lambda: RosRuntime._refused("x", exc))
     assert result.details == {"store_bytes": 1000, "used_bytes": 999, "size_bytes": 200}
+    assert result.file_limit is None
     assert messages == [
         "Asset upload for 'x' refused: 200 bytes does not fit the robot's 1000-byte asset store, 999 of which is in use"
     ]
@@ -939,3 +944,19 @@ def test_the_urdf_upload_path_reports_file_too_large_as_a_refusal():
     finally:
         stop()
     assert (result.ok, result.refused, result.details) == (False, True, None)
+    assert result.file_limit == {"max_bytes": 1000000000, "size_bytes": 1400000000}
+
+
+@pytest.mark.parametrize("body", [
+    b"{not-json",
+    {"code": "quota_exceeded", "details": {"max_bytes": 1000, "size_bytes": 2000}},
+    {"code": "file_too_large", "details": {"max_bytes": 1000, "size_bytes": 2000},
+     "padding": "x" * (64 * 1024)},
+])
+def test_unreadable_413_never_exposes_file_limit(body):
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    result = RosRuntime._refused("package://arm/huge.stl", _FakeRefusal(413, body))
+    assert result.refused is True
+    assert result.details is None
+    assert result.file_limit is None

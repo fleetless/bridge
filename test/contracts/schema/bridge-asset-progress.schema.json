@@ -40,10 +40,10 @@
               "upload_failed",
               "refused"
             ],
-            "description": "Why it failed. `unresolvable` means the reference names nothing the producer can find or may read, and is **permanent** — the only kind reconciliation may treat as gone. `upload_failed` means the bytes exist and the transfer did not succeed, and `refused` means it was never attempted, either because the robot's asset store had no room — then `details` carries the three numbers — or because a producer-side ceiling was hit."
+            "description": "Why it failed. `unresolvable` means the reference names nothing the producer can find or may read, and is **permanent** — the only kind reconciliation may treat as gone. `upload_failed` means the bytes exist and the transfer did not succeed. `refused` means the store or per-file limit refused the upload, or the producer did not examine the reference; it remains transient for reconciliation."
           },
           "details": {
-            "description": "The three numbers behind a `refused` entry the robot's store had no room for, and absent for every other kind — a forced `null` on every `unresolvable` entry buys nothing. A `refused` entry may also carry no details: the producer's own ceiling is the other half of that kind, and no store number describes it.",
+            "description": "The three numbers behind a `refused` entry the robot's store had no room for. Absent for every other kind and exclusive with `file_limit`; a forced `null` on every other entry buys nothing.",
             "anyOf": [
               {
                 "type": "object",
@@ -77,11 +77,90 @@
                 "type": "null"
               }
             ]
+          },
+          "file_limit": {
+            "description": "The enforced per-file limit and refused file size, if known, for a `refused` upload that received `413 file_too_large`. Exclusive with store-full `details`; absent on bare refusals and every other kind.",
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "max_bytes": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991,
+                    "description": "The most one asset file can be, in bytes: `ASSET_FILE_MAX_BYTES`, the same on every plan."
+                  },
+                  "size_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "description": "The refused file's size, in bytes: the announced size, or the bytes that arrived when none (or a false one) was announced; `null` only when the body limit stopped the upload and nobody counted the bytes."
+                  }
+                },
+                "required": [
+                  "max_bytes",
+                  "size_bytes"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
           "reference",
           "kind"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "details": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "details"
+              ]
+            },
+            "then": {
+              "properties": {
+                "kind": {
+                  "const": "refused"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "file_limit": {
+                  "type": "object"
+                }
+              },
+              "required": [
+                "file_limit"
+              ]
+            },
+            "then": {
+              "properties": {
+                "kind": {
+                  "const": "refused"
+                },
+                "details": {
+                  "type": "null"
+                }
+              }
+            }
+          }
         ]
       }
     },

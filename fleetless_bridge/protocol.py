@@ -63,7 +63,15 @@ import pathlib
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, TypedDict, Union
+
+
+class FileLimit(TypedDict):
+    max_bytes: int
+    size_bytes: Optional[int]
+
+
+AssetFailureTuple = Tuple[str, str, Optional[Dict[str, int]], Optional[FileLimit]]
 
 # Read from the vendored contracts constants, not typed here: until 2026-09
 # the `2` was a literal on both sides of the wire and one test stood between
@@ -1123,11 +1131,11 @@ def bridge_asset_progress_message(
     sync_id: str,
     done: int,
     total: int,
-    failed: Sequence[Tuple[str, str, Optional[Dict[str, int]]]],
+    failed: Sequence[AssetFailureTuple],
     state: str,
 ) -> str:
     """How far a sync got, and — required, not optional — what it could not
-    do. `failed` carries `(reference, kind, details)` triples, not bare
+    do. `failed` carries `(reference, kind, details, file_limit)` entries, not bare
     strings and not bare pairs: a sync that quietly drops three meshes and
     reports success moves the failure into somebody else's renderer, where it
     shows up as a robot with missing limbs and no cause — and *why* it wasn't
@@ -1148,8 +1156,8 @@ def bridge_asset_progress_message(
     arrived. This bridge cannot derive any of them — it does not know what
     the robot's other assets already cost — so a refusal it could not read
     reports `refused` with no details rather than a number it made up.
-    A `file_too_large` refusal is `refused` with `None`: the limit is in
-    the bridge's log, not on the wire.
+    A readable `file_too_large` refusal is `refused` with `file_limit` set
+    from the cloud's response. Other entries omit that key.
 
     `state` is `'running' | 'finished' | 'refused_busy'` — three values
     because a plain `finished: bool` had nowhere to put a refusal. A second
@@ -1167,8 +1175,9 @@ def bridge_asset_progress_message(
             "done": done,
             "total": total,
             "failed": [
-                {"reference": reference, "kind": kind, "details": details}
-                for reference, kind, details in failed
+                {"reference": reference, "kind": kind, "details": details,
+                 **({"file_limit": file_limit} if file_limit is not None else {})}
+                for reference, kind, details, file_limit in failed
             ],
             "state": state,
         }

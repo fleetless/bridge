@@ -95,22 +95,18 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@9.1.0
-            at commit 7da5f385125f38eb3aae6e1c34332f5071518692 (tag v9.1.0)
+    Source: @fleetless/contracts@11.0.0 (unreleased issue/191-too-large-entry branch)
+            at commit 7638fd337112a36c15c5fd6f8a07318ed9e86b84
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-Compared with the 8.1.0 bytes this pin replaces, only
-`schema/cloud-config.schema.json` differs: description text names the current
-MCP tools. The other twenty-seven input schemas, all fifteen outgoing schemas,
-and `constants.json` are byte-identical. `PROTOCOL_VERSION` stays 5 and
-`LATEST_BRIDGE_VERSION` stays `6.1.0`. The sync test compares against whatever
-`$FLEETLESS_CONTRACTS_DIR` points at and checks that tree's own version against
-this line, so only a checkout or tarball of 9.1.0 agrees with it.
-
-An **exact npm version**, not a git revision. The contracts package is
-published; a revision of the repository that produced it is not something a
-reader of this file can resolve, and two people reading "the current pin" a
-month apart have to end up with the same bytes.
+This is the source commit of fleetless/contracts#59, before its planned
+`11.1.0` release. Its package manifest still says `11.0.0`; the commit, not
+that manifest version, identifies the new artifacts. The only changed vendor
+files relative to the 9.1.0 pin are the input and outgoing
+`bridge-asset-progress.schema.json` files. `constants.json` is byte-identical.
+Re-vendor from the final contracts head before this Bridge PR is accepted if
+that head changes, and replace this branch pin with the published version
+after release.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
