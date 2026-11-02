@@ -95,15 +95,17 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@11.0.0 (unreleased issue/191-too-large-entry branch)
-            at commit 7638fd337112a36c15c5fd6f8a07318ed9e86b84
+    Source: @fleetless/contracts@12.0.0 (unreleased issue/191-too-large-entry branch)
+            at commit 6fa2878b2459bb7ebe5c76e9e309626d73ca7d91
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-This is the source commit of fleetless/contracts#59, before its planned
-`11.1.0` release. Its package manifest still says `11.0.0`; the commit, not
-that manifest version, identifies the new artifacts. The only changed vendor
-files relative to the 9.1.0 pin are the input and outgoing
-`bridge-asset-progress.schema.json` files. `constants.json` is byte-identical.
+This is the rebased source commit of fleetless/contracts#59, before its planned
+`12.1.0` release. Its package manifest still says `12.0.0`; the commit, not
+that manifest version, identifies the new artifacts. Its Bridge schemas and
+constants are byte-identical to the earlier source commit `7638fd3`.
+The only changed vendor files relative to the 9.1.0 pin are the input and
+outgoing `bridge-asset-progress.schema.json` files. `constants.json` is
+byte-identical.
 Re-vendor from the final contracts head before this Bridge PR is accepted if
 that head changes, and replace this branch pin with the published version
 after release.

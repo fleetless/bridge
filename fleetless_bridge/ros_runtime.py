@@ -6218,21 +6218,23 @@ class RosRuntime:
 
         Read from the body, not from a vendored constant: the cloud is what
         enforces the limit, and its answer names it. A `max_bytes` that is
-        not a positive integer makes the whole answer unreadable, so the
-        caller falls back to the bare-413 sentence. A `size_bytes` that is
-        not a positive integer reads as unknown, which is what the cloud
-        sends as `null` when the body limit stopped an upload with no size
-        announced."""
+        outside the contract's positive safe-integer range makes the whole
+        answer unreadable, so the caller falls back to the bare-413 sentence.
+        A `size_bytes` outside that range reads as unknown, which is what
+        the cloud sends as `null` when the body limit stopped an upload
+        with no size announced."""
         if body is None or body.get("code") != "file_too_large":
             return None
         details = body.get("details")
         if not isinstance(details, dict):
             return None
         max_bytes = details.get("max_bytes")
-        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        if (not isinstance(max_bytes, int) or isinstance(max_bytes, bool)
+                or not 0 < max_bytes <= (1 << 53) - 1):
             return None
         size_bytes = details.get("size_bytes")
-        if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
+        if (not isinstance(size_bytes, int) or isinstance(size_bytes, bool)
+                or not 0 < size_bytes <= (1 << 53) - 1):
             size_bytes = None
         return max_bytes, size_bytes
 
