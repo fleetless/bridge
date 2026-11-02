@@ -359,6 +359,7 @@ def test_turn_fallback_reports_second_failure_and_tears_down():
 @pytest.mark.parametrize("join, failure", [
     (_turn_join(), RuntimeError("not a TURN transaction")),
     (JoinInfo(ice_servers=(IceServer(urls=("stun:stun.example:3478",)),)), _turn_failure()),
+    (JoinInfo(ice_servers=(IceServer(urls=("turn:turn.example:3478",)),)), _turn_failure()),
 ])
 def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure):
     async def scenario():

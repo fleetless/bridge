@@ -404,7 +404,15 @@ class LivePublisher:
                     url for server in join.ice_servers for url in server.urls
                     if url.lower().startswith(("turn:", "turns:"))
                 ]
-                if not turn_urls:
+                stun_servers = [
+                    IceServer(urls=tuple(
+                        url for url in server.urls
+                        if not url.lower().startswith(("turn:", "turns:"))
+                    ))
+                    for server in join.ice_servers
+                ]
+                stun_servers = [server for server in stun_servers if server.urls]
+                if not turn_urls or not stun_servers:
                     raise
                 # The response reason is server text, not a safe exception
                 # message. Strip the URL query and every credential we know
@@ -427,18 +435,9 @@ class LivePublisher:
                     detail = detail.replace(value, "[redacted]")
                 log.warning("TURN gathering failed for %s (%s); retrying with STUN only",
                             turn_url, detail)
-                stun_servers = [
-                    IceServer(urls=tuple(
-                        url for url in server.urls
-                        if not url.lower().startswith(("turn:", "turns:"))
-                    ))
-                    for server in join.ice_servers
-                ]
                 self._pc = None
                 await pc.close()
-                pc = self._connection_factory([
-                    server for server in stun_servers if server.urls
-                ])
+                pc = self._connection_factory(stun_servers)
                 self._pc = pc
                 pc.on("connectionstatechange", lambda pc=pc: self._on_connection_state(pc))
                 self._sender = pc.addTrack(track)
