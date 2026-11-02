@@ -52,6 +52,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import cv2
+from aioice.stun import TransactionFailed, TransactionTimeout
 from aiortc import (
     RTCConfiguration,
     RTCIceServer,
@@ -381,7 +382,7 @@ class LivePublisher:
             # Bound to this connection rather than read off `self`: teardown
             # clears the attribute, and a handler that re-read it would report
             # an AttributeError instead of the state change it was called for.
-            pc.on("connectionstatechange", lambda: self._on_connection_state(pc))
+            pc.on("connectionstatechange", lambda pc=pc: self._on_connection_state(pc))
 
             track = self._track_factory(
                 self._width, self._height, self._fps, self._bitrate_kbps
@@ -396,7 +397,32 @@ class LivePublisher:
             self._track_sid = _published_track_sid(published)
 
             offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
+            try:
+                await pc.setLocalDescription(offer)
+            except (TransactionFailed, TransactionTimeout):
+                turn_urls = [
+                    url for server in join.ice_servers for url in server.urls
+                    if url.lower().startswith(("turn:", "turns:"))
+                ]
+                if not turn_urls:
+                    raise
+                stun_servers = [
+                    IceServer(urls=tuple(
+                        url for url in server.urls
+                        if not url.lower().startswith(("turn:", "turns:"))
+                    ))
+                    for server in join.ice_servers
+                ]
+                self._pc = None
+                await pc.close()
+                pc = self._connection_factory([
+                    server for server in stun_servers if server.urls
+                ])
+                self._pc = pc
+                pc.on("connectionstatechange", lambda pc=pc: self._on_connection_state(pc))
+                self._sender = pc.addTrack(track)
+                offer = await pc.createOffer()
+                await pc.setLocalDescription(offer)
             # Local candidates are not trickled: no aiortc version among the
             # three Ubuntu ships emits a per-candidate event, and
             # `setLocalDescription` returns only once gathering has finished,
@@ -442,6 +468,8 @@ class LivePublisher:
     # -- the two halves coming apart ---------------------------------------
 
     def _on_connection_state(self, pc) -> None:
+        if pc is not self._pc:
+            return
         state = pc.connectionState
         if state in ("failed", "closed"):
             self._on_room_disconnected("peer connection {}".format(state))

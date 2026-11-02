@@ -19,6 +19,7 @@ import traceback
 
 import numpy as np
 import pytest
+from aioice import stun
 from aiortc.mediastreams import MediaStreamError
 
 from fleetless_bridge.camera import LatestFrameHolder
@@ -66,7 +67,7 @@ class _FakeOffer:
 
 
 class _FakeConnection:
-    def __init__(self, *, ice_servers=(), fail_offer=False, sender=None):
+    def __init__(self, *, ice_servers=(), fail_offer=False, fail_local=None, sender=None):
         self.ice_servers = ice_servers
         self.added_tracks = []
         self.local_descriptions = []
@@ -77,6 +78,7 @@ class _FakeConnection:
         self.localDescription = _FakeOffer("v=0\r\nlocal-offer\r\n")
         self._handlers = {}
         self._fail_offer = fail_offer
+        self._fail_local = fail_local
         self.sender = sender if sender is not None else _FakeSender()
 
     def on(self, event, callback):
@@ -99,6 +101,8 @@ class _FakeConnection:
 
     async def setLocalDescription(self, description):
         self.local_descriptions.append(description)
+        if self._fail_local is not None:
+            raise self._fail_local
 
     async def setRemoteDescription(self, description):
         # The real one awaits I/O, which lets anything already queued on the
@@ -122,6 +126,7 @@ class _FakeConnection:
     async def close(self):
         self.close_calls += 1
         self.connectionState = "closed"
+        self.fire("connectionstatechange")
 
 
 class _FakeSignal:
@@ -214,8 +219,9 @@ def _publisher(signal, connection, track, **kwargs):
         return signal
 
     def connection_factory(ice_servers):
-        connection.ice_servers = tuple(ice_servers)
-        return connection
+        selected = connection.pop(0) if isinstance(connection, list) else connection
+        selected.ice_servers = tuple(ice_servers)
+        return selected
 
     def track_factory(width, height, fps, bitrate_kbps):
         if isinstance(track, Exception):
@@ -271,6 +277,63 @@ def _started(**kwargs):
 
 
 # --- start -------------------------------------------------------------------
+
+
+def _turn_failure(code=508, reason="Insufficient Capacity"):
+    response = stun.Message(
+        stun.Method.ALLOCATE, stun.Class.ERROR,
+        attributes={"ERROR-CODE": (code, reason)},
+    )
+    return stun.TransactionFailed(response)
+
+
+def _turn_join():
+    return JoinInfo(
+        room_sid="RM_1", room_name="room-1",
+        ice_servers=(
+            IceServer(urls=("stun:stun.example:3478",)),
+            IceServer(
+                urls=("turns:turn.example:443?transport=tcp", "stun:second.example:3478"),
+                username="test-user", credential="test-credential",
+            ),
+        ),
+    )
+
+
+def test_turn_fallback_reuses_session_and_track_without_reporting_loss():
+    async def scenario():
+        signal = _FakeSignal(join=_turn_join())
+        first = _FakeConnection(fail_local=_turn_failure())
+        second = _FakeConnection()
+        track = _FakeTrack()
+        lost = []
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(signal, [first, second], track, on_lost=lost.append)
+            await pub.start("wss://media.example", "room-1", "test-token")
+            first.connectionState = "failed"
+            first.fire("connectionstatechange")
+            before_stop = (signal.close_calls, lost[:], handler.messages[:])
+            await pub.stop()
+            return signal, first, second, track, before_stop
+        finally:
+            watched.removeHandler(handler)
+
+    signal, first, second, track, (signal_closes, lost, messages) = asyncio.run(scenario())
+    assert first.close_calls == 1
+    assert second.added_tracks == [track]
+    assert first.added_tracks == [track]
+    assert [url for server in second.ice_servers for url in server.urls] == [
+        "stun:stun.example:3478", "stun:second.example:3478",
+    ]
+    assert [call for call in signal.calls if isinstance(call, tuple) and call[0] == "add_track"] == [
+        ("add_track", "fake-track-id", "camera", 64, 48, 500_000),
+    ]
+    assert len([call for call in signal.calls if isinstance(call, tuple) and call[0] == "send_offer"]) == 1
+    assert signal.calls.count("connect") == 1
+    assert signal_closes == 0
+    assert lost == []
+    assert not any("disconnected unexpectedly" in message for message in messages)
 
 
 def test_start_joins_publishes_and_negotiates():
