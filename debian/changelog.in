@@ -1,3 +1,13 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.2.2-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(live): publish without TURN when relay allocation fails
+  * fix(live): redact TURN fallback diagnostics
+  * fix(live): skip TURN fallback without a STUN server
+  * fix(live): constrain TURN fallback diagnostics
+  * fix(live): require usable STUN scheme for TURN fallback
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Mon, 02 Nov 2026 18:07:40 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.2.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * fix(jobs): prepare job_lost result settlement
