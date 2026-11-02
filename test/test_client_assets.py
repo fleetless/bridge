@@ -185,7 +185,7 @@ def test_asset_progress_carries_the_failed_list_and_finished_state():
                 sync_id="3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f",
                 done=2,
                 total=2,
-                failed=(("package://foo/missing.stl", "unresolvable", None),),
+                failed=(("package://foo/missing.stl", "unresolvable", None, None),),
                 state="finished",
             )
         )
@@ -220,6 +220,7 @@ def test_asset_progress_carries_the_store_numbers_of_a_refusal():
                             "used_bytes": 900000000,
                             "size_bytes": 193886766,
                         },
+                        None,
                     ),
                 ),
                 state="running",

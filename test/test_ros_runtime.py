@@ -7898,7 +7898,7 @@ def test_sync_assets_applies_the_same_containment_check_to_a_texture():
             stop()
 
     received, updates = run(body)
-    assert updates[-1].failed == ((traversal_uri, "unresolvable", None),)
+    assert updates[-1].failed == ((traversal_uri, "unresolvable", None, None),)
     assert {r["headers"]["X-Fleetless-Asset-Name"] for r in received} == {URDF_ASSET_NAME}
     assert not any(b"root:" in r["body"] for r in received)
 
@@ -7982,6 +7982,36 @@ _STORE_REFUSAL_BODY = json.dumps({
     },
 }).encode("utf-8")
 
+_FILE_REFUSAL_BODY = json.dumps({
+    "code": "file_too_large",
+    "details": {"max_bytes": 1_000_000_000, "size_bytes": 1_005_000_000},
+}).encode("utf-8")
+
+
+@pytest.mark.parametrize("refused_name", [URDF_ASSET_NAME, _RESOLVABLE_MESH_URI])
+def test_file_refusal_preserves_the_urdf_or_mesh_reference_in_terminal_progress(refused_name):
+    def status_for(record):
+        if record["headers"]["X-Fleetless-Asset-Name"] == refused_name:
+            return 413, _FILE_REFUSAL_BODY
+        return 201
+
+    async def body(rt):
+        await _publish_urdf_and_wait(rt)
+        server, url, stop = _start_asset_upload_server()
+        server.status_for = status_for
+        try:
+            await rt.sync_assets("sync-1", url, "upload-tok", (_RESOLVABLE_MESH_URI,))
+            return await _drain_asset_progress_until(rt, {"finished"})
+        finally:
+            stop()
+
+    updates = run(body)
+    assert updates[-1].state == "finished"
+    assert updates[-1].failed == ((
+        refused_name, "refused", None,
+        {"max_bytes": 1_000_000_000, "size_bytes": 1_005_000_000},
+    ),)
+
 
 def test_a_store_refusal_becomes_a_refused_entry_carrying_the_three_numbers():
     """The bridge cannot compute any of these — it does not know what the
@@ -8017,7 +8047,7 @@ def test_a_store_refusal_becomes_a_refused_entry_carrying_the_three_numbers():
             "store_bytes": 1_000_000_000,
             "used_bytes": 999_999_000,
             "size_bytes": 193_886_766,
-        }),
+        }, None),
     )
     # It was attempted, unlike under the old ceiling: both names reached
     # the wire, and only the cloud decided which one it had room for.
@@ -8049,7 +8079,7 @@ def test_a_refusal_the_bridge_cannot_read_is_still_a_refusal():
             stop()
 
     updates = run(body)
-    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None),)
+    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None, None),)
 
 
 # --- a mesh is streamed, not buffered whole ---
@@ -8209,7 +8239,7 @@ def test_a_persistently_rate_limited_upload_gives_up_and_reports_failed():
 
     server, updates = run(body)
     assert updates[-1].state == "finished"
-    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "upload_failed", None),)
+    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "upload_failed", None, None),)
     # Bounded: the first attempt plus exactly the retry ceiling, never more.
     assert server.attempts[_RESOLVABLE_MESH_URI] == ASSET_UPLOAD_RATE_LIMIT_MAX_RETRIES + 1
 
@@ -8404,6 +8434,43 @@ def test_run_asset_sync_uploads_a_dae_internal_texture_and_totals_it_upfront():
     assert sum(1 for r in received if r["headers"]["X-Fleetless-Asset-Name"] == texture_name) == 1
 
 
+def test_dae_internal_texture_file_refusal_retains_its_reference():
+    dae_uri = "package://{}/meshes/arm.dae".format(_DAE_PACKAGE)
+    texture_name = "package://{}/meshes/textures/skin.png".format(_DAE_PACKAGE)
+    urdf = '<robot name="test"><link name="base"><visual><geometry><mesh filename="{}"/></geometry></visual></link></robot>'.format(dae_uri)
+
+    with tempfile.TemporaryDirectory() as tmp_path:
+        os.makedirs(os.path.join(tmp_path, "meshes", "textures"))
+        with open(os.path.join(tmp_path, "meshes", "arm.dae"), "w") as f:
+            f.write(_dae_with_init_from("textures/skin.png"))
+        with open(os.path.join(tmp_path, "meshes", "textures", "skin.png"), "wb") as f:
+            f.write(b"texture bytes")
+
+        def status_for(record):
+            if record["headers"]["X-Fleetless-Asset-Name"] == texture_name:
+                return 413, _FILE_REFUSAL_BODY
+            return 201
+
+        async def body(rt):
+            await _publish_urdf_and_wait(rt, text=urdf)
+            server, url, stop = _start_asset_upload_server()
+            server.status_for = status_for
+            try:
+                with _fake_share_dir_for(tmp_path):
+                    await rt.sync_assets("sync-1", url, "upload-tok", (dae_uri,))
+                    return await _drain_asset_progress_until(rt, {"finished"})
+            finally:
+                stop()
+
+        updates = run(body)
+
+    assert updates[-1].state == "finished"
+    assert updates[-1].failed == ((
+        texture_name, "refused", None,
+        {"max_bytes": 1_000_000_000, "size_bytes": 1_005_000_000},
+    ),)
+
+
 # --- the contained-but-not-normal case -----------
 #
 # The happy-path test above and the browser fixture both hardcoded
@@ -8577,7 +8644,7 @@ def test_run_asset_sync_refuses_a_dae_internal_traversal():
     assert not any(b"root:" in r["body"] for r in received)
     assert updates[-1].total == 3  # urdf + mesh + the (failed) reference — no longer silently dropped
     assert updates[-1].done == 3
-    assert updates[-1].failed == ((expected_failed_name, "unresolvable", None),)
+    assert updates[-1].failed == ((expected_failed_name, "unresolvable", None, None),)
 
 
 def test_run_asset_sync_reports_a_dae_internal_reference_to_a_missing_file_as_failed():
@@ -8624,7 +8691,7 @@ def test_run_asset_sync_reports_a_dae_internal_reference_to_a_missing_file_as_fa
     # Same shape the traversal case produces — the `kind` field makes that sameness
     # explicit: both are `unresolvable`, and `failed` cannot be used to
     # tell an attack from a typo.
-    assert updates[-1].failed == ((expected_failed_name, "unresolvable", None),)
+    assert updates[-1].failed == ((expected_failed_name, "unresolvable", None, None),)
 
 
 def test_run_asset_sync_uploads_a_dae_with_no_internal_textures_normally():
@@ -8878,7 +8945,7 @@ def test_run_asset_sync_refuses_a_dae_with_too_many_internal_references():
     assert updates[-1].done == 3
     # `refused`: never attempted, not confirmed missing — the ceiling
     # fired before any of the five references was individually examined.
-    assert updates[-1].failed == ((expected_sentinel, "refused", None),)
+    assert updates[-1].failed == ((expected_sentinel, "refused", None, None),)
     # The mesh itself is unaffected — still requested and uploaded, only its
     # internal references were refused as a block.
     assert {r["headers"]["X-Fleetless-Asset-Name"] for r in received} == {URDF_ASSET_NAME, dae_uri}
@@ -8950,7 +9017,7 @@ def test_run_asset_sync_caps_dae_references_across_the_whole_sync():
     # failed, simply never looked at.
     assert updates[-1].total == 7
     assert updates[-1].done == 7
-    assert updates[-1].failed == ((expected_sentinel, "refused", None),)
+    assert updates[-1].failed == ((expected_sentinel, "refused", None, None),)
 
     uploaded_names = {r["headers"]["X-Fleetless-Asset-Name"] for r in received}
     assert uploaded_names == {
@@ -9004,10 +9071,10 @@ def test_run_asset_sync_caps_mesh_level_failures_across_the_whole_sync():
     assert updates[-1].total == 6
     assert updates[-1].done == 6
     assert updates[-1].failed == (
-        (unresolvable_uris[0], "unresolvable", None),
-        (unresolvable_uris[1], "unresolvable", None),
-        (unresolvable_uris[2], "unresolvable", None),
-        (expected_sentinel, "refused", None),
+        (unresolvable_uris[0], "unresolvable", None, None),
+        (unresolvable_uris[1], "unresolvable", None, None),
+        (unresolvable_uris[2], "unresolvable", None, None),
+        (expected_sentinel, "refused", None, None),
     )
     # Nothing but the URDF itself ever uploaded — every mesh reference was
     # unresolvable from the start.
@@ -9059,10 +9126,10 @@ def test_run_asset_sync_exception_guard_shares_the_mesh_failure_budget():
     assert updates[-1].total == 5
     assert updates[-1].done == 5
     assert updates[-1].failed == (
-        (unresolvable_uris[0], "unresolvable", None),
-        (unresolvable_uris[1], "unresolvable", None),
-        (resolvable_uris[0], "refused", None),
-        (expected_sentinel, "refused", None),
+        (unresolvable_uris[0], "unresolvable", None, None),
+        (unresolvable_uris[1], "unresolvable", None, None),
+        (resolvable_uris[0], "refused", None, None),
+        (expected_sentinel, "refused", None, None),
     )
     # Only the URDF ever uploaded — the exception fired on the very first
     # resolvable mesh, before its own upload could be counted as sent, and
@@ -9138,9 +9205,9 @@ def test_dae_per_file_sentinels_share_the_sync_wide_reference_ceiling():
     # the shared overflow sentinel instead of its own, d3 and d4 are never
     # examined at all (sync_budget_exhausted short-circuits them).
     assert updates[-1].failed == (
-        (expected_per_file_sentinel.format(dae_uris[0]), "refused", None),
-        (expected_per_file_sentinel.format(dae_uris[1]), "refused", None),
-        (expected_overflow_sentinel, "refused", None),
+        (expected_per_file_sentinel.format(dae_uris[0]), "refused", None, None),
+        (expected_per_file_sentinel.format(dae_uris[1]), "refused", None, None),
+        (expected_overflow_sentinel, "refused", None, None),
     )
     # Every mesh itself still uploaded -- only the internal-reference scan
     # was refused, never the mesh file the scan runs against.
@@ -9166,9 +9233,9 @@ def test_terminal_frame_stays_schema_valid_at_the_combined_ceiling():
     the actual wire JSON `bridge_asset_progress_message` produces against
     the vendored schema. Not that the count is right: that the thing
     actually crosses the wire."""
-    failed = [(URDF_ASSET_NAME, "upload_failed", None)]
+    failed = [(URDF_ASSET_NAME, "upload_failed", None, None)]
     failed.extend(
-        ("package://pkg/mesh-{}.stl".format(i), "unresolvable", None)
+        ("package://pkg/mesh-{}.stl".format(i), "unresolvable", None, None)
         for i in range(MESH_MAX_FAILED_PER_SYNC)
     )
     failed.append((
@@ -9177,9 +9244,10 @@ def test_terminal_frame_stays_schema_valid_at_the_combined_ceiling():
         .format(MESH_MAX_FAILED_PER_SYNC),
         "refused",
         None,
+        None,
     ))
     failed.extend(
-        ("package://pkg/part-{}.dae#texture-{}.png".format(i // 10, i), "unresolvable", None)
+        ("package://pkg/part-{}.dae#texture-{}.png".format(i // 10, i), "unresolvable", None, None)
         for i in range(DAE_MAX_INTERNAL_REFERENCES_PER_SYNC)
     )
     failed.append((
@@ -9187,6 +9255,7 @@ def test_terminal_frame_stays_schema_valid_at_the_combined_ceiling():
         "sync limit at package://pkg/part-last.dae — the rest were not "
         "enumerated".format(DAE_MAX_INTERNAL_REFERENCES_PER_SYNC),
         "refused",
+        None,
         None,
     ))
     total = len(failed)
@@ -9242,7 +9311,7 @@ def test_sync_assets_reports_an_unresolvable_mesh_as_failed_without_uploading_it
 
     received, updates = run(body)
     assert updates[-1].failed == (
-        ("package://this_package_does_not_exist_xyz/foo.stl", "unresolvable", None),
+        ("package://this_package_does_not_exist_xyz/foo.stl", "unresolvable", None, None),
     )
     assert updates[-1].done == updates[-1].total == 2
     # Only the URDF was actually uploaded — no attempt for a URI that never resolved.
@@ -9266,7 +9335,7 @@ def test_sync_assets_reports_a_resolved_but_missing_file_as_failed():
             stop()
 
     updates = run(body)
-    assert updates[-1].failed == (("package://example_interfaces/no_such_file.stl", "unresolvable", None),)
+    assert updates[-1].failed == (("package://example_interfaces/no_such_file.stl", "unresolvable", None, None),)
 
 
 # --- Security: package:// path traversal ---------------------
@@ -9411,7 +9480,7 @@ def test_sync_assets_never_reads_or_uploads_a_traversal_target():
             stop()
 
     received, updates = run(body)
-    assert updates[-1].failed == ((traversal_uri, "unresolvable", None),)
+    assert updates[-1].failed == ((traversal_uri, "unresolvable", None, None),)
     # Only the URDF was uploaded — no request was ever made for the
     # traversal target, under its requested name or any other.
     assert {r["headers"]["X-Fleetless-Asset-Name"] for r in received} == {URDF_ASSET_NAME}
@@ -9430,7 +9499,7 @@ def test_sync_assets_reports_a_server_error_as_failed():
 
     updates = run(body)
     # `upload_failed`: the mesh resolved; the server refused it.
-    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "upload_failed", None),)
+    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "upload_failed", None, None),)
     assert updates[-1].done == updates[-1].total == 2  # attempted and counted, not skipped
 
 
@@ -9467,7 +9536,7 @@ def test_sync_assets_with_no_urdf_ever_seen_reports_it_failed():
     # `upload_failed`: nothing was affirmatively determined absent —
     # a URDF simply hasn't arrived yet, not the same claim `unresolvable`
     # makes about a workspace file.
-    assert updates[-1].failed == ((URDF_ASSET_NAME, "upload_failed", None),)
+    assert updates[-1].failed == ((URDF_ASSET_NAME, "upload_failed", None, None),)
     assert updates[-1].total == 1
 
 
@@ -9556,7 +9625,7 @@ def test_an_unexpected_exception_mid_sync_still_reports_a_terminal_frame():
     # "never attempted, nothing known missing" is exactly the meaning
     # this kind already carries, reused deliberately rather than guessing
     # between the other two.
-    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None),)
+    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None, None),)
 
 
 def test_an_exception_before_any_item_is_attempted_still_reports_every_item_failed():
@@ -9579,7 +9648,7 @@ def test_an_exception_before_any_item_is_attempted_still_reports_every_item_fail
     assert updates[-1].state == "finished"
     assert updates[-1].done == updates[-1].total == 2
     assert set(updates[-1].failed) == {
-        (URDF_ASSET_NAME, "refused", None), (_RESOLVABLE_MESH_URI, "refused", None),
+        (URDF_ASSET_NAME, "refused", None, None), (_RESOLVABLE_MESH_URI, "refused", None, None),
     }
 
 
@@ -9666,7 +9735,7 @@ def test_a_bare_413_is_a_refusal_not_a_transfer_failure():
             stop()
 
     updates = run(body)
-    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None),)
+    assert updates[-1].failed == ((_RESOLVABLE_MESH_URI, "refused", None, None),)
 
 
 # --- the .dae scan cap ---------------------------------------------------
