@@ -893,7 +893,7 @@ def test_file_too_large_without_a_size_logs_the_limit_only():
     ]
 
 
-@pytest.mark.parametrize("max_bytes", ["1000000000", True, -1, 0, 1.5, None])
+@pytest.mark.parametrize("max_bytes", ["1000000000", True, -1, 0, 1.5, None, 9007199254740992])
 def test_file_too_large_with_an_unreadable_limit_falls_back_to_the_bare_413_sentence(max_bytes):
     from fleetless_bridge.ros_runtime import RosRuntime
 
@@ -905,6 +905,28 @@ def test_file_too_large_with_an_unreadable_limit_falls_back_to_the_bare_413_sent
         "Asset upload for 'x' refused: the cloud would not accept a body that large. "
         "Nothing about retrying changes that"
     ]
+
+
+def test_file_too_large_accepts_the_contract_maximum_with_unknown_size():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    exc = _FakeRefusal(413, {
+        "code": "file_too_large",
+        "details": {"max_bytes": 9007199254740991, "size_bytes": None},
+    })
+    result = RosRuntime._refused("x", exc)
+    assert result.file_limit == {"max_bytes": 9007199254740991, "size_bytes": None}
+
+
+def test_file_too_large_treats_a_size_beyond_the_contract_range_as_unknown():
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    exc = _FakeRefusal(413, {
+        "code": "file_too_large",
+        "details": {"max_bytes": 1000000000, "size_bytes": 9007199254740992},
+    })
+    result = RosRuntime._refused("x", exc)
+    assert result.file_limit == {"max_bytes": 1000000000, "size_bytes": None}
 
 
 def test_a_bare_413_keeps_the_old_sentence():
