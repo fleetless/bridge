@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -407,32 +408,42 @@ class LivePublisher:
                 stun_servers = [
                     IceServer(urls=tuple(
                         url for url in server.urls
-                        if not url.lower().startswith(("turn:", "turns:"))
+                        if url.lower().startswith(("stun:", "stuns:"))
                     ))
                     for server in join.ice_servers
                 ]
                 stun_servers = [server for server in stun_servers if server.urls]
                 if not turn_urls or not stun_servers:
                     raise
-                # The response reason is server text, not a safe exception
-                # message. Strip the URL query and every credential we know
-                # before letting either reach a log record.
+                # The server controls the reason text and the TURN URL. Keep
+                # only a safe address and a validated code in the warning.
                 sensitive = [token] + [
                     value for server in join.ice_servers
                     for value in (server.username, server.credential)
                     if value
                 ]
                 turn_url = turn_urls[0].partition("?")[0]
+                if re.fullmatch(
+                    r"turns?:[A-Za-z0-9.:\[\]-]+", turn_url, re.IGNORECASE
+                ) is None:
+                    turn_url = "[redacted]"
                 if isinstance(exc, TransactionTimeout):
                     detail = "timed out"
                 else:
-                    code, reason = exc.response.attributes.get(
-                        "ERROR-CODE", ("unknown", "no reason")
+                    error_code = exc.response.attributes.get("ERROR-CODE")
+                    code = (
+                        error_code[0]
+                        if isinstance(error_code, tuple) and len(error_code) == 2
+                        else None
                     )
-                    detail = "{} - {}".format(code, reason)
+                    if type(code) is int and 300 <= code <= 699:
+                        detail = "{} - {}".format(
+                            code, "Insufficient Capacity" if code == 508 else "TURN error"
+                        )
+                    else:
+                        detail = "unknown TURN error"
                 for value in sensitive:
                     turn_url = turn_url.replace(value, "[redacted]")
-                    detail = detail.replace(value, "[redacted]")
                 log.warning("TURN gathering failed for %s (%s); retrying with STUN only",
                             turn_url, detail)
                 self._pc = None
