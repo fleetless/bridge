@@ -27,7 +27,9 @@ from fleetless_bridge.protocol import (
     DatapointConfig,
     DatapointNumeric,
     RetentionConfig,
+    bridge_asset_progress_message,
 )
+from schemas import validate_frame
 
 
 def _dp(slug, *, rate_throttle_hz=None, keep=False, retention=None):
@@ -927,6 +929,42 @@ def test_file_too_large_treats_a_size_beyond_the_contract_range_as_unknown():
     })
     result = RosRuntime._refused("x", exc)
     assert result.file_limit == {"max_bytes": 1000000000, "size_bytes": None}
+
+
+@pytest.mark.parametrize(
+    ("max_bytes", "size_bytes", "expected_file_limit"),
+    [
+        (9007199254740991, None, {"max_bytes": 9007199254740991, "size_bytes": None}),
+        (9007199254740992, None, None),
+        (1000000000, 9007199254740991,
+         {"max_bytes": 1000000000, "size_bytes": 9007199254740991}),
+        (1000000000, 9007199254740992,
+         {"max_bytes": 1000000000, "size_bytes": None}),
+    ],
+)
+def test_file_limit_progress_frame_obeys_the_vendored_outgoing_schema(
+    max_bytes, size_bytes, expected_file_limit,
+):
+    from fleetless_bridge.ros_runtime import RosRuntime, _upload_failure
+
+    refusal = _FakeRefusal(413, {
+        "code": "file_too_large",
+        "details": {"max_bytes": max_bytes, "size_bytes": size_bytes},
+    })
+    failure = _upload_failure(RosRuntime._refused("package://arm/huge.stl", refusal))
+    payload = json.loads(bridge_asset_progress_message(
+        "3f1e9a2c-6d4b-4f0a-9c8e-1b2a3c4d5e6f", 0, 1,
+        [("package://arm/huge.stl", *failure)], "finished",
+    ))
+
+    validate_frame("bridge-asset-progress", payload)
+    failed = payload["failed"][0]
+    assert failed["kind"] == "refused"
+    assert failed["details"] is None
+    if expected_file_limit is None:
+        assert "file_limit" not in failed
+    else:
+        assert failed["file_limit"] == expected_file_limit
 
 
 def test_a_bare_413_keeps_the_old_sentence():
