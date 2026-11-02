@@ -399,13 +399,34 @@ class LivePublisher:
             offer = await pc.createOffer()
             try:
                 await pc.setLocalDescription(offer)
-            except (TransactionFailed, TransactionTimeout):
+            except (TransactionFailed, TransactionTimeout) as exc:
                 turn_urls = [
                     url for server in join.ice_servers for url in server.urls
                     if url.lower().startswith(("turn:", "turns:"))
                 ]
                 if not turn_urls:
                     raise
+                # The response reason is server text, not a safe exception
+                # message. Strip the URL query and every credential we know
+                # before letting either reach a log record.
+                sensitive = [token] + [
+                    value for server in join.ice_servers
+                    for value in (server.username, server.credential)
+                    if value
+                ]
+                turn_url = turn_urls[0].partition("?")[0]
+                if isinstance(exc, TransactionTimeout):
+                    detail = "timed out"
+                else:
+                    code, reason = exc.response.attributes.get(
+                        "ERROR-CODE", ("unknown", "no reason")
+                    )
+                    detail = "{} - {}".format(code, reason)
+                for value in sensitive:
+                    turn_url = turn_url.replace(value, "[redacted]")
+                    detail = detail.replace(value, "[redacted]")
+                log.warning("TURN gathering failed for %s (%s); retrying with STUN only",
+                            turn_url, detail)
                 stun_servers = [
                     IceServer(urls=tuple(
                         url for url in server.urls

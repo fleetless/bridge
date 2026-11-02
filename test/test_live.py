@@ -336,6 +336,97 @@ def test_turn_fallback_reuses_session_and_track_without_reporting_loss():
     assert not any("disconnected unexpectedly" in message for message in messages)
 
 
+def test_turn_fallback_reports_second_failure_and_tears_down():
+    async def scenario():
+        signal = _FakeSignal(join=_turn_join())
+        first = _FakeConnection(fail_local=_turn_failure())
+        second = _FakeConnection(fail_local=RuntimeError("test-token must stay private"))
+        pub = _publisher(signal, [first, second], _FakeTrack())
+        token = "test-token"
+        with pytest.raises(LiveStartError, match=r"\(RuntimeError\)") as caught:
+            await pub.start("wss://media.example", "room-1", token)
+        return first, second, signal, caught.value
+
+    first, second, signal, error = asyncio.run(scenario())
+    assert first.close_calls == 1
+    assert second.close_calls == 1
+    assert signal.close_calls == 1
+    assert "test-token" not in "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+
+
+@pytest.mark.parametrize("join, failure", [
+    (_turn_join(), RuntimeError("not a TURN transaction")),
+    (JoinInfo(ice_servers=(IceServer(urls=("stun:stun.example:3478",)),)), _turn_failure()),
+])
+def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure):
+    async def scenario():
+        signal = _FakeSignal(join=join)
+        first = _FakeConnection(fail_local=failure)
+        second = _FakeConnection()
+        pub = _publisher(signal, [first, second], _FakeTrack())
+        with pytest.raises(LiveStartError):
+            await pub.start("wss://media.example", "room-1", "test-token")
+        return first, second, signal
+
+    first, second, signal = asyncio.run(scenario())
+    assert first.close_calls == 1
+    assert second.close_calls == 0
+    assert signal.close_calls == 1
+
+
+def test_turn_fallback_logs_timeout_without_credentials():
+    async def scenario():
+        signal = _FakeSignal(join=_turn_join())
+        first = _FakeConnection(fail_local=stun.TransactionTimeout())
+        second = _FakeConnection()
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(signal, [first, second], _FakeTrack())
+            await pub.start("wss://media.example", "room-1", "test-token")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    messages = asyncio.run(scenario())
+    warnings = [message for message in messages if "TURN" in message]
+    assert len(warnings) == 1
+    assert "timed out" in warnings[0]
+    assert "turns:turn.example:443" in warnings[0]
+    assert not any(secret in "".join(messages) for secret in (
+        "test-user", "test-credential", "test-token", "transport=tcp",
+    ))
+
+
+def test_turn_fallback_logs_code_and_redacts_reason_and_url_query():
+    async def scenario():
+        signal = _FakeSignal(join=_turn_join())
+        first = _FakeConnection(fail_local=_turn_failure(
+            reason="Insufficient Capacity test-user test-credential test-token"
+        ))
+        second = _FakeConnection()
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(signal, [first, second], _FakeTrack())
+            await pub.start("wss://media.example", "room-1", "test-token")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    messages = asyncio.run(scenario())
+    warnings = [message for message in messages if "TURN" in message]
+    assert len(warnings) == 1
+    assert "508" in warnings[0]
+    assert "turns:turn.example:443" in warnings[0]
+    assert "Insufficient Capacity" in warnings[0]
+    assert not any(secret in "".join(messages) for secret in (
+        "test-user", "test-credential", "test-token", "transport=tcp",
+    ))
+
+
 def test_start_joins_publishes_and_negotiates():
     async def scenario():
         pub, signal, connection, track = _started()
