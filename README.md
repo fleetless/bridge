@@ -46,15 +46,15 @@ before a robot running it would need a second year of updates.
 
 ## 📥 Install
 
-The package is served signed from `apt.fleetless.dev`, one suite per
+The package is served signed from `registry.fleetless.dev/apt`, one suite per
 distribution. Substitute your own distribution for `humble`; the suite and the
 package name change together, and nothing else does.
 
 ```sh
 export ROS_DISTRO=humble          # or jazzy, or lyrical
-curl -fsSL https://apt.fleetless.dev/key.gpg \
+curl -fsSL https://registry.fleetless.dev/apt/key.gpg \
   | sudo tee /usr/share/keyrings/fleetless.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/fleetless.gpg] https://apt.fleetless.dev $ROS_DISTRO main" \
+echo "deb [signed-by=/usr/share/keyrings/fleetless.gpg] https://registry.fleetless.dev/apt $ROS_DISTRO main" \
   | sudo tee /etc/apt/sources.list.d/fleetless.list
 sudo apt update && sudo apt install "ros-$ROS_DISTRO-fleetless-bridge"
 ```
