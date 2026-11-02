@@ -336,21 +336,30 @@ def test_turn_fallback_reuses_session_and_track_without_reporting_loss():
     assert not any("disconnected unexpectedly" in message for message in messages)
 
 
-def test_turn_fallback_reports_second_failure_and_tears_down():
+@pytest.mark.parametrize("second_failure, error_type", [
+    (RuntimeError("test-token must stay private"), "RuntimeError"),
+    (_turn_failure(), "TransactionFailed"),
+    (stun.TransactionTimeout(), "TransactionTimeout"),
+])
+def test_turn_fallback_reports_second_failure_and_tears_down(second_failure, error_type):
     async def scenario():
         signal = _FakeSignal(join=_turn_join())
         first = _FakeConnection(fail_local=_turn_failure())
-        second = _FakeConnection(fail_local=RuntimeError("test-token must stay private"))
-        pub = _publisher(signal, [first, second], _FakeTrack())
+        second = _FakeConnection(fail_local=second_failure)
+        connections = [first, second]
+        track = _FakeTrack()
+        pub = _publisher(signal, connections, track)
         token = "test-token"
-        with pytest.raises(LiveStartError, match=r"\(RuntimeError\)") as caught:
+        with pytest.raises(LiveStartError, match=rf"\({error_type}\)") as caught:
             await pub.start("wss://media.example", "room-1", token)
-        return first, second, signal, caught.value
+        return first, second, signal, track, connections, caught.value
 
-    first, second, signal, error = asyncio.run(scenario())
+    first, second, signal, track, connections, error = asyncio.run(scenario())
     assert first.close_calls == 1
     assert second.close_calls == 1
     assert signal.close_calls == 1
+    assert track.stop_calls == 1
+    assert connections == []
     assert "test-token" not in "".join(
         traceback.format_exception(type(error), error, error.__traceback__)
     )
@@ -360,6 +369,9 @@ def test_turn_fallback_reports_second_failure_and_tears_down():
     (_turn_join(), RuntimeError("not a TURN transaction")),
     (JoinInfo(ice_servers=(IceServer(urls=("stun:stun.example:3478",)),)), _turn_failure()),
     (JoinInfo(ice_servers=(IceServer(urls=("turn:turn.example:3478",)),)), _turn_failure()),
+    (JoinInfo(ice_servers=(IceServer(urls=(
+        "turn:turn.example:3478", "https://other.example/ice",
+    )),)), _turn_failure()),
 ])
 def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure):
     async def scenario():
@@ -375,6 +387,29 @@ def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure
     assert first.close_calls == 1
     assert second.close_calls == 0
     assert signal.close_calls == 1
+
+
+def test_turn_fallback_keeps_only_stun_and_stuns_from_mixed_ice_urls():
+    async def scenario():
+        join = JoinInfo(ice_servers=(
+            IceServer(urls=(
+                "turn:turn.example:3478", "https://other.example/ice",
+                "stun:stun.example:3478",
+            )),
+            IceServer(urls=("STUNS:secure.example:5349", "ftp://other.example/ice")),
+        ))
+        signal = _FakeSignal(join=join)
+        first = _FakeConnection(fail_local=_turn_failure())
+        second = _FakeConnection()
+        pub = _publisher(signal, [first, second], _FakeTrack())
+        await pub.start("wss://media.example", "room-1", "test-token")
+        await pub.stop()
+        return second
+
+    second = asyncio.run(scenario())
+    assert [url for server in second.ice_servers for url in server.urls] == [
+        "stun:stun.example:3478", "STUNS:secure.example:5349",
+    ]
 
 
 def test_turn_fallback_logs_timeout_without_credentials():
@@ -405,7 +440,8 @@ def test_turn_fallback_logs_code_and_redacts_reason_and_url_query():
     async def scenario():
         signal = _FakeSignal(join=_turn_join())
         first = _FakeConnection(fail_local=_turn_failure(
-            reason="Insufficient Capacity test-user test-credential test-token"
+            reason="test-user test-credential test-token "
+            "test%2Duser test%2Dcredential test%2Dtoken\nFORGED LOG LINE"
         ))
         second = _FakeConnection()
         handler, watched = _capturing()
@@ -425,7 +461,62 @@ def test_turn_fallback_logs_code_and_redacts_reason_and_url_query():
     assert "Insufficient Capacity" in warnings[0]
     assert not any(secret in "".join(messages) for secret in (
         "test-user", "test-credential", "test-token", "transport=tcp",
+        "test%2Duser", "test%2Dcredential", "test%2Dtoken", "FORGED LOG LINE",
     ))
+    assert "\n" not in warnings[0]
+
+
+def test_turn_fallback_rejects_untrusted_error_code():
+    async def scenario():
+        signal = _FakeSignal(join=_turn_join())
+        first = _FakeConnection(fail_local=_turn_failure(
+            code="508\nFORGED LOG LINE", reason="untrusted reason"
+        ))
+        second = _FakeConnection()
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(signal, [first, second], _FakeTrack())
+            await pub.start("wss://media.example", "room-1", "test-token")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    messages = asyncio.run(scenario())
+    warnings = [message for message in messages if "TURN" in message]
+    assert len(warnings) == 1
+    assert "unknown TURN error" in warnings[0]
+    assert "FORGED LOG LINE" not in "\n".join(messages)
+    assert "untrusted reason" not in "\n".join(messages)
+    assert "\n" not in warnings[0]
+
+
+def test_turn_fallback_redacts_unsafe_turn_address():
+    async def scenario():
+        join = JoinInfo(ice_servers=(
+            IceServer(urls=("stun:stun.example:3478",)),
+            IceServer(urls=(
+                "turns:test%2Dtoken.example:443?transport=tcp",
+            )),
+        ))
+        signal = _FakeSignal(join=join)
+        first = _FakeConnection(fail_local=_turn_failure())
+        second = _FakeConnection()
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(signal, [first, second], _FakeTrack())
+            await pub.start("wss://media.example", "room-1", "test-token")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    messages = asyncio.run(scenario())
+    warnings = [message for message in messages if "TURN" in message]
+    assert len(warnings) == 1
+    assert "[redacted]" in warnings[0]
+    assert "test%2Dtoken" not in "\n".join(messages)
+    assert "transport=tcp" not in "\n".join(messages)
 
 
 def test_start_joins_publishes_and_negotiates():
