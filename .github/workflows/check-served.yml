@@ -17,7 +17,7 @@ on:
         type: string
       base_url:
         description: the served repository
-        default: https://apt.fleetless.dev
+        default: https://registry.fleetless.dev/apt
         type: string
 
 permissions:

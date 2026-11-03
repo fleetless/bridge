@@ -14,7 +14,7 @@
 # `reprepro/conf/distributions` beside this script, and served over HTTP.
 #
 # The repository is a throwaway one this script creates and removes, signed
-# with a throwaway key. It cannot be run against apt.fleetless.dev and does not
+# with a throwaway key. It cannot be run against registry.fleetless.dev/apt and does not
 # try: that repository is signed by the apt publishing workflow, the one place
 # its key is decrypted. So the last mile -- that the served repository was
 # published to correctly -- is apt/check-served.sh, run against the served

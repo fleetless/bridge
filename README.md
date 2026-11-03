@@ -59,6 +59,10 @@ echo "deb [signed-by=/usr/share/keyrings/fleetless.gpg] https://registry.fleetle
 sudo apt update && sudo apt install "ros-$ROS_DISTRO-fleetless-bridge"
 ```
 
+If you already installed from `apt.fleetless.dev`, change only the URL in
+`/etc/apt/sources.list.d/fleetless.list` to `https://registry.fleetless.dev/apt`,
+then run `sudo apt-get update`. The signing key is unchanged.
+
 Every runtime dependency is an ordinary apt package, and nothing runs at
 install time. A suite carries only its own distribution's package, so a
 mismatched pair answers `Unable to locate package` rather than installing the

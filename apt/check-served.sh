@@ -3,8 +3,8 @@
 # Installs the package from a SERVED apt repository, the way a robot would:
 # one clean container per distribution.
 #
-#   ./apt/check-served.sh https://apt.fleetless.dev 3.1.0
-#   ./apt/check-served.sh https://apt.fleetless.dev 3.1.0 jazzy
+#   ./apt/check-served.sh https://registry.fleetless.dev/apt 3.1.0
+#   ./apt/check-served.sh https://registry.fleetless.dev/apt 3.1.0 jazzy
 #
 # apt/check-suites.sh reads the indices; this installs from them. In each
 # distribution's own `ros:<distro>` image:
