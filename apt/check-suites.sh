@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Asks a SERVED apt repository whether each declared suite is there and correct.
 #
-#   ./apt/check-suites.sh https://apt.fleetless.dev
-#   ./apt/check-suites.sh https://apt.fleetless.dev --require-published
+#   ./apt/check-suites.sh https://registry.fleetless.dev/apt
+#   ./apt/check-suites.sh https://registry.fleetless.dev/apt --require-published
 #
 # **`--local <basedir> --distro <name>` reads a reprepro basedir on disk
 # instead of asking a served URL**, for the ONE moment there is no served URL
@@ -13,7 +13,7 @@
 # probe); everything after that — the Package/Version comparison against
 # `debian/changelog.in`, and what counts as NOT PUBLISHED versus BROKEN — is
 # the same comparison, run once, so `publish-deb.sh` and a deployed
-# `apt.fleetless.dev` are never checked against two different ideas of
+# `registry.fleetless.dev/apt` are never checked against two different ideas of
 # "correct".
 #
 # The suites come from `reprepro/conf/distributions` beside this script, never
@@ -54,7 +54,7 @@
 # `--require-published` folds 2 into 1. Use it at release time, when publishing
 # IS the task; leave it off in anything that runs for another reason.
 #
-# **This reads indices, not a directory listing.** apt.fleetless.dev is served
+# **This reads indices, not a directory listing.** registry.fleetless.dev/apt is served
 # with `file_server browse`, so every path under it answers 200 with some HTML,
 # and a probe of `dists/<suite>/` cannot tell a published suite from a directory
 # the web server is happy to render. What a robot fetches is
@@ -206,7 +206,7 @@ fi
 # `-L --max-redirs 1` follows exactly one redirect (apt itself follows
 # redirects; a bare http:// probe or a fronting proxy answering 308 is not a
 # broken suite). More than one redirect is treated the same as no answer at
-# all -- it is not a shape apt.fleetless.dev is expected to need, and guessing
+# all -- it is not a shape registry.fleetless.dev/apt is expected to need, and guessing
 # how many hops are "still fine" is worse than refusing past the first.
 http_code() {
     local url=$1 code attempt

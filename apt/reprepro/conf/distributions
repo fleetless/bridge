@@ -1,4 +1,4 @@
-# The suites apt.fleetless.dev serves: one per ROS 2 distribution this package
+# The suites registry.fleetless.dev/apt serves: one per ROS 2 distribution this package
 # is built for, named after that distribution.
 #
 # **The suite name is the guarantee.** A robot's sources.list line names one

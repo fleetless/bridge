@@ -3,7 +3,7 @@
 
 `apt/reprepro/conf/distributions` is kept in git so the suite list,
 architectures and signing key fingerprint are reviewable. Nothing here talks
-to `apt.fleetless.dev`: what's checkable from a checkout is that the declared
+to `registry.fleetless.dev/apt`: what's checkable from a checkout is that the declared
 suites match the distribution table, the three stanzas differ only where
 they're supposed to, and `apt/publish-deb.sh` refuses to file a package into
 the wrong one.
