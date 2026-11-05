@@ -95,17 +95,18 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@12.0.0 (unreleased issue/191-too-large-entry branch)
-            at commit 6fa2878b2459bb7ebe5c76e9e309626d73ca7d91
+    Source: @fleetless/contracts@13.3.0 (unreleased feat/1050-org-roles branch)
+            at commit a4e2ec1d8edf44df69c4faa03e5dcbb5d9acc5cf
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-This is the rebased source commit of fleetless/contracts#59, before its planned
-`12.1.0` release. Its package manifest still says `12.0.0`; the commit, not
-that manifest version, identifies the new artifacts. Its Bridge schemas and
-constants are byte-identical to the earlier source commit `7638fd3`.
-The only changed vendor files relative to the 9.1.0 pin are the input and
-outgoing `bridge-asset-progress.schema.json` files. `constants.json` is
-byte-identical.
+This is the source commit of the contracts branch that adds organization roles
+to `fleetless.yaml`, before its planned `14.0.0` release. Its package manifest
+still says `13.3.0`; the commit, not that manifest version, identifies the new
+artifacts. The only vendored file that changed relative to the previous pin is
+`schema/cloud-config.schema.json`: every entry of `datapoints`, `actions`,
+`services`, `publishers` and `cameras` may carry `role`, and the document may
+carry an `access` section. The bridge reads neither and ignores them.
+Every other vendored schema and `constants.json` are byte-identical.
 Re-vendor from the final contracts head before this Bridge PR is accepted if
 that head changes, and replace this branch pin with the published version
 after release.

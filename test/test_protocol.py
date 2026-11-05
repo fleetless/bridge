@@ -1126,6 +1126,55 @@ def test_a_config_frame_with_only_the_format_version_still_validates():
     validate_frame("cloud-config", {"type": "config", "version": 1, "doc": _EMPTY_DOC})
 
 
+def test_a_config_document_carrying_role_and_access_validates_and_parses_unchanged():
+    """`role` and `access` say who may use an entry. The cloud enforces them
+    and sends the stored document as it is, so the bridge has to accept both
+    and read the rest exactly as if they were not there."""
+    with_roles = _config_frame(
+        datapoints={"battery_percentage": dict(_RAW_DATAPOINT, role="observe")},
+        services={"reset_odom": dict(_RAW_SERVICE, role=["admin"])},
+        access={
+            "assets": "observe",
+            "job_history": ["operate"],
+            "rules": [
+                {"match": "/arm/**", "role": "admin"},
+                {"match": "/diagnostics/*", "kinds": ["read"], "role": "wartung"},
+            ],
+        },
+    )
+    without = _config_frame(
+        datapoints={"battery_percentage": _RAW_DATAPOINT},
+        services={"reset_odom": _RAW_SERVICE},
+    )
+    validate_frame("cloud-config", with_roles)
+    parsed = parse_cloud_message(json.dumps(with_roles))
+    assert isinstance(parsed, Config)
+    assert parsed == parse_cloud_message(json.dumps(without))
+
+
+def test_a_role_on_an_entry_of_every_section_validates_and_parses_unchanged():
+    """Same promise, one entry in each of the five sections: none of them
+    may trip the parser or leak into what it returns."""
+    sections = {
+        "datapoints": {"battery_percentage": _RAW_DATAPOINT},
+        "actions": {"drive_to": _RAW_ACTION},
+        "services": {"reset_odom": _RAW_SERVICE},
+        "publishers": {"drive": _RAW_PUBLISHER},
+        "cameras": {"front_cam": _RAW_CAMERA},
+    }
+    with_roles = _config_frame(
+        **{
+            section: {slug: dict(raw, role=["operate", "wartung"]) for slug, raw in entries.items()}
+            for section, entries in sections.items()
+        }
+    )
+    without = _config_frame(**sections)
+    validate_frame("cloud-config", with_roles)
+    parsed = parse_cloud_message(json.dumps(with_roles))
+    assert isinstance(parsed, Config)
+    assert parsed == parse_cloud_message(json.dumps(without))
+
+
 def test_a_hello_frame_without_active_jobs_still_validates():
     """`active_jobs` is `.default([])` on the wire; the vendored schema
     used to publish it as `required` — the same `.default()`-trap the
