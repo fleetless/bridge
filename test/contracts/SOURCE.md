@@ -95,16 +95,21 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@12.0.0 (unreleased issue/191-too-large-entry branch)
-            at commit 6fa2878b2459bb7ebe5c76e9e309626d73ca7d91
+    Source: @fleetless/contracts@14.0.0 (unreleased feat/889-app-collections branch)
+            at commit 3926a4a6183f4c7a0cf650c25af08a63abf6b2c7
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-This is the rebased source commit of fleetless/contracts#59, before its planned
-`12.1.0` release. Its package manifest still says `12.0.0`; the commit, not
-that manifest version, identifies the new artifacts. Its Bridge schemas and
-constants are byte-identical to the earlier source commit `7638fd3`.
-The only changed vendor files relative to the 9.1.0 pin are the input and
-outgoing `bridge-asset-progress.schema.json` files. `constants.json` is
+This is the source commit of the contracts branch that adds app collections and
+removes the built-in `robot_details` datapoint, before its planned `14.0.0`
+release; the commit identifies the artifacts, and its package manifest already
+carries the release version. The branch also carries the organization roles
+change. The only vendored file that changed relative to the previous
+`12.0.0` pin is `schema/cloud-config.schema.json`: every entry of
+`datapoints`, `actions`, `services`, `publishers` and `cameras` may carry
+`role`, the document may carry an `access` section, and the slug descriptions
+of the five sections no longer name `robot_details` as built-in but list
+`assets` and `job_history` as reserved. The bridge reads none of this and
+ignores it. Every other vendored schema and `constants.json` are
 byte-identical.
 Re-vendor from the final contracts head before this Bridge PR is accepted if
 that head changes, and replace this branch pin with the published version
