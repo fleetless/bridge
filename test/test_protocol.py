@@ -1138,7 +1138,7 @@ def test_a_config_document_carrying_role_and_access_validates_and_parses_unchang
             "job_history": ["operate"],
             "rules": [
                 {"match": "/arm/**", "role": "admin"},
-                {"match": "/diagnostics/*", "kinds": ["read"], "role": "wartung"},
+                {"match": "/diagnostics/*", "kinds": ["read"], "role": "maintenance"},
             ],
         },
     )
@@ -1164,7 +1164,7 @@ def test_a_role_on_an_entry_of_every_section_validates_and_parses_unchanged():
     }
     with_roles = _config_frame(
         **{
-            section: {slug: dict(raw, role=["operate", "wartung"]) for slug, raw in entries.items()}
+            section: {slug: dict(raw, role=["operate", "maintenance"]) for slug, raw in entries.items()}
             for section, entries in sections.items()
         }
     )
