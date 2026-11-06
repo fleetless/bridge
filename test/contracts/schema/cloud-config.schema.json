@@ -398,6 +398,41 @@
                     }
                   }
                 ]
+              },
+              "role": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                    "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                      "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                    }
+                  }
+                ],
+                "defaultSnippets": [
+                  {
+                    "label": "one role",
+                    "description": "The role that may use this; a role that inherits from it may too.",
+                    "body": "${1:operate}"
+                  },
+                  {
+                    "label": "any of several roles",
+                    "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                    "body": [
+                      "${1:operate}",
+                      "${2:admin}"
+                    ]
+                  }
+                ],
+                "description": "Which role may read this datapoint: one role key, or a list of keys when several roles qualify. A role qualifies when it, or a role it inherits from, is named. Without this, the first rule of `access.rules` that fits the entry decides, and without a fitting rule the organization's default for `read` applies. A key that names no role of the organization is a warning when you publish, never an error, and grants nothing. The robot ignores it; the cloud enforces it."
               }
             },
             "required": [
@@ -442,7 +477,7 @@
               }
             ]
           },
-          "description": "Values the robot publishes, each one field of one topic or a whole topic, and **never several topics**. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
+          "description": "Values the robot publishes, each one field of one topic or a whole topic, and **never several topics**. Keys are slugs, one namespace across all five exposure sections, which is what lets an app lock name `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, `history` is reserved because `GET …/jobs/history` would shadow an action of that name, and `assets` and `job_history` are reserved because they name the robot-level capabilities; all five are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a datapoint",
@@ -671,6 +706,41 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 2000
+              },
+              "role": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                    "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                      "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                    }
+                  }
+                ],
+                "defaultSnippets": [
+                  {
+                    "label": "one role",
+                    "description": "The role that may use this; a role that inherits from it may too.",
+                    "body": "${1:operate}"
+                  },
+                  {
+                    "label": "any of several roles",
+                    "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                    "body": [
+                      "${1:operate}",
+                      "${2:admin}"
+                    ]
+                  }
+                ],
+                "description": "Which role may start this action: one role key, or a list of keys when several roles qualify. A role qualifies when it, or a role it inherits from, is named. Without this, the first rule of `access.rules` that fits the entry decides, and without a fitting rule the organization's default for `invoke` applies. A key that names no role of the organization is a warning when you publish, never an error, and grants nothing. The robot ignores it; the cloud enforces it."
               }
             },
             "required": [
@@ -690,7 +760,7 @@
               }
             ]
           },
-          "description": "Things the robot does on request that take time, each reported as a job with progress. **At most one job runs per action slug**: a second call is refused `busy`, and every observer of that slug watches the same job. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
+          "description": "Things the robot does on request that take time, each reported as a job with progress. **At most one job runs per action slug**: a second call is refused `busy`, and every observer of that slug watches the same job. Keys are slugs, one namespace across all five exposure sections, which is what lets an app lock name `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, `history` is reserved because `GET …/jobs/history` would shadow an action of that name, and `assets` and `job_history` are reserved because they name the robot-level capabilities; all five are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "an action",
@@ -892,6 +962,41 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 2000
+              },
+              "role": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                    "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                      "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                    }
+                  }
+                ],
+                "defaultSnippets": [
+                  {
+                    "label": "one role",
+                    "description": "The role that may use this; a role that inherits from it may too.",
+                    "body": "${1:operate}"
+                  },
+                  {
+                    "label": "any of several roles",
+                    "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                    "body": [
+                      "${1:operate}",
+                      "${2:admin}"
+                    ]
+                  }
+                ],
+                "description": "Which role may call this service: one role key, or a list of keys when several roles qualify. A role qualifies when it, or a role it inherits from, is named. Without this, the first rule of `access.rules` that fits the entry decides, and without a fitting rule the organization's default for `invoke` applies. A key that names no role of the organization is a warning when you publish, never an error, and grants nothing. The robot ignores it; the cloud enforces it."
               }
             },
             "required": [
@@ -911,7 +1016,7 @@
               }
             ]
           },
-          "description": "ROS service calls the robot answers — one request, one reply. Unlike an action a service reports **no progress** and the call returns with its result already on the job, so there is nothing left to observe; a second concurrent call is still refused `busy`, exactly as for an action. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
+          "description": "ROS service calls the robot answers — one request, one reply. Unlike an action a service reports **no progress** and the call returns with its result already on the job, so there is nothing left to observe; a second concurrent call is still refused `busy`, exactly as for an action. Keys are slugs, one namespace across all five exposure sections, which is what lets an app lock name `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, `history` is reserved because `GET …/jobs/history` would shadow an action of that name, and `assets` and `job_history` are reserved because they name the robot-level capabilities; all five are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a service",
@@ -1163,6 +1268,41 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 2000
+              },
+              "role": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                    "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                      "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                    }
+                  }
+                ],
+                "defaultSnippets": [
+                  {
+                    "label": "one role",
+                    "description": "The role that may use this; a role that inherits from it may too.",
+                    "body": "${1:operate}"
+                  },
+                  {
+                    "label": "any of several roles",
+                    "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                    "body": [
+                      "${1:operate}",
+                      "${2:admin}"
+                    ]
+                  }
+                ],
+                "description": "Which role may send to this publisher, which is what driving the robot is: one role key, or a list of keys when several roles qualify. A role qualifies when it, or a role it inherits from, is named. Without this, the first rule of `access.rules` that fits the entry decides, and without a fitting rule the organization's default for `publish` applies. A key that names no role of the organization is a warning when you publish, never an error, and grants nothing. The robot ignores it; the cloud enforces it."
               }
             },
             "required": [
@@ -1219,7 +1359,7 @@
               }
             ]
           },
-          "description": "Topics clients may send to, and where the format's whole safety story lives. The `message` template fixes every value a caller cannot change, and **`failsafe` is required**: once a client falls silent the bridge sends the failsafe message itself, so an operator whose window closed does not leave a robot driving. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
+          "description": "Topics clients may send to, and where the format's whole safety story lives. The `message` template fixes every value a caller cannot change, and **`failsafe` is required**: once a client falls silent the bridge sends the failsafe message itself, so an operator whose window closed does not leave a robot driving. Keys are slugs, one namespace across all five exposure sections, which is what lets an app lock name `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, `history` is reserved because `GET …/jobs/history` would shadow an action of that name, and `assets` and `job_history` are reserved because they name the robot-level capabilities; all five are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a publisher, with its parameters and its failsafe",
@@ -1573,6 +1713,41 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 2000
+              },
+              "role": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                    "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                  },
+                  {
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                      "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                    }
+                  }
+                ],
+                "defaultSnippets": [
+                  {
+                    "label": "one role",
+                    "description": "The role that may use this; a role that inherits from it may too.",
+                    "body": "${1:operate}"
+                  },
+                  {
+                    "label": "any of several roles",
+                    "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                    "body": [
+                      "${1:operate}",
+                      "${2:admin}"
+                    ]
+                  }
+                ],
+                "description": "Which role may see this camera: one role key, or a list of keys when several roles qualify. A role qualifies when it, or a role it inherits from, is named. Without this, the first rule of `access.rules` that fits the entry decides, and without a fitting rule the organization's default for `read` applies. A key that names no role of the organization is a warning when you publish, never an error, and grants nothing. The robot ignores it; the cloud enforces it."
               }
             },
             "required": [
@@ -1603,7 +1778,7 @@
               }
             ]
           },
-          "description": "Video the robot streams, and the still frames the cloud serves from it. `width`, `height`, `fps` and `bitrate_kbps` are what **the bridge produces before sending**, not what the camera captures — they live in the configuration rather than in a viewer's request precisely so that no viewer can make a robot send more. Keys are slugs, one namespace across all five exposure sections, which is what lets a role grant say `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, and `history` is reserved because `GET …/jobs/history` would shadow an action of that name; all three are refused when the document is validated.",
+          "description": "Video the robot streams, and the still frames the cloud serves from it. `width`, `height`, `fps` and `bitrate_kbps` are what **the bridge produces before sending**, not what the camera captures — they live in the configuration rather than in a viewer's request precisely so that no viewer can make a robot send more. Keys are slugs, one namespace across all five exposure sections, which is what lets an app lock name `{robot, slug}` without naming a kind; `bridge_state` and `robot_details` are built-in, `history` is reserved because `GET …/jobs/history` would shadow an action of that name, and `assets` and `job_history` are reserved because they name the robot-level capabilities; all five are refused when the document is validated.",
           "defaultSnippets": [
             {
               "label": "a camera",
@@ -1621,6 +1796,185 @@
                   "snapshot_interval_seconds": 5,
                   "description": "${3:Forward-facing camera on the mast.}"
                 }
+              }
+            }
+          ]
+        },
+        "access": {
+          "type": "object",
+          "properties": {
+            "rules": {
+              "maxItems": 100,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "match": {
+                    "type": "string",
+                    "maxLength": 255,
+                    "pattern": "^(?:\\/(?:\\*\\*|(?![A-Za-z0-9_*]*\\*\\*)(?:\\*|[A-Za-z_])[A-Za-z0-9_*]*))+$",
+                    "description": "A glob over the ROS name an entry is exposed by: the `topic` of a datapoint or a publisher, the `ros_name` of a service or an action, the source topic of a camera that reads a ROS topic. `*` stands for one name segment, or for any characters inside one (`/joint_*`); `**` stands for any number of segments, none included, so `/arm/**` fits `/arm` and everything below it. Always absolute.",
+                    "patternErrorMessage": "A match pattern is an absolute ROS graph name in which `*` stands for any characters inside one segment and `**` for any number of whole segments — `/arm/**`, `/diagnostics/*`, `/joint_*`. It begins with a slash. A relative pattern, a trailing slash, a dash, a dot, or `**` mixed into a longer segment is refused."
+                  },
+                  "kinds": {
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "read",
+                        "invoke",
+                        "publish"
+                      ],
+                      "enumDescriptions": [
+                        "Datapoints and cameras: seeing what the robot reports.",
+                        "Services and actions: asking the robot to do something.",
+                        "Publishers: sending to the robot, which is what driving it is."
+                      ]
+                    },
+                    "description": "Narrows the rule to some kinds of access. Without it the rule fits entries of every kind."
+                  },
+                  "role": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                        "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                      },
+                      {
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                          "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                        }
+                      }
+                    ],
+                    "defaultSnippets": [
+                      {
+                        "label": "one role",
+                        "description": "The role that may use this; a role that inherits from it may too.",
+                        "body": "${1:operate}"
+                      },
+                      {
+                        "label": "any of several roles",
+                        "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                        "body": [
+                          "${1:operate}",
+                          "${2:admin}"
+                        ]
+                      }
+                    ],
+                    "description": "The role that may use what this rule fits: one key, or a list of keys when several roles qualify. A role qualifies when it, or a role it inherits from, is named. A key that names no role of the organization is a warning when you publish and grants nothing."
+                  }
+                },
+                "required": [
+                  "match",
+                  "role"
+                ],
+                "additionalProperties": false
+              },
+              "description": "Ordered rules that give a role to every entry whose ROS name fits `match`, so a whole namespace is covered by one line. For an entry the order of precedence is its own `role`, then the first rule that fits it, then the organization's default for its kind. A rule that fits no entry of this document is a warning and changes nothing.",
+              "defaultSnippets": [
+                {
+                  "label": "a rule over a namespace",
+                  "description": "Gives everything under `/arm` to one role. The first rule that fits an entry decides, so a narrower rule goes above a wider one.",
+                  "body": [
+                    {
+                      "match": "${1:/arm/**}",
+                      "role": "${2:admin}"
+                    }
+                  ]
+                }
+              ]
+            },
+            "assets": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                  "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                },
+                {
+                  "minItems": 1,
+                  "maxItems": 50,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                    "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                  }
+                }
+              ],
+              "defaultSnippets": [
+                {
+                  "label": "one role",
+                  "description": "The role that may use this; a role that inherits from it may too.",
+                  "body": "${1:operate}"
+                },
+                {
+                  "label": "any of several roles",
+                  "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                  "body": [
+                    "${1:operate}",
+                    "${2:admin}"
+                  ]
+                }
+              ],
+              "description": "Who may use this robot's asset store — the meshes and the URDF a viewer draws it from — in place of the organization's default for `assets`. One role key, or a list of keys."
+            },
+            "job_history": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                  "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                },
+                {
+                  "minItems": 1,
+                  "maxItems": 50,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^(?!defaults$)[a-z][a-z0-9_]{0,62}$",
+                    "patternErrorMessage": "A role key is lower-case: it starts with a letter and continues with letters, digits and underscores, up to 63 characters in all — `operate`, `night_shift`. A capital, a dash, a dot, a space or a leading digit is refused, and `defaults` is reserved."
+                  }
+                }
+              ],
+              "defaultSnippets": [
+                {
+                  "label": "one role",
+                  "description": "The role that may use this; a role that inherits from it may too.",
+                  "body": "${1:operate}"
+                },
+                {
+                  "label": "any of several roles",
+                  "description": "A list of roles; holding one of them, or inheriting from one, is enough.",
+                  "body": [
+                    "${1:operate}",
+                    "${2:admin}"
+                  ]
+                }
+              ],
+              "description": "Who may read this robot's job history, in place of the organization's default for `job_history`. One role key, or a list of keys. A run names the person who started it, so whoever may read the history learns who else has been driving the robot."
+            }
+          },
+          "additionalProperties": false,
+          "description": "Who may use what on this robot, beyond the `role` an entry can carry itself: ordered `rules` over ROS name patterns, and the robot-level `assets` and `job_history`. Everything in it is optional. For an entry the precedence is its own `role`, then the first rule that fits, then the organization's default for its kind; only the published version counts. The robot ignores this section.",
+          "defaultSnippets": [
+            {
+              "label": "access, with one rule",
+              "description": "A rule that gives everything under `/arm` to one role; entries it does not fit keep the organization's defaults.",
+              "body": {
+                "rules": [
+                  {
+                    "match": "${1:/arm/**}",
+                    "role": "${2:admin}"
+                  }
+                ]
               }
             }
           ]
