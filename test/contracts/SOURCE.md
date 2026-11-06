@@ -95,15 +95,16 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@14.0.0
+    Source: @fleetless/contracts@15.0.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-Diffed file by file against the copies this pin replaces: the only vendored
-file that changed is `schema/cloud-config.schema.json`. Every entry of
-`datapoints`, `actions`, `services`, `publishers` and `cameras` may carry
-`role`, and the document may carry an `access` section. The bridge reads
-neither and ignores them. Every other vendored schema and `constants.json` are
-byte-identical.
+Diffed file by file against the copies the previous pin (14.0.0) carried: the
+only vendored file that changed is `schema/cloud-config.schema.json`. The
+descriptions of its five sections (`datapoints`, `actions`, `services`,
+`publishers` and `cameras`) no longer name `robot_details` as a built-in slug;
+`bridge_state` is the only built-in one, and `history`, `assets` and
+`job_history` stay reserved. The bridge reads none of this and ignores it.
+Every other vendored schema and `constants.json` are byte-identical.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
