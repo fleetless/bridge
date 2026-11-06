@@ -95,21 +95,15 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@13.3.0 (unreleased feat/1050-org-roles branch)
-            at commit a4e2ec1d8edf44df69c4faa03e5dcbb5d9acc5cf
+    Source: @fleetless/contracts@14.0.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-This is the source commit of the contracts branch that adds organization roles
-to `fleetless.yaml`, before its planned `14.0.0` release. Its package manifest
-still says `13.3.0`; the commit, not that manifest version, identifies the new
-artifacts. The only vendored file that changed relative to the previous pin is
-`schema/cloud-config.schema.json`: every entry of `datapoints`, `actions`,
-`services`, `publishers` and `cameras` may carry `role`, and the document may
-carry an `access` section. The bridge reads neither and ignores them.
-Every other vendored schema and `constants.json` are byte-identical.
-Re-vendor from the final contracts head before this Bridge PR is accepted if
-that head changes, and replace this branch pin with the published version
-after release.
+Diffed file by file against the copies this pin replaces: the only vendored
+file that changed is `schema/cloud-config.schema.json`. Every entry of
+`datapoints`, `actions`, `services`, `publishers` and `cameras` may carry
+`role`, and the document may carry an `access` section. The bridge reads
+neither and ignores them. Every other vendored schema and `constants.json` are
+byte-identical.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
