@@ -95,22 +95,16 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@14.0.0 (unreleased feat/889-app-collections branch)
-            at commit 3926a4a6183f4c7a0cf650c25af08a63abf6b2c7
+    Source: @fleetless/contracts@15.0.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-This is the source commit of the contracts branch that adds app collections and
-removes the built-in `robot_details` datapoint, before its planned `14.0.0`
-release; the commit identifies the artifacts, and its package manifest already
-carries the release version. The branch also carries the organization roles
-change. The only vendored file that changed relative to the previous
-`12.0.0` pin is `schema/cloud-config.schema.json`: every entry of
-`datapoints`, `actions`, `services`, `publishers` and `cameras` may carry
-`role`, the document may carry an `access` section, and the slug descriptions
-of the five sections no longer name `robot_details` as built-in but list
-`assets` and `job_history` as reserved. The bridge reads none of this and
-ignores it. Every other vendored schema and `constants.json` are
-byte-identical.
+Diffed file by file against the copies the previous pin (14.0.0) carried: the
+only vendored file that changed is `schema/cloud-config.schema.json`. The
+descriptions of its five sections (`datapoints`, `actions`, `services`,
+`publishers` and `cameras`) no longer name `robot_details` as a built-in slug;
+`bridge_state` is the only built-in one, and `history`, `assets` and
+`job_history` stay reserved. The bridge reads none of this and ignores it.
+Every other vendored schema and `constants.json` are byte-identical.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
