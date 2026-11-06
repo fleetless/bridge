@@ -111,9 +111,6 @@ of the five sections no longer name `robot_details` as built-in but list
 `assets` and `job_history` as reserved. The bridge reads none of this and
 ignores it. Every other vendored schema and `constants.json` are
 byte-identical.
-Re-vendor from the final contracts head before this Bridge PR is accepted if
-that head changes, and replace this branch pin with the published version
-after release.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
