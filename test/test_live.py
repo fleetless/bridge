@@ -14,6 +14,7 @@ to invent.
 """
 import asyncio
 import logging
+import re
 import time
 import traceback
 
@@ -616,6 +617,111 @@ def test_the_ice_servers_from_join_reach_the_connection_factory():
     ]
     assert connection.ice_servers[1].username == "u"
     assert connection.ice_servers[1].credential == "c"
+
+
+# --- the start line ------------------------------------------------------------
+
+START_LINE = re.compile(r"^Live publish for (\S+) ready in (\d+) ms$")
+
+
+def _start_lines(messages):
+    return [m.groups() for m in map(START_LINE.match, messages) if m is not None]
+
+
+def test_a_start_logs_one_line_with_the_slug_and_the_time_it_took():
+    """The one number that says how long a viewer waited on this side. It
+    counts from the instant the command arrived, not from the call to
+    `start()`: whatever the caller did in between is part of the wait."""
+
+    async def scenario():
+        handler, watched = _capturing()
+        try:
+            pub, _, _, _ = _started(slug="front", received_s=time.monotonic() - 0.2)
+            await pub.start("wss://media.example", "room-1", "tok-1")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    lines = _start_lines(asyncio.run(scenario()))
+    assert len(lines) == 1, lines
+    slug, milliseconds = lines[0]
+    assert slug == "front"
+    # The fakes answer at once, so everything above 200 is this test's own
+    # head start and everything far above it would be a wrong clock.
+    assert 200 <= int(milliseconds) < 1200
+
+
+def test_the_start_line_carries_neither_the_url_nor_the_token():
+    async def scenario():
+        handler, watched = _capturing()
+        try:
+            pub, _, _, _ = _started(slug="front")
+            await pub.start("wss://media.example", "room-1", "tok-secret-1")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    messages = asyncio.run(scenario())
+    assert len(_start_lines(messages)) == 1
+    assert not any("media.example" in m or "tok-secret-1" in m for m in messages)
+
+
+def test_without_a_received_instant_the_start_line_counts_from_start():
+    """The live proof builds a publisher with no command behind it. The line
+    still has to say something true: the time `start()` itself took."""
+
+    async def scenario():
+        handler, watched = _capturing()
+        try:
+            pub, _, _, _ = _started(slug="proof")
+            await pub.start("wss://media.example", "room-1", "tok-1")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    lines = _start_lines(asyncio.run(scenario()))
+    assert len(lines) == 1, lines
+    assert lines[0][0] == "proof"
+    assert int(lines[0][1]) < 1000
+
+
+def test_a_start_that_falls_back_from_turn_still_logs_one_start_line():
+    async def scenario():
+        signal = _FakeSignal(join=_turn_join())
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(
+                signal, [_FakeConnection(fail_local=_turn_failure()), _FakeConnection()],
+                _FakeTrack(), slug="front",
+            )
+            await pub.start("wss://media.example", "room-1", "test-token")
+            await pub.stop()
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    assert len(_start_lines(asyncio.run(scenario()))) == 1
+
+
+def test_a_failed_start_logs_no_start_line():
+    """"Ready" is a claim. A start that raised must not make it."""
+
+    async def scenario():
+        handler, watched = _capturing()
+        try:
+            pub, _, _, _ = _started(
+                slug="front", connection=_FakeConnection(fail_offer=True)
+            )
+            with pytest.raises(LiveStartError):
+                await pub.start("wss://media.example", "room-1", "tok-1")
+            return handler.messages
+        finally:
+            watched.removeHandler(handler)
+
+    assert _start_lines(asyncio.run(scenario())) == []
 
 
 def test_start_raises_live_start_error_when_the_join_fails():

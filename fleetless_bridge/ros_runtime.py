@@ -2507,6 +2507,9 @@ class RosRuntime:
         this call emits echoes it (`cause=CAMERA_STATE_CAUSE_COMMAND`) so a
         late answer to an earlier, already-superseded attempt cannot be
         mistaken for one to this one."""
+        # Read before the lock: the publisher logs how long this start took,
+        # and a stop still running for the same slug is part of that time.
+        received_s = time.monotonic()
         async with self._live_lock(slug):
             if slug in self._live_publishers:
                 return
@@ -2577,6 +2580,8 @@ class RosRuntime:
                 fps=entry.fps,
                 bitrate_kbps=entry.bitrate_kbps,
                 on_lost=lambda reason, slug=slug: self._on_live_lost(slug, reason),
+                slug=slug,
+                received_s=received_s,
             )
             try:
                 await publisher.start(url, room, token)

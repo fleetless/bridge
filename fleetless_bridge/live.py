@@ -291,6 +291,8 @@ class LivePublisher:
         signal_factory: Optional[Callable[..., Any]] = None,
         bitrate_interval_s: float = BITRATE_HOLD_INTERVAL_S,
         on_lost: Optional[Callable[[str], None]] = None,
+        slug: Optional[str] = None,
+        received_s: Optional[float] = None,
     ) -> None:
         self._holder = holder
         self._width = width
@@ -307,6 +309,13 @@ class LivePublisher:
         # called for a disconnect *we* caused (see `_stopping` below): the
         # caller of `stop()` already knows and is already handling it.
         self._on_lost = on_lost
+        # For the one line `start()` logs, and nothing else: which camera this
+        # session is, and the `time.monotonic()` at which the command it
+        # answers arrived. Whoever received the command knows that instant;
+        # this class only knows when `start()` was called, which is later by
+        # whatever the caller did first. `None` counts from `start()`.
+        self._slug = slug
+        self._received_s = received_s
         self._signal = None
         self._pc = None
         self._track = None
@@ -357,7 +366,13 @@ class LivePublisher:
         the same rule `SignalConnectError` applies one level down. `url` (the
         server address, without the query string) is not secret and stays, for
         the diagnostic value a bare type name would throw away.
+
+        **One line says how long it took**, at INFO, once the answer is
+        applied: the camera and the milliseconds since the command arrived.
+        It is the bridge's own share of what a viewer waits for, readable on
+        a robot without a debugger. Neither `url` nor `token` is in it.
         """
+        since_s = self._received_s if self._received_s is not None else time.monotonic()
         signal = self._signal_factory(
             url,
             token,
@@ -473,6 +488,11 @@ class LivePublisher:
                 "could not publish the video track ({})".format(type(exc).__name__)
             ) from None
 
+        log.info(
+            "Live publish for %s ready in %d ms",
+            self._slug if self._slug is not None else "camera",
+            round((time.monotonic() - since_s) * 1000),
+        )
         self._bitrate_task = asyncio.ensure_future(self._hold_bitrate_budget())
         self._feed_task = asyncio.ensure_future(self._feed_frames())
 

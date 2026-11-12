@@ -175,6 +175,8 @@ async def run(args):
             args.coturn_host, args.coturn_port, args.coturn_user, args.coturn_pass,
         ),
         on_lost=lambda reason: log("LOST", reason),
+        # Names this run in the publisher's own "ready in N ms" line.
+        slug="relay-proof",
     )
     token = make_token(args.api_key, args.api_secret, args.room, args.identity)
     log("publishing into", args.url, "room", args.room)
