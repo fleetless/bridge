@@ -131,6 +131,8 @@ async def run(args):
         bitrate_kbps=args.bitrate_kbps,
         connection_factory=codec_pinning_factory(args.codec),
         on_lost=lambda reason: log("LOST", reason),
+        # Names this run in the publisher's own "ready in N ms" line.
+        slug="proof",
     )
     token = make_token(args.api_key, args.api_secret, args.room, args.identity)
     log("publishing into", args.url, "room", args.room, "codec", args.codec,

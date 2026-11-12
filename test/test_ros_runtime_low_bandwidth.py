@@ -78,7 +78,8 @@ class _LivePublisher:
     #: join is still in flight.
     gate = None
 
-    def __init__(self, *, holder, width, height, fps, bitrate_kbps, on_lost=None):
+    def __init__(self, *, holder, width, height, fps, bitrate_kbps, on_lost=None,
+                 slug=None, received_s=None):
         self.bitrate_kbps = bitrate_kbps
         self.on_lost = on_lost
         self.start_calls = []

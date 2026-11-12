@@ -129,6 +129,8 @@ async def run(args):
         holder=holder, width=args.width, height=args.height, fps=args.fps,
         bitrate_kbps=args.bitrate_kbps,
         on_lost=lambda reason: log("LOST", reason),
+        # Names this run in the publisher's own "ready in N ms" line.
+        slug="soak",
     )
     token = make_token(args.api_key, args.api_secret, args.room, args.identity)
     log("publishing into", args.url, "room", args.room, "for", args.minutes,

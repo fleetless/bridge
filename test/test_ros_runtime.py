@@ -6564,8 +6564,11 @@ class _FakeLivePublisher:
 
     def __init__(
         self, *, holder, width, height, fps, bitrate_kbps, on_lost=None,
+        slug=None, received_s=None,
         fail_with=None, stop_delay=0.0, start_delay=0.0,
     ):
+        self.slug = slug
+        self.received_s = received_s
         self.holder = holder
         self.width = width
         self.height = height
@@ -6810,6 +6813,34 @@ def test_start_live_reports_publishing_true_on_success():
     pub = _FakeLivePublisher.instances[0]
     assert pub.start_calls == [("wss://media.example", "room-1", "tok-1")]
     assert (pub.width, pub.height, pub.fps) == (64, 48, 15)
+
+
+def test_start_live_tells_the_publisher_its_slug_and_when_the_command_arrived():
+    """The publisher logs how long a start took, and counts from the instant
+    the command arrived -- which only `start_live` knows. A stop still in
+    flight for the same slug is part of that wait, so the clock is read
+    before the per-slug lock and not after it."""
+    _FakeLivePublisher.instances.clear()
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front")]))
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        stopping = asyncio.ensure_future(rt.stop_live("front", request_id="req-2"))
+        await asyncio.sleep(0)  # the stop holds the lock now, for 0.3 s
+        asked_at = time.monotonic()
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-2", "req-3")
+        built_at = time.monotonic()
+        await stopping
+        return asked_at, built_at
+
+    asked_at, built_at = run(body, live_publisher_factory=_fake_live_factory(stop_delay=0.3))
+    first, second = _FakeLivePublisher.instances
+    assert (first.slug, second.slug) == ("front", "front")
+    assert first.received_s is not None
+    # The second start waited out the stop before its publisher was built.
+    # Its instant is when it was asked, not when it got the lock.
+    assert built_at - asked_at >= 0.25
+    assert asked_at <= second.received_s < asked_at + 0.1
 
 
 def test_start_live_reports_publishing_false_when_the_publisher_fails_to_start():
