@@ -2808,6 +2808,19 @@ class RosRuntime:
             # come too late for that first look, and cost a frame interval.
             self.convert_newest_raw_frame(slug)
 
+            # `live.encoder` is for a publisher that encodes pictures, and
+            # only for that one. The keyword is a dict of its own so that a
+            # camera with any other kind of publisher is given none at all,
+            # not even `None`: such a publisher brings its encoder with it.
+            #
+            # `None` for `software`: aiortc builds its own encoder and the
+            # answer picks the codec, as before the setting existed. Anything
+            # else is an encoder of this session's own, which the publisher
+            # closes. Nothing is built or probed here; that happens with the
+            # first frame, in aiortc's encoder thread.
+            encoder_kwargs = {
+                "encoder": live_encoder.build_encoder(self._live_encoder, fps=entry.fps)
+            }
             publisher = self._live_publisher_factory(
                 holder=entry.latest,
                 width=entry.width,
@@ -2822,12 +2835,7 @@ class RosRuntime:
                 # holds when a viewer comes back is converted at once, as at a
                 # start, rather than left until the camera's next message.
                 on_resume=lambda slug=slug: self.convert_newest_raw_frame(slug),
-                # `None` for `software`: aiortc builds its own encoder and
-                # the answer picks the codec, as before the setting existed.
-                # Anything else is an encoder of this session's own, which
-                # the publisher closes. Nothing is built or probed here; that
-                # happens with the first frame, in aiortc's encoder thread.
-                encoder=live_encoder.build_encoder(self._live_encoder, fps=entry.fps),
+                **encoder_kwargs,
             )
             try:
                 await publisher.start(url, room, token)
