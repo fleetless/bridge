@@ -11,6 +11,12 @@ Every test here runs the bridge the way a robot does, as a process of its
 own (`python3 -m fleetless_bridge.main`), against the suite's fake cloud. A
 signal sent to the test process itself would say nothing about the seconds
 before the bridge's own code runs.
+
+The seam tests are the proof: each sends its signal at one exact step of the
+start. The sweep is the net under them: twenty moments for each way of being
+stopped, placed by what the bridge has done so far. For a run by hand,
+`FLEETLESS_EARLY_STOP_MOMENTS=40` asks for forty instead, evenly over the
+bridge's first five seconds; `./run-tests.sh` passes the variable on.
 """
 import asyncio
 import logging
@@ -28,22 +34,45 @@ from fake_cloud import FakeCloud, accepts
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
-#: The moments a stop is sent at, in seconds after the bridge began to listen
-#: (`LISTENS_WITHIN_S` says how that is known): forty of them, evenly over
-#: its first five seconds.
-MOMENTS_S = [5.0 * step / 40 for step in range(40)]
 
-#: How long a stop may take, from the signal to the process being gone.
-STOP_WITHIN_S = 1.0
-
-
-def _cores() -> int:
-    """The cores this process may use, which on a small runner are few."""
+def _cores() -> float:
+    """The cores this process can use, which on a small runner are few: the
+    ones it may run on, and no more than a container's CPU limit gives it.
+    Not the cores the machine has."""
     try:
-        return len(os.sched_getaffinity(0))
+        cores = float(len(os.sched_getaffinity(0)))
     except AttributeError:  # not Linux
-        return os.cpu_count() or 1
+        cores = float(os.cpu_count() or 1)
+    limit = _cpu_limit()
+    return cores if limit is None else min(cores, limit)
 
+
+def _cpu_limit() -> Optional[float]:
+    """A container's CPU limit in cores, where one is set and can be read."""
+    try:  # cgroup v2: "<quota> <period>", or "max <period>" for no limit
+        quota, period = pathlib.Path("/sys/fs/cgroup/cpu.max").read_text().split()
+        return None if quota == "max" else int(quota) / int(period)
+    except (OSError, ValueError, ZeroDivisionError):
+        pass
+    try:  # cgroup v1: a quota of -1 is no limit
+        quota = int(pathlib.Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = int(pathlib.Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        return quota / period if quota > 0 and period > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+#: How long a stop may take, from the signal to the process being gone: a
+#: second, where the bridge has a core to itself.
+#:
+#: A handler in Python runs between two steps of the interpreter, never
+#: inside one, so a stop that lands inside one long C call of the imports
+#: waits for that call; `import cv2` alone is one call of about half a second
+#: of an idle core. Below two usable cores the bridge shares its core with
+#: this test and the fake cloud, and now and then the half second becomes
+#: more than one. That says nothing about the bridge, so there a stop gets
+#: three seconds. Everything else it has to be stays what it is.
+STOP_WITHIN_S = 1.0 if _cores() >= 2 else 3.0
 
 #: How many bridges start at once. Each one is a second of imports on a core
 #: of its own, so a few run side by side without slowing each other into a
@@ -51,7 +80,7 @@ def _cores() -> int:
 #: fewer, because a bridge that waits for a core cannot stop within a second
 #: either, and that says nothing about the bridge. Half the cores at most:
 #: the test and its fake cloud need theirs.
-SIDE_BY_SIDE = max(1, min(4, _cores() // 2))
+SIDE_BY_SIDE = max(1, min(4, int(_cores() // 2)))
 
 #: Where the clock starts: the first moment the bridge is seen to catch both
 #: signals (`SigCgt` in `/proc/<pid>/status`). Until a Python program's first
@@ -72,6 +101,61 @@ LISTENS_WITHIN_S = 20.0
 #: The bridge's first log line, written after the imports and before ROS.
 _ITS_START = "Starting fleetless_bridge"
 
+#: How long a bridge is waited for to log that line, for a moment counted
+#: from it. On a shared core the imports alone take several seconds.
+STARTS_WITHIN_S = 60.0
+
+#: What a moment is counted from.
+_IT_LISTENS = "it listens"
+_ITS_FIRST_LINE = "its first log line"
+
+
+@dataclass(frozen=True)
+class _Moment:
+    """When a stop is sent: so long after the bridge was seen to do something."""
+
+    after: str
+    seconds: float
+
+    def __str__(self) -> str:
+        return "{:.3f} s after {}".format(self.seconds, self.after)
+
+
+#: The sweep in the suite: twenty moments for each way of being stopped.
+#:
+#: Placed by what the bridge has done and not by a clock alone, because where
+#: its first seconds go depends on the machine: the imports take a second on
+#: a free core and several on a shared one, and everything after them moves
+#: with that.
+#:
+#:   six     in the imports, counted from the moment the bridge listens
+#:   twelve  from its first log line on, close together: before ROS, inside
+#:           ROS initialisation and node creation, before the loop listens,
+#:           around the first connection
+#:   two     later, with the connection up
+_TWENTY = (
+    [_Moment(_IT_LISTENS, s) for s in (0.0, 0.05, 0.15, 0.3, 0.5, 0.75)]
+    + [
+        _Moment(_ITS_FIRST_LINE, s)
+        for s in (0.0, 0.01, 0.02, 0.035, 0.05, 0.065, 0.08, 0.1, 0.13, 0.2, 0.35, 0.7)
+    ]
+    + [_Moment(_ITS_FIRST_LINE, s) for s in (1.5, 3.0)]
+)
+
+#: The sweep by hand: forty moments, evenly over the five seconds after the
+#: bridge listens.
+_FORTY = [_Moment(_IT_LISTENS, 5.0 * step / 40) for step in range(40)]
+
+_ASKED_FOR = os.environ.get("FLEETLESS_EARLY_STOP_MOMENTS", "").strip()
+if _ASKED_FOR not in ("", "20", "40"):
+    raise ValueError(
+        "FLEETLESS_EARLY_STOP_MOMENTS is {!r}; it is 40 for the sweep by hand, "
+        "and unset or 20 for the suite's".format(_ASKED_FOR)
+    )
+
+#: The moments a stop is sent at.
+MOMENTS = _FORTY if _ASKED_FOR == "40" else _TWENTY
+
 _SIGNALS = {"SIGINT": signal.SIGINT, "SIGTERM": signal.SIGTERM}
 
 
@@ -79,10 +163,11 @@ _SIGNALS = {"SIGINT": signal.SIGINT, "SIGTERM": signal.SIGTERM}
 class _Stop:
     """One bridge, stopped once: what was done to it and how it ended."""
 
-    moment_s: float
+    moment: _Moment
     signal_name: str
     listening_after_s: Optional[float]
     started_before_it_listened: bool
+    signal_sent: bool
     exit_code: Optional[int]
     stopped_after_s: Optional[float]
     output: str
@@ -94,6 +179,13 @@ class _Stop:
                 "never caught both signals (exit code {})".format(self.exit_code)
                 if self.exit_code is not None
                 else "not catching both signals {:.0f} s after its birth".format(LISTENS_WITHIN_S)
+            ]
+        if not self.signal_sent:
+            # Nor here: the moment is counted from a line that never came.
+            return [
+                "never logged its start (exit code {})".format(self.exit_code)
+                if self.exit_code is not None
+                else "had not logged its start {:.0f} s after its birth".format(STARTS_WITHIN_S)
             ]
         found = []
         if self.started_before_it_listened:
@@ -120,9 +212,9 @@ class _Stop:
             if self.listening_after_s is not None
             else "no signal sent"
         )
-        return "{} at {:.3f} s ({}): {}\n{}".format(
+        return "{} {} ({}): {}\n{}".format(
             self.signal_name,
-            self.moment_s,
+            self.moment,
             listening,
             ", ".join(self.problems()),
             _indented(_tail(self.output)),
@@ -202,7 +294,7 @@ def _catches_both(pid: int) -> bool:
 
 
 async def _stop_at(
-    moment_s: float,
+    moment: _Moment,
     signal_name: str,
     *,
     sigint_ignored: bool,
@@ -221,22 +313,38 @@ async def _stop_at(
     born = time.monotonic()
     listening_after_s = None
     started_before_it_listened = False
+    signal_sent = False
     stopped_after_s = None
     ended_by_itself = False
+
+    def has_logged_its_start() -> bool:
+        return _ITS_START in log_path.read_text(errors="replace")
+
     try:
         while bridge.poll() is None and time.monotonic() - born < LISTENS_WITHIN_S:
             if _catches_both(bridge.pid):
                 listening_after_s = time.monotonic() - born
                 # Read after it was seen to listen, never before: a line
                 # that stands in the log now may have been written first.
-                started_before_it_listened = _ITS_START in log_path.read_text(errors="replace")
+                started_before_it_listened = has_logged_its_start()
                 break
             await asyncio.sleep(0.002)
+
+        # What the moment is counted from has to have happened.
+        reached = listening_after_s is not None
+        if reached and moment.after == _ITS_FIRST_LINE:
+            reached = False
+            while bridge.poll() is None and time.monotonic() - born < STARTS_WITHIN_S:
+                if has_logged_its_start():
+                    reached = True
+                    break
+                await asyncio.sleep(0.002)
         ended_by_itself = bridge.poll() is not None
 
-        if listening_after_s is not None:
-            await asyncio.sleep(moment_s)
+        if reached:
+            await asyncio.sleep(moment.seconds)
             bridge.send_signal(_SIGNALS[signal_name])
+            signal_sent = True
             sent = time.monotonic()
             while time.monotonic() - sent < STOP_WITHIN_S:
                 if bridge.poll() is not None:
@@ -248,10 +356,11 @@ async def _stop_at(
             bridge.kill()
         bridge.wait()
     return _Stop(
-        moment_s=moment_s,
+        moment=moment,
         signal_name=signal_name,
         listening_after_s=listening_after_s,
         started_before_it_listened=started_before_it_listened,
+        signal_sent=signal_sent,
         exit_code=bridge.returncode if stopped_after_s is not None or ended_by_itself else None,
         stopped_after_s=stopped_after_s,
         output=log_path.read_text(errors="replace"),
@@ -264,19 +373,17 @@ async def _stop_at_every_moment(
     async with FakeCloud(accepts()) as cloud:
         turn = asyncio.Semaphore(SIDE_BY_SIDE)
 
-        async def one(index: int, moment_s: float) -> _Stop:
+        async def one(index: int, moment: _Moment) -> _Stop:
             async with turn:
                 return await _stop_at(
-                    moment_s,
+                    moment,
                     signal_name,
                     sigint_ignored=sigint_ignored,
                     cloud_url=cloud.url,
                     workdir=workdir / "stop-{:02d}".format(index),
                 )
 
-        return await asyncio.gather(
-            *(one(index, moment_s) for index, moment_s in enumerate(MOMENTS_S))
-        )
+        return await asyncio.gather(*(one(index, moment) for index, moment in enumerate(MOMENTS)))
 
 
 @pytest.mark.parametrize(
@@ -287,13 +394,13 @@ async def _stop_at_every_moment(
         pytest.param("SIGINT", True, id="SIGINT-ignored-at-birth"),
     ],
 )
-def test_a_stop_at_any_moment_of_the_first_five_seconds_ends_the_bridge_quietly(
+def test_a_stop_at_any_moment_of_its_first_seconds_ends_the_bridge_quietly(
     signal_name, sigint_ignored, tmp_path
 ):
     stops = asyncio.run(
         _stop_at_every_moment(signal_name, sigint_ignored=sigint_ignored, workdir=tmp_path)
     )
-    assert len(stops) == len(MOMENTS_S)
+    assert len(stops) == len(MOMENTS)
     failed = [stop for stop in stops if stop.problems()]
     assert not failed, "{} of {} stops did not end the bridge quietly:\n\n{}".format(
         len(failed), len(stops), "\n\n".join(stop.describe() for stop in failed)
