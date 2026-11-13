@@ -281,12 +281,21 @@ class PassthroughPublisher(live.LivePublisher):
     encoder handed over here is therefore never installed, and is closed at
     once, in a thread of its own -- the publisher is the only one left who
     could close it, and closing a hardware pipeline may take a moment.
+
+    **`on_resume` is taken and not used either.** The base class tells its
+    camera when a viewer comes back, so that the message the camera held
+    while paused is converted, and keeps the track from the sender until
+    that conversion has landed. A passthrough camera holds no raw message
+    and converts nothing for live; its stream starts again at the source's
+    next keyframe by itself. A hook handed over all the same is not kept, so
+    a resume never asks for, or waits for, a conversion that does not exist.
     """
 
     def __init__(
         self, *, passthrough: PassthroughStream, encoder: Optional[object] = None, **kwargs
     ) -> None:
         _close_unused(encoder)
+        kwargs.pop("on_resume", None)
         handoff = UnitHandoff()
 
         def track_factory(width: int, height: int, fps: int, bitrate_kbps: int) -> PassthroughTrack:
