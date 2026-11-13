@@ -4626,16 +4626,19 @@ class RosRuntime:
             # executor thread, the same thread `self._cameras` is always
             # touched from, so no marshaling is needed just to read a dict.
             #
-            # Paused means nobody is subscribed. The publisher's encoder and
-            # its feed loop already idle then; converting every message for a
-            # picture nobody pulls was the last cost left, and since the cloud
-            # keeps a robot in its room for 30 s after the last viewer
-            # (fleetless/fleetless#1118) it is one paid for half a minute
-            # after every viewing. A paused publisher is to this camera what
+            # Paused means nobody is subscribed: between a `camera_start` and
+            # the first viewer, while a viewer's client has unsubscribed, and
+            # for as long as the cloud keeps the robot in its room after the
+            # last one (fleetless/fleetless#1118; off unless the cloud is
+            # configured for it, up to half a minute per viewing when it
+            # is). The publisher's encoder and its feed loop already idle
+            # then; converting every message for a picture nobody pulls was
+            # the last cost left. A paused publisher is to this camera what
             # no publisher is: the newest message stays raw, a snapshot that
             # falls due converts the one it sends, and the publisher's
             # `on_resume` (`start_live`) has the newest one converted the
-            # moment somebody watches again.
+            # moment somebody watches again, before the track goes back to
+            # the sender.
             #
             # `_live_publishers` itself is mutated on the *loop* thread
             # (`start_live`/`stop_live`, both `_submit_async`-free asyncio
