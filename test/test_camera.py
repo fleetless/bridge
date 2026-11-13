@@ -12,6 +12,7 @@ from sensor_msgs.msg import BatteryState, CompressedImage, Image
 from fleetless_bridge.camera import (
     EncodedFrameHolder,
     LatestFrameHolder,
+    RawFrame,
     RawFrameHolder,
     UnsupportedImageError,
     encode_jpeg,
@@ -463,3 +464,11 @@ def test_encoded_frame_holder_keeps_the_newest_frame_and_does_not_hand_it_out_on
     # The same object, not a copy: keeping a frame costs a reference.
     assert held.data is second and held.timestamp_ms == 2_000
     assert holder.get() is held
+
+
+def test_a_raw_frame_built_without_an_arrival_time_says_so():
+    """`0.0` is a reading of the monotonic clock like any other: a frame that
+    carried it as its default would claim to have arrived when the clock
+    started. Not known is `None`, and whoever reads it decides what that
+    means."""
+    assert RawFrame(msg=object(), timestamp_ms=1).arrived_s is None

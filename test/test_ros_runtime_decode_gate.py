@@ -496,3 +496,24 @@ def test_convert_newest_raw_frame_after_the_runtime_has_stopped_is_a_no_op():
     assert future.result(timeout=1.0) is None
     assert _DestroyedGuard.triggered == 0
     assert len(rt._work_queue) == 0
+
+
+def test_a_held_message_with_no_arrival_time_counts_as_arriving_when_it_is_converted():
+    """A `RawFrame` that does not say when it arrived is rate-limited as
+    arriving now, like every frame that comes with no arrival time. Read as
+    "arrived when the monotonic clock started", it would never count against
+    the frame limit at all, and the message right behind it would go through
+    inside the same interval."""
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=2)]))
+        entry = rt._cameras["front"]
+        following = np.zeros((12, 16, 3), dtype=np.uint8)
+
+        with entry.raw._lock:
+            entry.raw._frame = camera.RawFrame(msg=_image_msg((10, 20, 30)), timestamp_ms=1_000)
+        rt.convert_newest_raw_frame("front").result(timeout=5.0)
+        await rt._submit_async(lambda: rt._on_source_frame("front", entry, following, 1_005))
+        return entry.latest.get().timestamp_ms
+
+    assert run(body) == 1_000
