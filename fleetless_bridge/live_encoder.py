@@ -29,16 +29,18 @@ told which packages are missing.
 **GStreamer starts a child process of its own, and writes files of its
 own.** When its plugin registry is missing or stale, `Gst.init` runs
 GStreamer's plugin scanner (`gst-plugin-scanner`) as a child, and again for
-the rest of the scan whenever a plugin crashes it. The scanner writes the
-registry to the user's cache, `$XDG_CACHE_HOME/gstreamer-1.0/`. That is at
-the first hardware session, after an update of a GStreamer package, and at
-every start where that directory cannot be written. GStreamer's libraries
-may write short-lived files besides: liborc 0.4.42 creates `orcexec.*` in
-`$XDG_RUNTIME_DIR` or `$HOME` and deletes it at once. Nothing from a cloud
-message reaches the scanner's command line. `GST_REGISTRY_FORK=no` would
-spare the child by loading every installed plugin into the bridge's own
-process, where a plugin that crashes the scanner would crash the bridge,
-and is not set. `SECURITY.md` names all of it.
+the rest of the scan whenever a plugin crashes it. From what the scanner
+reports, GStreamer writes the registry itself, in this process, to the
+user's cache, `$XDG_CACHE_HOME/gstreamer-1.0/`. That is at the first
+hardware session, after an update of a GStreamer package, and at every start
+where that directory cannot be written. GStreamer's libraries may write
+short-lived files besides: in the scanner, liborc 0.4.42 creates `orcexec.*`
+in `$XDG_RUNTIME_DIR`, or in `$HOME` where that is not set, and deletes it
+at once. Nothing from a cloud message reaches the scanner's command line.
+`GST_REGISTRY_FORK=no` would spare the child by loading every installed
+plugin into the bridge's own process, where a plugin that crashes the
+scanner would crash the bridge, and is not set. `SECURITY.md` names all of
+it.
 
 **No chain here is proven on its hardware by this package's own tests.**
 Each is written to the documentation of its elements. The machines this is
