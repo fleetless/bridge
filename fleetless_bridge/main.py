@@ -11,6 +11,25 @@ Exit codes, because a supervisor cannot read log messages:
 A stop is heard from the first statement of `main()` on, and it is exit 0
 whenever it comes: during the imports, while the ROS node is being created,
 before the cloud has answered. `_EarlyStop` says how.
+
+Three things a signal handler in Python cannot do:
+
+- **Listen before `main()` runs.** While the interpreter starts and, as
+  installed, the console script looks its entry point up (0.1 to 0.2 s after
+  the process's birth), a SIGTERM kills and a SIGINT that was ignored at the
+  bridge's birth is dropped.
+- **Interrupt a C call.** A handler runs between two steps of the
+  interpreter, never inside one. A stop that lands inside one long C call of
+  the imports is heard when that call returns, and `import cv2` is one call
+  of about half a second of an idle core. So "within a second" needs a core
+  that is free and fast enough; on a busy or a slow one the stop is as quiet
+  and comes later.
+- **End a start that does not return.** A start that blocks inside a C call
+  (ROS initialisation that never comes back) is not ended by a signal: the
+  first is recorded and waits for that call like any other, and a second
+  changes nothing. The supervisor's SIGKILL ends it. While the bridge did
+  not listen this early, SIGTERM's default killed such a start at once;
+  that is the price of the quiet stop.
 """
 from __future__ import annotations
 
@@ -204,7 +223,8 @@ def _configure_logging() -> None:
 
 
 def run() -> int:
-    """Everything main() does, minus the process exit — so tests can call it."""
+    """Everything main() does after it listens, minus the process exit — so
+    tests can call it."""
     # The slow part: the client, ROS and OpenCV. Here and not at the top of
     # this file, so that `main()` listens for a stop first; a stop during
     # these lines ends the process in the handler.
@@ -274,7 +294,7 @@ async def _serve(client: BridgeClient) -> StopReason:
     # the early one, the client has not connected. A stop recorded until
     # here would wait for a second signal that nobody owes. It is passed on
     # now: `client.run()` returns before it connects, and `_run_client`
-    # ends ROS again.
+    # ends ROS.
     if _early_stop.requested():
         client.stop()
     return await client.run()
