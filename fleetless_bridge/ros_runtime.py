@@ -591,11 +591,11 @@ class CameraStateQueue:
     this class borrows its structure too: `_order` holds either a
     request-answering `CameraStateUpdate` directly or a key standing for
     "the latest unsolicited update of this kind for this slug is in
-    `_pending`" (see `put` for the two kinds). The bound the design asked for is unaffected: a flapping
-    source reports `cause='source'` with `request_id=None` by
-    construction, so the unbounded-growth case is precisely the coalesced
-    one, and the uncoalesced remainder is bounded by how many commands the
-    cloud has outstanding.
+    `_pending`" (see `put` for the two kinds). The bound the design asked
+    for is unaffected: a flapping source reports `cause='source'` with
+    `request_id=None` by construction, so the unbounded-growth case is
+    precisely the coalesced one, and the uncoalesced remainder is bounded
+    by how many commands the cloud has outstanding.
 
     Insertion order is preserved: a coalesced update replaces its
     predecessor **in place** rather than jumping the queue, so a slug that
@@ -1371,6 +1371,15 @@ COMPRESSED_IMAGE_TYPE = "sensor_msgs/msg/CompressedImage"
 #: the cloud's mapping needs no new entry.
 PASSTHROUGH_REFUSAL_CODE = "source_error"
 
+#: The sentence that says why a camera cannot be passed through is written
+#: to the robot's log when it is a new one, and again at most once in this
+#: many seconds while it keeps being said.
+PASSTHROUGH_REFUSAL_LOG_INTERVAL_S = 60.0
+
+#: How many different sentences per camera are remembered for that, which is
+#: also how many such lines a camera can write within one interval.
+PASSTHROUGH_REFUSAL_LOG_SENTENCES = 8
+
 #: The fields the bridge reads that type by. `timestamp` is the publisher's
 #: own clock and is not used as time: `timestamp_ms` is bridge capture time
 #: for every camera. It is in this list because a class without it is not
@@ -1634,6 +1643,11 @@ class _CameraEntry:
     # Capture time of the keyframe last decoded for a snapshot, so that one
     # keyframe is decoded once however often a snapshot comes due.
     keyframe_decoded_ms: Optional[int] = None
+    # The sentences logged for a stream that cannot be passed through, each
+    # with the `time.monotonic()` it was last written at, and when the line
+    # that says there were too many was last written (`_log_refusal`).
+    refusal_logged: Dict[str, float] = field(default_factory=dict)
+    refusal_overflow_logged_at: Optional[float] = None
 
 
 #: The `live.*` ROS parameters and the check each proposed value has to pass.
@@ -5266,12 +5280,53 @@ class RosRuntime:
             # stream ends, and says why. A source that stalls or drops
             # (other codes) leaves a running stream as it leaves any other.
             #
-            # And one line in the robot's own log, once per refusal: the
-            # sentence travels to the cloud in the camera's state, and the
-            # console shows a state's kind and not its text. The sentence is
-            # this package's own, built from sizes and codec names.
-            log.warning("Camera slug %r is not passed through: %s", slug, message)
+            self._log_refusal(slug, entry, message)
             self._end_live_from_executor(slug, (code, message))
+
+    def _log_refusal(self, slug: str, entry: _CameraEntry, message: str) -> None:
+        """A line in the robot's own log for why `slug` cannot be passed
+        through. The sentence travels to the cloud in the camera's state,
+        and the console shows a state's kind and not its text, so this line
+        is where the reason can be read. The sentence is this package's own,
+        built from sizes and codec names, or an adapter's ("the camera
+        answered RTSP 404").
+
+        **A new sentence is written at once; the same one at most once a
+        minute.** The limit is per sentence and not per camera: the callers
+        hand a sentence on only when it changes, so one that was held back
+        would never be offered again, and the log would name a reason the
+        camera no longer has for as long as the new one stands.
+
+        A topic whose messages disagree about their codec changes its
+        sentence with every message; each of its sentences is then written
+        once a minute. A camera that brings up more than
+        `PASSTHROUGH_REFUSAL_LOG_SENTENCES` different ones within a minute
+        gets one more line, which says that the rest is not logged, and
+        where the reason still is."""
+        now_s = time.monotonic()
+        written = entry.refusal_logged
+        for sentence in [
+            sentence for sentence, at in written.items()
+            if now_s - at >= PASSTHROUGH_REFUSAL_LOG_INTERVAL_S
+        ]:
+            del written[sentence]
+        if message in written:
+            return
+        if len(written) >= PASSTHROUGH_REFUSAL_LOG_SENTENCES:
+            if (
+                entry.refusal_overflow_logged_at is None
+                or now_s - entry.refusal_overflow_logged_at >= PASSTHROUGH_REFUSAL_LOG_INTERVAL_S
+            ):
+                entry.refusal_overflow_logged_at = now_s
+                log.warning(
+                    "Camera slug %r: the reason it cannot be passed through "
+                    "keeps changing; no more than %d reasons a minute are "
+                    "logged, the camera's state carries the newest",
+                    slug, PASSTHROUGH_REFUSAL_LOG_SENTENCES,
+                )
+            return
+        written[message] = now_s
+        log.warning("Camera slug %r cannot be passed through: %s", slug, message)
 
     # --- cameras: H.264 that is passed through ------------------------------
 
