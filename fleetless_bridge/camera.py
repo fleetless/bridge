@@ -350,7 +350,11 @@ class RawFrame:
     #: not instead of it: that one is the capture time the wire reports, on
     #: the wall clock; this one is for arithmetic with other monotonic
     #: readings, which a wall clock that can be stepped is no good for.
-    arrived_s: float = 0.0
+    #: `None` when nobody recorded it: `0.0` would be a reading too, and say
+    #: the message arrived when the clock started. `RawFrameHolder.set`
+    #: always records it; a reader takes `None` as "now"
+    #: (`RosRuntime._on_source_frame`).
+    arrived_s: Optional[float] = None
 
 
 class RawFrameHolder:
