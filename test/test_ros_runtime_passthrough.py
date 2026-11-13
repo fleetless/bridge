@@ -565,29 +565,91 @@ def test_a_reason_that_changes_within_the_minute_is_logged_at_once(units, compre
     assert states[-1].error[1].startswith("the topic carries VP9")
 
 
-def test_the_same_reason_is_logged_at_most_once_a_minute(units, compressed_video, monkeypatch):
-    """Two publishers on one topic that disagree about the codec make a new
-    sentence with every message. The camera's state follows them; the log
-    writes each of the two once a minute."""
+def test_a_reason_that_comes_back_within_the_minute_is_logged_again(units, compressed_video, monkeypatch):
+    """H.265, then VP9, then H.265 again and for good. Each was written
+    within the minute, and a limit of one line a minute per sentence held
+    the third back: the log ended on VP9 while the topic carried H.265. The
+    last line names the reason in force."""
     clock = [5000.0]
     monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
 
     async def body(rt):
         await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
         refuse = _refusing(rt, "front", clock)
-        for index in range(40):  # twenty of each within twenty seconds
-            await refuse("h265" if index % 2 == 0 else "vp9", index * 0.5)
-        within_the_minute = len(log_.refusals())
-        await refuse("h265", 61)   # its line is a minute old
-        await refuse("vp9", 61.2)  # and so is this one's
-        await refuse("h265", 61.4)
-        return within_the_minute, await _drain_camera_states(rt)
+        await refuse("h265", 0)
+        await refuse("vp9", 10)
+        for at_s in range(20, 201):  # H.265 again, once a second for three minutes
+            await refuse("h265", at_s)
+        return await _drain_camera_states(rt)
 
     with _RuntimeLog() as log_:
-        within_the_minute, states = run(body)
-    assert within_the_minute == 2
-    assert len(log_.refusals()) == 4
-    assert states[-1].error[1].startswith("the topic carries H.265")  # the state still says the latest
+        states = run(body)
+    lines = log_.refusals()
+    assert ["H.265" in lines[0], "VP9" in lines[1], "H.265" in lines[2]] == [True, True, True]
+    assert len(lines) == 3  # and the standing reason is not said again and again
+    assert states[-1].error[1].startswith("the topic carries H.265")
+
+
+def test_the_same_reason_is_logged_at_most_once_a_minute(units, compressed_video, monkeypatch):
+    """A topic that carries H.265 between stretches of H.264 is refused for
+    the same reason each time. The camera's state follows every turn; the
+    log says it once a minute."""
+    clock = [5000.0]
+    monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
+        refuse = _refusing(rt, "front", clock)
+        counts, states = [], []
+        for at_s in (0, 30, 59, 61):
+            await refuse("h265", at_s)
+            counts.append(len(log_.refusals()))
+            # Drained turn by turn: the queue keeps one state per camera,
+            # the newest, and this is about every one of them.
+            states.extend(await _drain_camera_states(rt))
+            await _feed(rt, "front", units, start_ms=1_000_000 + at_s * 1000)  # H.264 again
+            states.extend(await _drain_camera_states(rt))
+        return counts, states
+
+    with _RuntimeLog() as log_:
+        counts, states = run(body)
+    # Refused four times and recovered four times, and the cloud heard each.
+    assert [state.error is None for state in states] == [False, True] * 4
+    # Written at 0 s, and again when that line was a minute old.
+    assert counts == [1, 1, 1, 2]
+
+
+def test_two_reasons_that_alternate_with_every_message_are_a_bounded_number_of_lines(
+    units, compressed_video, monkeypatch
+):
+    """Two publishers on one topic that disagree about the codec make a new
+    sentence with every message. Eight lines are written, then one that
+    says the reason keeps changing -- and that one stays the last, so the
+    log does not end on whichever of the two happened to be the eighth."""
+    clock = [5000.0]
+    monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
+    limit = ros_runtime.PASSTHROUGH_REFUSAL_LOG_LINES
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
+        refuse = _refusing(rt, "front", clock)
+        for index in range(240):  # two minutes, two messages a second
+            await refuse("h265" if index % 2 == 0 else "vp9", index * 0.5)
+        while_it_alternates = list(log_.lines)
+        await refuse("h265", 200)  # one publisher is left, and stays
+        return while_it_alternates, await _drain_camera_states(rt)
+
+    with _RuntimeLog() as log_:
+        while_it_alternates, states = run(body)
+    passed = [line for line in while_it_alternates if "passed through" in line]
+    # Never more than the limit and the one line beyond it within a minute...
+    assert len(passed) <= 2 * (limit + 1) + 2
+    # ...and whenever the lines ran out, the last one said so.
+    assert "keeps changing" in passed[limit]
+    assert "keeps changing" in passed[-1]
+    # Once the reason holds still, the last line names it.
+    assert "H.265" in log_.lines[-1] and "keeps changing" not in log_.lines[-1]
+    assert states[-1].error[1].startswith("the topic carries H.265")
 
 
 def test_a_camera_whose_reason_never_settles_is_a_bounded_number_of_lines(units, compressed_video, monkeypatch):
@@ -596,7 +658,7 @@ def test_a_camera_whose_reason_never_settles_is_a_bounded_number_of_lines(units,
     that says the rest is not, and where the reason still is."""
     clock = [5000.0]
     monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
-    limit = ros_runtime.PASSTHROUGH_REFUSAL_LOG_SENTENCES
+    limit = ros_runtime.PASSTHROUGH_REFUSAL_LOG_LINES
 
     async def body(rt):
         await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
@@ -613,6 +675,38 @@ def test_a_camera_whose_reason_never_settles_is_a_bounded_number_of_lines(units,
     assert len(overflow) == 1 and "front" in overflow[0] and "state" in overflow[0]
     assert len(log_.refusals()) == limit + 1 and "codec-late" in log_.refusals()[-1]
     assert states[-1].error[1].startswith("the topic carries codec-late")
+
+
+def test_the_reason_that_stays_after_lines_were_withheld_is_logged_when_the_minute_is_over(
+    units, compressed_video, monkeypatch
+):
+    """Ten reasons within a second, and the tenth stays. Eight were written
+    and then the line that says the reason keeps changing; the tenth was
+    withheld, and since it never changes again nobody offers it again. The
+    log owes it: it is written with the first message that arrives once a
+    minute has room, and then no more."""
+    clock = [5000.0]
+    monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
+    limit = ros_runtime.PASSTHROUGH_REFUSAL_LOG_LINES
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
+        refuse = _refusing(rt, "front", clock)
+        for index in range(10):
+            await refuse("codec{}".format(index), index * 0.1)
+        for at_s in (5, 30, 59):  # codec9 stays; the minute has no room yet
+            await refuse("codec9", at_s)
+        withheld = (len(log_.refusals()), log_.lines[-1])
+        for at_s in (70, 71, 100, 140, 300):  # and stays
+            await refuse("codec9", at_s)
+        return withheld, await _drain_camera_states(rt)
+
+    with _RuntimeLog() as log_:
+        (written, last), states = run(body)
+    assert written == limit and "keeps changing" in last
+    assert len(log_.refusals()) == limit + 1  # once, not once a minute from then on
+    assert "codec9" in log_.lines[-1] and "keeps changing" not in log_.lines[-1]
+    assert states[-1].error[1].startswith("the topic carries codec9")
 
 
 def test_a_refused_camera_answers_a_start_with_its_sentence_and_opens_no_publisher(units):

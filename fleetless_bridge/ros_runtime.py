@@ -1372,13 +1372,13 @@ COMPRESSED_IMAGE_TYPE = "sensor_msgs/msg/CompressedImage"
 PASSTHROUGH_REFUSAL_CODE = "source_error"
 
 #: The sentence that says why a camera cannot be passed through is written
-#: to the robot's log when it is a new one, and again at most once in this
-#: many seconds while it keeps being said.
+#: to the robot's log whenever it is another one than the last written, and
+#: an unchanged one again at most once in this many seconds.
 PASSTHROUGH_REFUSAL_LOG_INTERVAL_S = 60.0
 
-#: How many different sentences per camera are remembered for that, which is
-#: also how many such lines a camera can write within one interval.
-PASSTHROUGH_REFUSAL_LOG_SENTENCES = 8
+#: How many such lines a camera can write within one interval. One more
+#: line then says that the reason keeps changing, and counts as well.
+PASSTHROUGH_REFUSAL_LOG_LINES = 8
 
 #: The fields the bridge reads that type by. `timestamp` is the publisher's
 #: own clock and is not used as time: `timestamp_ms` is bridge capture time
@@ -1643,11 +1643,14 @@ class _CameraEntry:
     # Capture time of the keyframe last decoded for a snapshot, so that one
     # keyframe is decoded once however often a snapshot comes due.
     keyframe_decoded_ms: Optional[int] = None
-    # The sentences logged for a stream that cannot be passed through, each
-    # with the `time.monotonic()` it was last written at, and when the line
-    # that says there were too many was last written (`_log_refusal`).
-    refusal_logged: Dict[str, float] = field(default_factory=dict)
-    refusal_overflow_logged_at: Optional[float] = None
+    # The log lines for a stream that cannot be passed through
+    # (`_log_refusal`): the `time.monotonic()` of each line of the last
+    # minute, the sentence the last of them names, and whether that last
+    # line instead says that the reason keeps changing -- sentences have
+    # been withheld since, and the one in force is still owed.
+    refusal_logged_at: Deque[float] = field(default_factory=deque)
+    refusal_last_logged: Optional[str] = None
+    refusal_lines_withheld: bool = False
 
 
 #: The `live.*` ROS parameters and the check each proposed value has to pass.
@@ -5283,7 +5286,9 @@ class RosRuntime:
             self._log_refusal(slug, entry, message)
             self._end_live_from_executor(slug, (code, message))
 
-    def _log_refusal(self, slug: str, entry: _CameraEntry, message: str) -> None:
+    def _log_refusal(
+        self, slug: str, entry: _CameraEntry, message: str, standing: bool = False
+    ) -> None:
         """A line in the robot's own log for why `slug` cannot be passed
         through. The sentence travels to the cloud in the camera's state,
         and the console shows a state's kind and not its text, so this line
@@ -5291,42 +5296,56 @@ class RosRuntime:
         built from sizes and codec names, or an adapter's ("the camera
         answered RTSP 404").
 
-        **A new sentence is written at once; the same one at most once a
-        minute.** The limit is per sentence and not per camera: the callers
-        hand a sentence on only when it changes, so one that was held back
-        would never be offered again, and the log would name a reason the
-        camera no longer has for as long as the new one stands.
+        **The last line names the reason in force.** A sentence is held
+        back only when it is the one written last, less than a minute ago:
+        the same reason said again. Any other sentence is written, also one
+        that was already written within the minute -- the callers hand a
+        sentence on only when it changes, so one held back would never be
+        offered again, and the log would end on a reason the camera no
+        longer has for as long as the other one stands.
 
         A topic whose messages disagree about their codec changes its
-        sentence with every message; each of its sentences is then written
-        once a minute. A camera that brings up more than
-        `PASSTHROUGH_REFUSAL_LOG_SENTENCES` different ones within a minute
-        gets one more line, which says that the rest is not logged, and
-        where the reason still is."""
+        sentence with every message. `PASSTHROUGH_REFUSAL_LOG_LINES` lines a
+        minute is where that ends: one more line then says that the reason
+        keeps changing and that the camera's state carries the newest. That
+        line stays the last one until a minute has room for a sentence
+        again, so the log never ends on a reason that is no longer the
+        camera's.
+
+        `standing` is for a sentence that is not new: the reason the camera
+        already has, met again with the next unit. It is written only if the
+        log still owes it -- lines were withheld, and the reason that then
+        stayed was among them. Otherwise a reason that stands is one line,
+        not one a minute."""
+        if standing and not entry.refusal_lines_withheld:
+            return
         now_s = time.monotonic()
-        written = entry.refusal_logged
-        for sentence in [
-            sentence for sentence, at in written.items()
-            if now_s - at >= PASSTHROUGH_REFUSAL_LOG_INTERVAL_S
-        ]:
-            del written[sentence]
-        if message in written:
+        written = entry.refusal_logged_at
+        while written and now_s - written[0] >= PASSTHROUGH_REFUSAL_LOG_INTERVAL_S:
+            written.popleft()
+        if not written:
+            # No line within the minute: whatever the last one named may be
+            # named again.
+            entry.refusal_last_logged = None
+        if message == entry.refusal_last_logged:
             return
-        if len(written) >= PASSTHROUGH_REFUSAL_LOG_SENTENCES:
-            if (
-                entry.refusal_overflow_logged_at is None
-                or now_s - entry.refusal_overflow_logged_at >= PASSTHROUGH_REFUSAL_LOG_INTERVAL_S
-            ):
-                entry.refusal_overflow_logged_at = now_s
-                log.warning(
-                    "Camera slug %r: the reason it cannot be passed through "
-                    "keeps changing; no more than %d reasons a minute are "
-                    "logged, the camera's state carries the newest",
-                    slug, PASSTHROUGH_REFUSAL_LOG_SENTENCES,
-                )
+        if len(written) < PASSTHROUGH_REFUSAL_LOG_LINES:
+            written.append(now_s)
+            entry.refusal_last_logged = message
+            entry.refusal_lines_withheld = False
+            log.warning("Camera slug %r cannot be passed through: %s", slug, message)
             return
-        written[message] = now_s
-        log.warning("Camera slug %r cannot be passed through: %s", slug, message)
+        if entry.refusal_lines_withheld:
+            return
+        written.append(now_s)
+        entry.refusal_last_logged = None
+        entry.refusal_lines_withheld = True
+        log.warning(
+            "Camera slug %r: the reason it cannot be passed through keeps "
+            "changing; no more than %d lines a minute name it, the camera's "
+            "state carries the newest",
+            slug, PASSTHROUGH_REFUSAL_LOG_LINES,
+        )
 
     # --- cameras: H.264 that is passed through ------------------------------
 
@@ -5393,6 +5412,10 @@ class RosRuntime:
         the camera reports it once."""
         current = entry.last_source_error
         if current is not None and current[:2] == (PASSTHROUGH_REFUSAL_CODE, message):
+            # Reported already. The log may still owe it: if the reason kept
+            # changing and lines were withheld, the one that then stayed is
+            # written here, once a minute has room for it.
+            self._log_refusal(slug, entry, message, standing=True)
             return
         self._on_source_error(slug, entry, PASSTHROUGH_REFUSAL_CODE, message)
 
