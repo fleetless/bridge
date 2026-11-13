@@ -23,7 +23,6 @@ import pytest
 from aioice import stun
 from aiortc import RTCIceGatherer, RTCIceServer, RTCPeerConnection
 from aiortc.mediastreams import MediaStreamError
-from aiortc.rtcicetransport import connection_kwargs
 
 from fleetless_bridge.camera import LatestFrameHolder
 from fleetless_bridge.live import (
@@ -328,9 +327,9 @@ def test_turn_fallback_reuses_session_and_track_without_reporting_loss():
     assert first.close_calls == 1
     assert second.added_tracks == [track]
     assert first.added_tracks == [track]
-    assert [url for server in second.ice_servers for url in server.urls] == [
-        "stun:stun.example:3478", "stun:second.example:3478",
-    ]
+    # Host candidates only: the retry asks neither the relay that just failed
+    # nor a STUN server.
+    assert second.ice_servers == ()
     assert [call for call in signal.calls if isinstance(call, tuple) and call[0] == "add_track"] == [
         ("add_track", "fake-track-id", "camera", 64, 48, 500_000),
     ]
@@ -373,21 +372,13 @@ def test_turn_fallback_reports_second_failure_and_tears_down(second_failure, err
 @pytest.mark.parametrize("join, failure", [
     (_turn_join(), RuntimeError("not a TURN transaction")),
     (JoinInfo(ice_servers=(IceServer(urls=("stun:stun.example:3478",)),)), _turn_failure()),
-    (JoinInfo(ice_servers=(IceServer(urls=("turn:turn.example:3478",)),)), _turn_failure()),
-    (JoinInfo(ice_servers=(IceServer(urls=(
-        "turn:turn.example:3478", "https://other.example/ice",
-    )),)), _turn_failure()),
-    (JoinInfo(ice_servers=(IceServer(urls=(
-        "turn:turn.example:3478", "stuns:secure.example:5349",
-    )),)), _turn_failure()),
-    (JoinInfo(ice_servers=(IceServer(urls=(
-        "turn:turn.example:3478", "STUN:stun.example:3478",
-    )),)), _turn_failure()),
-    (JoinInfo(ice_servers=(IceServer(urls=(
-        "turn:turn.example:3478", "STUNS:secure.example:5349",
-    )),)), _turn_failure()),
+    (JoinInfo(ice_servers=()), stun.TransactionTimeout()),
 ])
 def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure):
+    """The trigger is a TURN transaction failing for a `join` that named a TURN
+    server. Anything else failing, or the same failure with no relay in the
+    `join` to blame it on, is not this path's to retry."""
+
     async def scenario():
         signal = _FakeSignal(join=join)
         first = _FakeConnection(fail_local=failure)
@@ -403,7 +394,35 @@ def test_turn_fallback_does_not_retry_unrelated_gathering_failures(join, failure
     assert signal.close_calls == 1
 
 
-def test_turn_fallback_keeps_only_usable_stun_from_mixed_ice_urls():
+@pytest.mark.parametrize("urls", [
+    ("turn:turn.example:3478",),
+    ("TURNS:turn.example:443?transport=tcp",),
+    ("turn:turn.example:3478", "https://other.example/ice"),
+    ("turn:turn.example:3478", "stuns:secure.example:5349"),
+    ("turn:turn.example:3478", "STUN:stun.example:3478"),
+])
+def test_turn_fallback_retries_when_the_join_named_no_stun_server(urls):
+    """The retry used to need a `stun:` URL to fall back on and gave up
+    without one. It asks no server now, so a `join` that names a relay and
+    nothing else is retried like any other."""
+
+    async def scenario():
+        signal = _FakeSignal(join=JoinInfo(ice_servers=(IceServer(urls=urls),)))
+        first = _FakeConnection(fail_local=_turn_failure())
+        second = _FakeConnection()
+        track = _FakeTrack()
+        pub = _publisher(signal, [first, second], track)
+        await pub.start("wss://media.example", "room-1", "test-token")
+        await pub.stop()
+        return first, second, track
+
+    first, second, track = asyncio.run(scenario())
+    assert first.close_calls == 1
+    assert second.added_tracks == [track]
+    assert second.ice_servers == ()
+
+
+def test_turn_fallback_hands_the_second_connection_no_ice_server():
     async def scenario():
         join = JoinInfo(ice_servers=(
             IceServer(urls=(
@@ -424,23 +443,19 @@ def test_turn_fallback_keeps_only_usable_stun_from_mixed_ice_urls():
         return second
 
     second = asyncio.run(scenario())
-    assert [url for server in second.ice_servers for url in server.urls] == [
-        "stun:stun.example:3478",
-    ]
+    assert second.ice_servers == ()
 
-    # Exercise the same aiortc parser and peer factory that production uses.
-    # A fake peer alone accepts schemes that aiortc ignores or rejects.
-    rtc_servers = [RTCIceServer(urls=list(server.urls)) for server in second.ice_servers]
-    assert connection_kwargs(rtc_servers)["stun_server"] == ("stun.example", 3478)
-
+    # The same argument through the factory production uses: a real peer
+    # connection that asks neither a relay nor a STUN server. A fake peer
+    # alone accepts anything it is handed.
     async def real_peer():
         pc = _default_connection_factory(second.ice_servers)
         try:
-            pc.addTrack(CameraTrack(64, 48, 10))
+            return _gathering_servers(pc)
         finally:
             await pc.close()
 
-    asyncio.run(real_peer())
+    assert asyncio.run(real_peer()) == (None, None)
 
 
 def test_turn_fallback_logs_timeout_without_credentials():
@@ -461,6 +476,7 @@ def test_turn_fallback_logs_timeout_without_credentials():
     warnings = [message for message in messages if "TURN" in message]
     assert len(warnings) == 1
     assert "timed out" in warnings[0]
+    assert warnings[0].endswith("retrying without TURN")
     assert "turns:turn.example:443" in warnings[0]
     assert not any(secret in "".join(messages) for secret in (
         "test-user", "test-credential", "test-token", "transport=tcp",
@@ -488,6 +504,7 @@ def test_turn_fallback_logs_code_and_redacts_reason_and_url_query():
     warnings = [message for message in messages if "TURN" in message]
     assert len(warnings) == 1
     assert "508" in warnings[0]
+    assert warnings[0].endswith("retrying without TURN")
     assert "turns:turn.example:443" in warnings[0]
     assert "Insufficient Capacity" in warnings[0]
     assert not any(secret in "".join(messages) for secret in (
