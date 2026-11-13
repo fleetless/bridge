@@ -1,3 +1,18 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.3.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(live): log how long each live start took
+  * fix(live): start live video without asking a STUN server
+  * fix(live): retry without any ICE server when TURN gathering fails
+  * fix(camera): show the newest held frame first when live video starts
+  * fix(live): answer a viewer's keyframe request without waiting for the next frame
+  * docs(live-proof): say where the start time is read
+  * fix(camera): count the frame limit from when a held frame arrived
+  * fix(live): send RTP packets of at most 1200 bytes, so video crosses a path with an MTU of 1280
+  * feat(live): set the largest RTP packet with live.max_packet_bytes, as a ROS parameter or in fleetless.yaml
+  * docs(readme): the default packet size is 1200 bytes, and 1280 is the MTU NetBird and Tailscale set
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Fri, 13 Nov 2026 05:49:57 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.2.3-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * docs(install): use registry apt URL
