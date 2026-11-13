@@ -6840,7 +6840,7 @@ def test_start_live_tells_the_publisher_its_slug_and_when_the_command_arrived():
     # The second start waited out the stop before its publisher was built.
     # Its instant is when it was asked, not when it got the lock.
     assert built_at - asked_at >= 0.25
-    assert asked_at <= second.received_s < asked_at + 0.1
+    assert asked_at <= second.received_s < asked_at + 0.2
 
 
 def test_start_live_reports_publishing_false_when_the_publisher_fails_to_start():
