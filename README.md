@@ -248,9 +248,12 @@ ros2 param set /fleetless_bridge live.encoder nvenc
 It holds for every camera of the robot and applies at the next live start; a
 running stream keeps the encoder it has. With any value but `software` a
 camera's `width` and `height` must be even, since H.264 takes no odd size: the
-cloud refuses such a configuration, and the bridge refuses the live start of
-such a camera with `live_unavailable` and the reason. Its snapshots go on. The `live` section of the published
-`fleetless.yaml` overrides the parameter for as long as it names the key:
+cloud refuses such a configuration, and the bridge refuses the live start of a
+camera it encodes with `live_unavailable` and a message naming the setting and
+the size. Its snapshots go on. A passed-through camera meets its own check
+instead: its stream cannot have an odd size, so it never matches the
+configured one. The `live` section of the published `fleetless.yaml`
+overrides the parameter for as long as it names the key:
 
 ```yaml
 live:
