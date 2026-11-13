@@ -461,4 +461,11 @@ else
     echo "run-tests.sh: checkout (or an unpacked npm tarball) to run them." >&2
 fi
 
+# test/test_early_stop.py stops the bridge at twenty moments for each way of
+# being stopped. FLEETLESS_EARLY_STOP_MOMENTS=40 asks it for the forty of a
+# run by hand. Passed on as it is: the test refuses a value it does not know.
+if [ -n "${FLEETLESS_EARLY_STOP_MOMENTS:-}" ]; then
+    run_args+=(-e "FLEETLESS_EARLY_STOP_MOMENTS=$FLEETLESS_EARLY_STOP_MOMENTS")
+fi
+
 run "${run_args[@]}" "$IMAGE"
