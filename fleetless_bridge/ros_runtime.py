@@ -1882,6 +1882,10 @@ class RosRuntime:
         # The resolved `live.encoder`, as `set_live_settings` last heard it.
         # Read once per live start: a running stream keeps its encoder.
         self._live_encoder: str = LIVE_DEFAULTS["encoder"]
+        # Per camera, the setting and the size `start_live` last logged a
+        # refusal of an odd size for: one warning for a pair, not one per
+        # attempt. Read and written on the loop thread only.
+        self._odd_size_warned: Dict[str, Tuple[str, int, int]] = {}
         self.samples = SampleQueue(maxsize=sample_queue_maxsize)
         self.backlog = BacklogStore()
         self.jobs = JobManager()
@@ -2795,6 +2799,41 @@ class RosRuntime:
                 seen_ms.append(keyframe.timestamp_ms)
         return max(seen_ms) if seen_ms else None
 
+    def _odd_size_refusal(self, slug: str, entry: _CameraEntry) -> Optional[str]:
+        """Why `slug` may not start live with this `live.encoder`, or `None`.
+
+        With any setting but `software` the bridge offers H.264 only, and
+        H.264 as it sends it (4:2:0) takes no odd width or height. The cloud
+        refuses such a document; this is the answer where the setting came
+        from the ROS parameter, which the cloud never sees, or the document
+        from a cloud that does not know the rule. The sentence is the
+        cloud's, said of the whole size: one camera state carries one
+        message.
+
+        A camera that passes its H.264 through is left alone: nothing
+        encodes it, so `live.encoder` does not reach it. Its size has to
+        equal its stream's, and a stream that does not is the passthrough's
+        own refusal.
+
+        Logged once per camera for a setting and a size, not at every
+        attempt: a viewer that keeps asking does not fill the log. A start
+        this lets through forgets the camera, so the same pair is said again
+        the next time it is refused. Loop thread only, under the slug's
+        lock."""
+        setting = self._live_encoder
+        width, height = entry.width, entry.height
+        if setting == "software" or entry.passes_through or (width % 2 == 0 and height % 2 == 0):
+            self._odd_size_warned.pop(slug, None)
+            return None
+        message = (
+            "With live.encoder: {} the bridge sends H.264, which takes no odd size: set an "
+            "even width and height instead of {}x{}, or live.encoder: software."
+        ).format(setting, width, height)
+        if self._odd_size_warned.get(slug) != (setting, width, height):
+            self._odd_size_warned[slug] = (setting, width, height)
+            log.warning("Camera %r: %s", slug, message)
+        return message
+
     def _live_lock(self, slug: str) -> asyncio.Lock:
         """One lock per slug, created on first use and kept for the life of
         the process (bounded by the number of configured cameras, same
@@ -2910,6 +2949,26 @@ class RosRuntime:
                     CameraStateUpdate(
                         slug, False,
                         ("live_unavailable", "no camera configured for slug {!r}".format(slug)),
+                        cause=CAMERA_STATE_CAUSE_COMMAND,
+                        observed_at_ms=sampling.capture_timestamp_ms(),
+                        request_id=request_id,
+                    )
+                )
+                return
+
+            # A camera of odd size under an encoder that sends H.264 only
+            # gets no picture: every chain fails for the size, and so does
+            # the software H.264 it falls back to. Refused before the
+            # low-bandwidth refusal, for the reason that one gives after the
+            # slug's own lookup: this is the camera's own truth, and it does
+            # not pass when the link recovers. Before any encoder, pipeline
+            # or publisher exists, so nothing is remembered against a chain:
+            # the chip is not at fault. Snapshots are not touched.
+            refusal = self._odd_size_refusal(slug, entry)
+            if refusal is not None:
+                self.camera_states.put(
+                    CameraStateUpdate(
+                        slug, False, ("live_unavailable", refusal),
                         cause=CAMERA_STATE_CAUSE_COMMAND,
                         observed_at_ms=sampling.capture_timestamp_ms(),
                         request_id=request_id,
