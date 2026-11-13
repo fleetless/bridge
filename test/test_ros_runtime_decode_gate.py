@@ -28,7 +28,7 @@ from helpers import by_slug
 from fleetless_bridge import camera
 from fleetless_bridge.live import LivePublisher
 from fleetless_bridge.ros_runtime import RosRuntime
-from test_live import _FakeConnection, _FakeSignal, _FakeTrack
+from test_live import _FakeConnection, _FakeSignal, _FakeTrack, _quality
 from test_ros_runtime import (
     _camera_cfg,
     _drain_camera_states,
@@ -202,15 +202,18 @@ def _image_msg(color, *, width=16, height=12, encoding="bgr8"):
     return msg
 
 
-def _publisher_factory_with_fake_peers(tracks):
+def _publisher_factory_with_fake_peers(tracks, signals=None):
     """The shipped `LivePublisher` and its own feed loop, joined to a fake
     room. `_fake_live_factory` would only show that `latest` was filled; what
     a viewer gets is what the publisher pushes to its track, and that is read
-    here."""
+    here. `signals` collects each publisher's signal, for a test that plays
+    the room's side: `signals[0].fire("on_quality_update", ...)`."""
 
     def factory(**kwargs):
         signal, track = _FakeSignal(), _FakeTrack()
         tracks.append(track)
+        if signals is not None:
+            signals.append(signal)
 
         def signal_factory(url, token, **callbacks):
             signal.callbacks = callbacks
@@ -517,3 +520,128 @@ def test_a_held_message_with_no_arrival_time_counts_as_arriving_when_it_is_conve
         return entry.latest.get().timestamp_ms
 
     assert run(body) == 1_000
+
+
+# --- a paused publisher needs no frames (fleetless/fleetless#1118) ----------
+#
+# The cloud now keeps a robot in its room for 30 s after the last viewer, so
+# "a publisher exists and nobody is subscribed" is no longer a moment between
+# two commands: it is half a minute, after every viewing. The publisher has
+# always paused its encoder and its feed for it. The camera source had not:
+# it converted every message for as long as a publisher existed.
+
+_NOBODY = (False, False, False)
+_SOMEBODY = (False, False, True)
+
+
+def test_a_paused_publisher_leaves_the_cameras_messages_raw(monkeypatch):
+    """With a publisher that nobody is subscribed to, messages arrive and not
+    one is converted -- the claim the idle test above makes for a camera with
+    no publisher at all, now for one whose publisher is paused. Break: read
+    only `slug in self._live_publishers` in `conversion_wanted`."""
+    tracks, signals = [], []
+
+    async def body(rt):
+        calls = _counting_to_bgr(monkeypatch)
+        stop_pub = _start_image_publisher("/image_raw", width=16, height=12, hz=30)
+        try:
+            await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=30)]))
+            await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+            await _eventually(lambda: len(calls) >= 3)  # live and unpaused: every message converts
+
+            signals[0].fire("on_quality_update", _quality(*_NOBODY))
+            await _executor_caught_up(rt)  # a message already in its callback finishes
+            entry = rt._cameras["front"]
+            entry.raw.take()
+            at_pause = len(calls)
+            await asyncio.sleep(0.3)  # some nine messages at 30 Hz
+            held = entry.raw.take()
+            during_pause = len(calls) - at_pause
+
+            signals[0].fire("on_quality_update", _quality(*_SOMEBODY))
+            await _eventually(lambda: len(calls) >= at_pause + 3)  # and eager again once somebody watches
+            await rt.stop_live("front", request_id="req-2")
+            return held, during_pause
+        finally:
+            stop_pub()
+
+    held, during_pause = run(
+        body, live_publisher_factory=_publisher_factory_with_fake_peers(tracks, signals)
+    )
+    assert held is not None  # messages really did keep arriving
+    assert during_pause == 0  # and none of them was decoded
+
+
+def test_a_resume_converts_the_newest_held_message_before_the_next_one_arrives(monkeypatch):
+    """No next message exists in this test at all. The viewer who comes back
+    gets the newest picture the camera had sent, converted on the resume, and
+    not whatever `latest` held from before the pause until the camera's next
+    message. Break: drop `on_resume` from the publisher `start_live` builds."""
+    tracks, signals = [], []
+
+    async def body(rt):
+        calls = _counting_to_bgr(monkeypatch)
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=50)]))
+        entry = rt._cameras["front"]
+        entry.raw.set(_image_msg((10, 20, 30)), 1_000)
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        await _executor_caught_up(rt)
+        await _eventually(lambda: tracks[0].pushed)  # the start's own first picture
+
+        signals[0].fire("on_quality_update", _quality(*_NOBODY))
+        entry.raw.set(_image_msg((40, 50, 60)), 2_000)  # arrives while nobody watches
+        await _executor_caught_up(rt)
+        while_paused = (entry.latest.get().timestamp_ms, len(calls), len(tracks[0].pushed))
+
+        signals[0].fire("on_quality_update", _quality(*_SOMEBODY))
+        await _executor_caught_up(rt)
+        latest = entry.latest.get()
+        await _eventually(lambda: len(tracks[0].pushed) >= 2)
+        pushed = list(tracks[0].pushed)
+        await rt.stop_live("front", request_id="req-2")
+        return while_paused, latest, pushed, len(calls)
+
+    while_paused, latest, pushed, conversions = run(
+        body, live_publisher_factory=_publisher_factory_with_fake_peers(tracks, signals)
+    )
+    assert while_paused == (1_000, 1, 1)  # held, not converted, nothing pushed
+    assert latest.timestamp_ms == 2_000  # its own capture time
+    assert conversions == 2
+    assert [frame[0, 0].tolist() for frame in pushed] == [[30, 20, 10], [60, 50, 40]]
+
+
+def test_snapshots_keep_working_while_the_publisher_is_paused(monkeypatch):
+    """A snapshot is due whether or not anyone watches live, and a paused
+    publisher changes nothing about that: the dueness walk converts the one
+    message it sends, as it does for a camera with no publisher."""
+    tracks, signals = [], []
+
+    async def body(rt):
+        calls = _counting_to_bgr(monkeypatch)
+        stop_pub = _start_image_publisher("/image_raw", width=16, height=12, hz=30)
+        try:
+            await rt.apply_cameras(by_slug(
+                [_camera_cfg("front", width=16, height=12, fps=30, snapshot_interval_seconds=1)]
+            ))
+            await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+            signals[0].fire("on_quality_update", _quality(*_NOBODY))
+            await _executor_caught_up(rt)
+            await _pull_snapshot(rt)  # whatever was due from before the pause
+            rt._cameras["front"].raw.take()
+            before = len(calls)
+
+            await asyncio.sleep(1.1)  # the next one falls due, with the publisher still paused
+            wire = await _pull_snapshot(rt)
+            conversions = len(calls) - before
+            await rt.stop_live("front", request_id="req-2")
+            return wire, conversions
+        finally:
+            stop_pub()
+
+    wire, conversions = run(
+        body, live_publisher_factory=_publisher_factory_with_fake_peers(tracks, signals)
+    )
+    header, image_bytes = _split_snapshot_frame(wire)
+    assert header["slug"] == "front"
+    assert len(image_bytes) > 0
+    assert conversions == 1  # the one frame the snapshot sent, not thirty a second

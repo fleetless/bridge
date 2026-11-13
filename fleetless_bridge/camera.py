@@ -370,7 +370,8 @@ class RawFrameHolder:
     `take()` — unlike `LatestFrameHolder.get()` — clears the slot: the
     frame is converted at most once, by whichever path consumes it. There
     are two, and both go through `RosRuntime._convert_due_raw_frame`: the
-    dueness walk of `_next_snapshot`, and a live start
+    dueness walk of `_next_snapshot`, and the moment live wants a picture —
+    a live start, or a paused publisher resuming
     (`RosRuntime.convert_newest_raw_frame`). Written on the executor thread
     (the ROS subscription callback, or the hand-off of an MJPEG part);
     `take()` runs on that same thread for both readers, so the lock here is
@@ -383,7 +384,12 @@ class RawFrameHolder:
     interval old at that moment — and not the next one, which is up to a
     whole interval away. Messages that arrive while the room is being joined
     stay raw; from the moment the stream is live, `_on_source_frame` converts
-    every accepted frame as it arrives."""
+    every accepted frame as it arrives.
+
+    **What a paused publisher does with it.** Nothing, for as long as nobody
+    is subscribed: messages stay raw, as they do with no publisher at all.
+    When somebody subscribes again the publisher resumes and the newest held
+    message is converted at once, the same way."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()

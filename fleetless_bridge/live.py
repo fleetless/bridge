@@ -527,6 +527,7 @@ class LivePublisher:
         on_lost: Optional[Callable[[str], None]] = None,
         slug: Optional[str] = None,
         received_s: Optional[float] = None,
+        on_resume: Optional[Callable[[], Any]] = None,
     ) -> None:
         self._holder = holder
         self._width = width
@@ -552,6 +553,14 @@ class LivePublisher:
         # whatever the caller did first. `None` counts from `start()`.
         self._slug = slug
         self._received_s = received_s
+        # Called on the event loop each time publishing resumes, after
+        # `paused` has turned false and before the track is handed back to
+        # the sender. It is how the camera source learns that a picture is
+        # wanted again: while this publisher is paused, a ROS camera keeps its
+        # messages unconverted (ros_runtime.py, `conversion_wanted`), and the
+        # newest of them is what the returning viewer should see. Whatever it
+        # returns is ignored, and so is what it raises.
+        self._on_resume = on_resume
         self._signal = None
         self._pc = None
         self._track = None
@@ -572,6 +581,17 @@ class LivePublisher:
         # budget outside the negotiated codec's clamp -- so the log line
         # below fires once per session, not once per tick.
         self._bitrate_clamp_logged = False
+
+    @property
+    def paused(self) -> bool:
+        """Whether nobody is subscribed right now: the encoder idles and the
+        feed loop converts nothing. False from construction until the room
+        first says otherwise -- a publisher that has heard nothing yet still
+        has its first picture to send.
+
+        A plain attribute read, safe from any thread. The camera source reads
+        it on the ROS executor thread for every message it receives."""
+        return self._paused
 
     async def start(self, url: str, room_name: str, token: str) -> None:
         """Joins, publishes and negotiates. Raises `LiveStartError` on any
@@ -1024,6 +1044,11 @@ class LivePublisher:
         if paused == self._paused:
             return
         self._paused = paused
+        if not paused:
+            # After the flag and before anything else, sender or no sender:
+            # from the flag on, the camera converts each message as it
+            # arrives, so this call only has to fetch what was held before.
+            self._tell_resume()
         sender, track = self._sender, self._track
         if sender is None:
             return
@@ -1044,6 +1069,17 @@ class LivePublisher:
             return
         log.info("Live publish %s (subscribed layers: %s)",
                  "paused" if paused else "resumed", "none" if paused else "at least one")
+
+    def _tell_resume(self) -> None:
+        if self._on_resume is None:
+            return
+        try:
+            self._on_resume()
+        except Exception as exc:  # noqa: BLE001 - the resume goes ahead either way
+            # The viewer then gets the camera's next message instead of the
+            # one it was holding: later by one camera interval at the most.
+            log.error("Could not tell the camera that live publishing resumed: %s",
+                      type(exc).__name__)
 
     def _answer_keyframe_requests_at_once(self) -> None:
         """Make a keyframe request wake the track as well.

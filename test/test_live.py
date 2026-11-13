@@ -1384,6 +1384,94 @@ def test_a_subscribed_layer_resumes_the_feed_and_asks_for_a_keyframe():
     assert len(track.pushed) == 2
 
 
+def test_paused_says_whether_anybody_is_subscribed():
+    """`paused` is what the camera source reads to decide whether a message
+    is worth converting for live at all (ros_runtime.py, `conversion_wanted`).
+    Not paused from the start: a publisher that has heard nothing yet still
+    has its first picture to send."""
+
+    async def scenario():
+        pub, signal, connection, track = _started()
+        seen = [pub.paused]
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        seen.append(pub.paused)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        seen.append(pub.paused)
+        signal.fire("on_quality_update", _quality(False, False, True))
+        seen.append(pub.paused)
+        await pub.stop()
+        return seen
+
+    assert asyncio.run(scenario()) == [False, False, True, False]
+
+
+def test_a_resume_tells_whoever_asked_to_hear_of_it_once():
+    """`on_resume` is how the camera's newest held message gets converted the
+    moment somebody watches again. Once per resume: not at the start, not on
+    the pause, and not for an update that changes nothing."""
+
+    async def scenario():
+        resumes = []
+        pub, signal, connection, track = _started(on_resume=lambda: resumes.append(pub.paused))
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        signal.fire("on_quality_update", _quality(False, False, True))  # already running
+        at_start = list(resumes)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        on_pause = list(resumes)
+        signal.fire("on_quality_update", _quality(False, False, True))
+        signal.fire("on_quality_update", _quality(False, True, True))  # still subscribed
+        after_resume = list(resumes)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        signal.fire("on_quality_update", _quality(True, False, False))
+        await pub.stop()
+        return at_start, on_pause, after_resume, resumes
+
+    at_start, on_pause, after_resume, resumes = asyncio.run(scenario())
+    assert at_start == [] and on_pause == []
+    # Called with the publisher already unpaused: a message that arrives from
+    # here on is converted as it comes, so the call only has to cover what was
+    # held before it.
+    assert after_resume == [False]
+    assert resumes == [False, False]
+
+
+def test_a_resume_hook_that_fails_does_not_cost_the_resume():
+    async def scenario():
+        def explode():
+            raise RuntimeError("the camera went away")
+
+        holder = LatestFrameHolder()
+        holder.set(_solid_frame(), timestamp_ms=100)
+        pub, signal, connection, track = _started(holder=holder, fps=200, on_resume=explode)
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)  # the first frame goes out
+        signal.fire("on_quality_update", _quality(False, False, False))
+        before = len(track.pushed)
+        signal.fire("on_quality_update", _quality(False, False, True))
+        holder.set(_solid_frame(), timestamp_ms=200)
+        await asyncio.sleep(0.05)
+        await pub.stop()
+        return connection.sender, track, pub.paused, before
+
+    sender, track, paused, before = asyncio.run(scenario())
+    assert paused is False
+    assert sender.replaced == [None, track]
+    assert sender.keyframes == 1
+    assert before == 1 and len(track.pushed) == 2  # the feed runs again
+
+
+def test_a_resume_before_the_track_is_published_is_still_heard():
+    """The flag and the hook do not wait for a sender: a publisher told
+    "nobody" and then "somebody" while it is still joining has to end up
+    unpaused, with the held message asked for."""
+    resumes = []
+    pub, signal, connection, track = _started(on_resume=lambda: resumes.append(True))
+    pub._set_paused(True)
+    pub._set_paused(False)
+    assert pub.paused is False
+    assert resumes == [True]
+
+
 def test_a_quality_update_carrying_no_layers_changes_nothing():
     """`{}` and "every layer is off" look alike — protojson omits `false` — and
     they are opposites. A message with nothing in it must not pause a working
