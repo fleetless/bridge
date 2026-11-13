@@ -57,6 +57,23 @@ development credentials (`LK_URL`, `LK_KEY`, `LK_SECRET` override them). The
 room name carries the case and a random suffix, so a viewer cannot be looking
 at another run's stream.
 
+`--encoder=stand-in` (with `h264`) hands the publisher the bridge's own
+encoder, the class a robot gets with `live.encoder` other than `software`,
+over the software stand-in chain: the real GStreamer pipeline with `x264enc`
+where a robot has its chip. It answers "does a real browser decode what the
+bridge's own encoder sends?" on a machine without an encoder chip:
+
+```
+tools/live-proof/run-proof.sh humble h264 --encoder=stand-in
+```
+
+The publisher logs which chain carried the session and exits non-zero if the
+encoder fell back to aiortc's libx264 on the way; the run then fails whatever
+the viewer saw, because a fallback also shows moving video. The viewer's
+browser has to decode H.264: Google Chrome does, a Chromium build without
+proprietary codecs does not. For a chip itself, `tools/encoder-proof/` is the
+instrument.
+
 ## What it asserts, and how each half is broken on purpose
 
 The viewer asserts three independent things: a frame arrived (`videoWidth >

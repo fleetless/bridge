@@ -5,7 +5,11 @@
 # one ROS distribution, then ask a real browser whether it decodes moving video
 # from it.
 #
-#   ./run-proof.sh <distro> <vp8|h264|all> [--still]
+#   ./run-proof.sh <distro> <vp8|h264|all> [--still] [--encoder=stand-in]
+#
+# `--encoder=stand-in` publishes with the bridge's own encoder over the
+# software stand-in chain (see publish.py); it needs `h264`, and an image
+# built from the current Dockerfile.dev, which has GStreamer.
 #
 # Both logs are kept. The viewer's verdict means nothing on its own: a viewer
 # that saw no video next to a publisher that never reached `connected` is a
@@ -22,15 +26,23 @@ REPO=$(cd ../.. && pwd)
 
 DISTRO=${1:-humble}
 CODEC=${2:-vp8}
-STILL=${3:-}
 SECONDS_TO_RUN=${LIVE_PROOF_SECONDS:-45}
 
-case "$STILL" in
-  ""|--still) ;;
-  *) echo "run-proof.sh: third argument, if given, must be --still" >&2; exit 2 ;;
-esac
+STILL=
+ENCODER=
+for option in "${@:3}"; do
+  case "$option" in
+    --still) STILL=--still ;;
+    --encoder=stand-in) ENCODER=stand-in ;;
+    *) echo "run-proof.sh: unknown option $option (--still, --encoder=stand-in)" >&2; exit 2 ;;
+  esac
+done
+if [ -n "$ENCODER" ] && [ "$CODEC" != "h264" ]; then
+    echo "run-proof.sh: --encoder=stand-in is H.264; the second argument has to be h264" >&2
+    exit 2
+fi
 
-LABEL="$DISTRO-$CODEC${STILL:+-still}"
+LABEL="$DISTRO-$CODEC${ENCODER:+-$ENCODER}${STILL:+-still}"
 ROOM="fl-live-proof-$LABEL-$RANDOM"
 IMAGE="fleetless-bridge-dev-$DISTRO"
 NAME="fl-live-proof-$LABEL-$$"
@@ -45,11 +57,12 @@ if ! $DOCKER image inspect "$IMAGE" >/dev/null 2>&1; then
     exit 2
 fi
 
-echo "=== $DISTRO / $CODEC${STILL:+ / still} / room=$ROOM ==="
+echo "=== $DISTRO / $CODEC${ENCODER:+ / encoder $ENCODER}${STILL:+ / still} / room=$ROOM ==="
 $DOCKER run --rm --name "$NAME" --network host \
     -v "$REPO:/ws:ro" -w /ws \
     "$IMAGE" python3 tools/live-proof/publish.py \
         --room "$ROOM" --codec "$CODEC" --seconds "$SECONDS_TO_RUN" $STILL \
+        ${ENCODER:+--encoder "$ENCODER"} \
     > "$LOGDIR/publisher.log" 2>&1 &
 PUB=$!
 
@@ -81,7 +94,15 @@ sed -n '1,40p' "$LOGDIR/viewer.log"
 echo "  viewer exit=$VIEWER"
 
 wait $PUB
-echo "  publisher exit=$?"
-grep -E "frames handed|EXIT|FAILED|LOST" "$LOGDIR/publisher.log" | tail -4
+PUBLISHER=$?
+echo "  publisher exit=$PUBLISHER"
+grep -E "frames handed|HARNESS encoder:|EXIT|FAILED|LOST" "$LOGDIR/publisher.log" | tail -5
 $DOCKER rm -f "$NAME" >/dev/null 2>&1 || true
+# With the bridge's own encoder the publisher's verdict counts too: a session
+# that fell back to aiortc's libx264 shows moving video all the same, and
+# proves nothing about the pipeline.
+if [ -n "$ENCODER" ] && [ "$PUBLISHER" -ne 0 ]; then
+    echo "  the bridge's own encoder did not carry the session: FAIL"
+    exit "$PUBLISHER"
+fi
 exit $VIEWER
