@@ -62,17 +62,37 @@ sockets for as long as somebody is watching a camera.
 
 **The bridge is ROS-pure** — no shell, systemd or HTTP features, and that's a
 security property, not a style choice. No code path runs from a cloud
-message to a process launch, a file write outside the upload path, or a
-system change. A robot that needs local limits (a speed cap, an area
+message to a system change. None runs to a process launch or to a file write
+outside the upload path either, with the one exception named below: a
+process whose command line the cloud has no say in, and a cache file of
+GStreamer's own. A robot that needs local limits (a speed cap, an area
 restriction) sets them robot-side, in ROS, in a node the robot's owner
 controls — not through this bridge.
 
-The one child process it starts is a Python `multiprocessing` worker that
-owns a V4L2 capture device, so a hung driver read can't block the rest of the
-bridge. It runs this package's own function, not a command line — the only
-configuration value that reaches it is the device path, and
+The one child process the bridge starts itself is a Python `multiprocessing`
+worker that owns a V4L2 capture device, so a hung driver read can't block the
+rest of the bridge. It runs this package's own function, not a command line —
+the only configuration value that reaches it is the device path, and
 `validate_device_path` refuses anything but a non-traversing path under
 `/dev/`.
+
+GStreamer starts a second one, and only on a robot whose `live.encoder` is
+not `software`. The hardware encoders are reached through GStreamer, which
+the bridge loads with the first live session that uses one. When GStreamer's
+plugin registry is missing or stale, its initialisation runs GStreamer's own
+plugin scanner (`gst-plugin-scanner`) as a child process and writes the
+registry file to the bridge user's cache directory,
+`$XDG_CACHE_HOME/gstreamer-1.0/` (`~/.cache/gstreamer-1.0/` by default). That
+happens at the first hardware start, again after an update of a GStreamer
+package, and at every start of a bridge whose user cannot write that
+directory.
+
+Nothing from a cloud message reaches the scanner's command line: the binary
+and its arguments are GStreamer's. What the cloud can do is cause it to run,
+by publishing a configuration that names a hardware encoder and starting a
+camera. The bridge does not turn the child off (`GST_REGISTRY_FORK=no`):
+scanning in the bridge's own process would load every installed plugin into
+it.
 
 ### What the cloud can make it do
 

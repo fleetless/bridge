@@ -14,9 +14,9 @@ handed over when `live.encoder` is not `software`.
   asked for a keyframe. `CHAINS` lists them per backend, in the order they
   are tried.
 - A `Pipeline` runs one chain: `appsrc`, the chain, `h264parse`, `appsink`.
-  One frame in, one access unit out, as an Annex-B byte string. No
-  subprocess and no main loop: the sample is pulled with a timeout and the
-  bus is polled.
+  One frame in, one access unit out, as an Annex-B byte string. No main
+  loop and no process of the bridge's own: the sample is pulled with a
+  timeout and the bus is read with every frame.
 - `HardwareH264Encoder` is aiortc's `H264Encoder` with `_encode_frame`
   replaced. It picks the chain, falls back to aiortc's own libx264 when no
   chain works, and remembers per process which chains did not.
@@ -25,6 +25,16 @@ handed over when `live.encoder` is not `software`.
 `_load_gst`, on the first frame of a session whose encoder is not
 `software`, and nowhere else. A robot without it encodes in software and is
 told which packages are missing.
+
+**GStreamer starts one child process of its own, and writes one file.**
+When its plugin registry is missing or stale, `Gst.init` runs GStreamer's
+plugin scanner (`gst-plugin-scanner`) as a child and writes the registry to
+the user's cache, `$XDG_CACHE_HOME/gstreamer-1.0/`. That is at the first
+hardware session, after an update of a GStreamer package, and at every start
+where that directory cannot be written. Nothing from a cloud message reaches
+the scanner's command line. `GST_REGISTRY_FORK=no` would spare the child by
+loading every installed plugin into the bridge's own process, and is not
+set. `SECURITY.md` names both.
 
 **No chain here is proven on its hardware by this package's own tests.**
 Each is written to the documentation of its elements. The machines this is
@@ -331,6 +341,12 @@ def _pin_the_unwinder() -> None:
     for the unwinder finds gcc's, before GStreamer's dependency is there to
     be found. It changes nothing for libraries already loaded, and GStreamer
     uses libunwind through names of its own.
+
+    Where GStreamer links libunwind, both are in the process long before
+    this module does anything: OpenCV, which the bridge imports for its
+    cameras, maps GStreamer for its own video input. That is harmless,
+    because it maps them for itself alone. It is `gi` that puts them where
+    everybody looks.
 
     `test_live_encoder_pipeline.py` loads GStreamer and then makes a ROS
     node and an image library error, each in a fresh interpreter. Without
