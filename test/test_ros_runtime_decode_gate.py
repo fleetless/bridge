@@ -27,6 +27,7 @@ from helpers import by_slug
 
 from fleetless_bridge import camera
 from fleetless_bridge.live import LivePublisher
+from fleetless_bridge.ros_runtime import RosRuntime
 from test_live import _FakeConnection, _FakeSignal, _FakeTrack
 from test_ros_runtime import (
     _camera_cfg,
@@ -452,3 +453,46 @@ def test_convert_newest_raw_frame_is_a_no_op_for_a_slug_without_a_camera():
         return rt.convert_newest_raw_frame("nobody").result(timeout=5.0)
 
     assert run(body) is None
+
+
+def test_convert_newest_raw_frame_before_the_runtime_has_started_is_a_no_op():
+    """`main.py` builds the runtime before it starts the node. Asking that
+    early used to queue the work and then fail on the guard condition that
+    does not exist yet: an `AttributeError` for the caller, and an item left
+    in the queue for whenever the executor first drained it."""
+    rt = RosRuntime(node_name="test_convert_unstarted")
+    try:
+        future = rt.convert_newest_raw_frame("front")
+        assert future.result(timeout=1.0) is None
+        assert len(rt._work_queue) == 0
+    finally:
+        rt.stop()  # never started; must not raise
+
+
+def test_convert_newest_raw_frame_after_the_runtime_has_stopped_is_a_no_op():
+    """A publisher can resume, or a start can be dispatched, while the
+    process is on its way down. The node is destroyed by then, and so is the
+    guard condition `_enqueue` would trigger. Nothing is queued and nothing
+    is triggered; the caller gets a future that is already done."""
+    held = {}
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12)]))
+        rt._cameras["front"].raw.set(_image_msg((10, 20, 30)), 1_000)
+        held["rt"] = rt
+
+    run(body)
+    rt = held["rt"]  # stopped by the harness
+
+    class _DestroyedGuard:
+        triggered = 0
+
+        def trigger(self):
+            _DestroyedGuard.triggered += 1
+            raise RuntimeError("the guard condition of a destroyed node")
+
+    rt._guard = _DestroyedGuard()
+    future = rt.convert_newest_raw_frame("front")
+    assert future.result(timeout=1.0) is None
+    assert _DestroyedGuard.triggered == 0
+    assert len(rt._work_queue) == 0
