@@ -101,17 +101,19 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@15.2.0
+    Source: @fleetless/contracts@15.3.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-Diffed file by file against the copies the previous pin (15.0.0) carried; two
-vendored files changed. `schema/cloud-config.schema.json` gains the optional
-top-level section `live` of the document, with one key, `max_packet_bytes`, an
-integer from 576 to 1350. `constants.json` gains `LIVE_DEFAULTS`
-(`max_packet_bytes: 1200`) and `LIVE_BOUNDS` (`max_packet_bytes`: `min` 576,
-`max` 1350). The bridge reads the section and both constants. Every other
-vendored schema is byte-identical; nothing 15.0.1 or 15.1.0 changed is among
-the files vendored here.
+Diffed file by file against the copies the previous pin (15.2.0) carried; two
+vendored files changed. `schema/cloud-config.schema.json`: the `live` section
+gains the optional key `encoder`, one of `software`, `auto`, `nvenc`, `vaapi`
+and `v4l2`; the RTSP camera source gains the optional boolean `passthrough`,
+and the descriptions of `width`, `height`, `fps`, `bitrate_kbps`, the ROS
+source's `type` and the low-bandwidth camera keys say what they mean for a
+camera that is passed through. `constants.json` gains `LIVE_DEFAULTS.encoder`
+(`software`) and `LIVE_BOUNDS.encoder` (`values`: the five names, in the
+schema's order). The bridge reads `encoder`, its default and its values.
+Every other vendored schema is byte-identical.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
