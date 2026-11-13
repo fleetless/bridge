@@ -517,13 +517,14 @@ def _prove_bitrate(pipeline, args, report, index):
         high / 1000, target // 1000, low / 1000, target // 4000, back / 1000, target // 1000))
     report.check(low < 0.6 * high and low < 0.6 * back, "the bitrate follows the target",
                  "a quarter of the target should be well under it")
-    report.check(
-        target / BITRATE_UNIT_FACTOR <= high <= target * BITRATE_UNIT_FACTOR,
-        "the bitrate is in the target's unit",
-        "{:.0f} kbps at a target of {} kbps is more than a factor of {} off; a chain that "
-        "takes bits for kilobits is a thousand off".format(
-            high / 1000, target // 1000, BITRATE_UNIT_FACTOR),
-    )
+    # What a passing line says must not read like the failure: the detail
+    # is printed either way.
+    in_unit = target / BITRATE_UNIT_FACTOR <= high <= target * BITRATE_UNIT_FACTOR
+    said = "{:.0f} kbps at a target of {} kbps".format(high / 1000, target // 1000)
+    if not in_unit:
+        said += (" is more than a factor of {} off; a chain that takes bits for kilobits "
+                 "is a thousand off".format(BITRATE_UNIT_FACTOR))
+    report.check(in_unit, "the bitrate is in the target's unit", said)
 
 
 def what_the_bridge_would_do(backend, chains, args, out):
