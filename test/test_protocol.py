@@ -397,8 +397,11 @@ def test_the_live_defaults_and_bounds_come_from_the_vendored_constants():
     """Read, not typed, for `LOW_BANDWIDTH_DEFAULTS`' reason: the default is
     also the ROS parameter's, and the bounds are the ones the cloud refuses
     a published document by."""
-    assert LIVE_DEFAULTS == {"max_packet_bytes": 1200}
-    assert LIVE_BOUNDS == {"max_packet_bytes": {"min": 576, "max": 1350}}
+    assert LIVE_DEFAULTS == {"max_packet_bytes": 1200, "encoder": "software"}
+    assert LIVE_BOUNDS == {
+        "max_packet_bytes": {"min": 576, "max": 1350},
+        "encoder": {"values": ["software", "auto", "nvenc", "vaapi", "v4l2"]},
+    }
 
 
 def test_config_carries_the_live_section_whole():

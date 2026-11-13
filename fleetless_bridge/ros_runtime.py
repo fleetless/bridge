@@ -119,16 +119,20 @@ from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import String as StringMsg
 from unique_identifier_msgs.msg import UUID as RosUUID
 
-from fleetless_bridge import camera, camera_sources, introspection, live, params, sampling
+from fleetless_bridge import (
+    camera, camera_sources, introspection, live, live_encoder, params, sampling,
+)
 from fleetless_bridge.jobs import JobManager, JobUpdate
 from fleetless_bridge.goal_state import (
     load_mapping, load_terminal_observations, mapping_path, save_mapping,
 )
 from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.live_settings import (
+    ENCODERS,
     MAX_PACKET_BYTES_MAX,
     MAX_PACKET_BYTES_MIN,
     LiveSettings,
+    check_encoder,
     check_max_packet_bytes,
 )
 from fleetless_bridge.protocol import (
@@ -1508,6 +1512,15 @@ class _CameraEntry:
     last_source_error: Optional[Tuple[str, str, int]] = None
 
 
+#: The `live.*` ROS parameters and the check each proposed value has to pass.
+#: A check raises `ValueError` with the sentence that names the key and the
+#: rule, which is what `ros2 param set` then prints.
+_LIVE_PARAMETERS: Dict[str, Callable[[Any], Any]] = {
+    "live.max_packet_bytes": check_max_packet_bytes,
+    "live.encoder": check_encoder,
+}
+
+
 class RosRuntime:
     """The bridge's ROS side: graph introspection, type resolution, and the
     live datapoint subscriptions, all reachable from asyncio."""
@@ -1725,6 +1738,9 @@ class RosRuntime:
         # What client.py wants told after a successful `ros2 param set` of a
         # `live.*` parameter.
         self._live_params_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        # The resolved `live.encoder`, as `set_live_settings` last heard it.
+        # Read once per live start: a running stream keeps its encoder.
+        self._live_encoder: str = LIVE_DEFAULTS["encoder"]
         self.samples = SampleQueue(maxsize=sample_queue_maxsize)
         self.backlog = BacklogStore()
         self.jobs = JobManager()
@@ -1857,6 +1873,22 @@ class RosRuntime:
                     "The largest RTP packet the bridge sends, in bytes, before SRTP: "
                     "header, header extensions and payload, retransmissions included. "
                     "An integer in [{}, {}].".format(MAX_PACKET_BYTES_MIN, MAX_PACKET_BYTES_MAX)
+                ),
+                dynamic_typing=True,
+            ),
+        )
+        # `ros2 param set /fleetless_bridge live.encoder nvenc` tries the
+        # robot's encoder chip; the next live start uses it.
+        self._node.declare_parameter(
+            "live.encoder",
+            LIVE_DEFAULTS["encoder"],
+            ParameterDescriptor(
+                description=(
+                    "What encodes live video: software, or a hardware encoder reached "
+                    "through GStreamer, which falls back to software H.264 when it "
+                    "does not start. One of {}. Read at the next live start.".format(
+                        ", ".join(ENCODERS)
+                    )
                 ),
                 dynamic_typing=True,
             ),
@@ -2093,7 +2125,10 @@ class RosRuntime:
         does not exist yet, and an empty layer resolves to the default."""
         if self._node is None:
             return {}
-        return {"max_packet_bytes": self._node.get_parameter("live.max_packet_bytes").value}
+        return {
+            "max_packet_bytes": self._node.get_parameter("live.max_packet_bytes").value,
+            "encoder": self._node.get_parameter("live.encoder").value,
+        }
 
     def on_live_params(self, callback: Callable[[Dict[str, Any]], None]) -> None:
         """Ask to be told when a `ros2 param set` changes a `live.*`
@@ -2108,7 +2143,17 @@ class RosRuntime:
         Plain and loop-side: the cap is a module constant of aiortc's that
         its packetizers read at call time, so it holds from the next frame of
         every stream, running ones included, and there is no node to wait
-        for."""
+        for.
+
+        The encoder is only noted: `start_live` reads it, so a change applies
+        at the next live start and a running stream keeps the encoder it has.
+        A change also forgets what was learned about the encoder chains. A
+        chain is remembered as failed so that a missing chip is not probed at
+        every start; somebody who has just changed the setting has usually
+        just changed the machine too, and wants it tried."""
+        if settings.encoder != self._live_encoder:
+            self._live_encoder = settings.encoder
+            live_encoder.forget_chains()
         return live.set_max_packet_bytes(settings.max_packet_bytes)
 
     def _on_set_parameters(self, params) -> SetParametersResult:
@@ -2128,17 +2173,18 @@ class RosRuntime:
         Nothing here mutates on a bad value — the parameter keeps what it
         had, and no callback fires.
 
-        `live.max_packet_bytes` is judged on its own, without the published
-        section: it has no rule that spans two keys, and a parameter the
-        section currently overrides is in force again the day the key leaves
-        the YAML, so it has to be a usable value by itself. An unset value is
-        refused as well, since unsetting would delete the parameter.
+        The `live.*` parameters are judged on their own, without the
+        published section: none has a rule that spans two keys, and a
+        parameter the section currently overrides is in force again the day
+        the key leaves the YAML, so it has to be a usable value by itself. An
+        unset value is refused as well, since unsetting would delete the
+        parameter.
 
         One call can carry both groups (`set_parameters_atomically`), and
         ROS stores all of it or none: every check runs before either
         callback is told."""
         touched = [p for p in params if p.name.startswith("low_bandwidth.")]
-        live_touched = [p for p in params if p.name == "live.max_packet_bytes"]
+        live_touched = [p for p in params if p.name in _LIVE_PARAMETERS]
         if not touched and not live_touched:
             # `use_sim_time` and anything else on this node: none of this
             # mode's business, and re-applying the levers for it would be a
@@ -2149,10 +2195,12 @@ class RosRuntime:
             proposed[param.name[len("low_bandwidth."):]] = param.value
         live_proposed = self.live_params()
         for param in live_touched:
-            live_proposed["max_packet_bytes"] = param.value
+            live_proposed[param.name[len("live."):]] = param.value
         try:
-            if live_touched:
-                check_max_packet_bytes(live_proposed["max_packet_bytes"])
+            for param in live_touched:
+                # `None` is an unset parameter, and the resolver would let it
+                # fall through to the default; here it is the value proposed.
+                _LIVE_PARAMETERS[param.name](param.value)
             if touched:
                 LowBandwidthSettings.resolve(proposed, self._lb_yaml)
         except ValueError as exc:
@@ -2774,6 +2822,12 @@ class RosRuntime:
                 # holds when a viewer comes back is converted at once, as at a
                 # start, rather than left until the camera's next message.
                 on_resume=lambda slug=slug: self.convert_newest_raw_frame(slug),
+                # `None` for `software`: aiortc builds its own encoder and
+                # the answer picks the codec, as before the setting existed.
+                # Anything else is an encoder of this session's own, which
+                # the publisher closes. Nothing is built or probed here; that
+                # happens with the first frame, in aiortc's encoder thread.
+                encoder=live_encoder.build_encoder(self._live_encoder, fps=entry.fps),
             )
             try:
                 await publisher.start(url, room, token)

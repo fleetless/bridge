@@ -96,13 +96,14 @@ LATEST_BRIDGE_VERSION: str = _CONSTANTS["LATEST_BRIDGE_VERSION"]
 #: and the console's placeholders, and a default written down twice ends up
 #: disagreeing with itself. `link_mode.py` is what reads them.
 LOW_BANDWIDTH_DEFAULTS: Dict[str, Any] = _CONSTANTS["LOW_BANDWIDTH_DEFAULTS"]
-#: The fallbacks for the `live` section, read for the same reason. One key
-#: today: `max_packet_bytes`, the largest RTP packet the bridge sends.
-#: `live_settings.py` is what reads them.
+#: The fallbacks for the `live` section, read for the same reason. Two keys:
+#: `max_packet_bytes`, the largest RTP packet the bridge sends, and `encoder`,
+#: what encodes live video. `live_settings.py` is what reads them.
 LIVE_DEFAULTS: Dict[str, Any] = _CONSTANTS["LIVE_DEFAULTS"]
-#: The bounds of the same settings, `{key: {"min": …, "max": …}}`. The cloud
-#: refuses a document outside them when it is published; the bridge refuses a
-#: ROS parameter outside them with the same two numbers, read and not typed.
+#: The bounds of the same settings: `{"min": …, "max": …}` for a number,
+#: `{"values": […]}` for a name. The cloud refuses a document outside them
+#: when it is published; the bridge refuses a ROS parameter outside them with
+#: the same numbers and the same list, read and not typed.
 LIVE_BOUNDS: Dict[str, Dict[str, Any]] = _CONSTANTS["LIVE_BOUNDS"]
 
 # The `fleetless.yaml` format version — `doc.fleetless`. Still a hand-kept

@@ -14,6 +14,8 @@ question it answers is whether aiortc 1.3.0, 1.6.0 and 1.14.0 really call
 No GStreamer here and no setting: the encoder is whatever the test hands over.
 """
 import asyncio
+import gc
+import logging
 import pathlib
 import subprocess
 import sys
@@ -239,6 +241,38 @@ def test_a_sender_that_keeps_its_encoder_elsewhere_fails_the_start():
     # No offer was made for a session that could not have worked.
     assert not any(isinstance(call, tuple) and call[0] == "send_offer" for call in signal.calls)
     assert any(SENDER_ENCODER_ATTR in line and "encoder" in line for line in logged)
+
+
+def test_a_start_after_the_encoder_was_closed_fails_and_uses_no_other_encoder():
+    """A publisher that was handed an encoder never publishes without it.
+    After a stop the encoder is closed and gone; a second start must not let
+    aiortc build an encoder of its own and offer VP8 in its place."""
+
+    async def scenario():
+        encoder = _Encoder()
+        first = _SeamConnection()
+        second = _SeamConnection()
+        signal = _FakeSignal()
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(signal, [first, second], _FakeTrack(), encoder=encoder)
+            await pub.start("wss://media.example", "room-1", "test-token")
+            await pub.stop()
+            with pytest.raises(LiveStartError) as refused:
+                await pub.start("wss://media.example", "room-1", "test-token")
+            return encoder, second, str(refused.value), handler.messages[:]
+        finally:
+            watched.removeHandler(handler)
+
+    encoder, second, message, logged = asyncio.run(scenario())
+    assert message == "could not publish the video track (EncoderNotInstalled)"
+    assert encoder.close_calls == 1
+    # Nothing was offered for the second start: no encoder on its sender,
+    # no preference, no offer.
+    assert getattr(second.sender, SENDER_ENCODER_ATTR) is None
+    assert second.transceiver.preferences is None
+    assert not any(isinstance(event, tuple) and event[0] == "createOffer" for event in second.events)
+    assert any("already closed" in line for line in logged)
 
 
 def test_the_bitrate_budget_is_held_on_the_encoder_that_was_handed_over():
@@ -473,7 +507,13 @@ print("returned", entered.is_set(), round(time.monotonic() - began, 1), flush=Tr
 
 def test_a_close_that_finishes_after_the_wait_is_over_is_not_reported_twice(monkeypatch):
     """Left behind, and then it returns after all, or fails after all: that
-    late end goes to nobody, and above all not to a log with its message."""
+    late end goes to nobody, and above all not to a log with its message.
+
+    Two places could still print it. This package's own logger is one. The
+    other is asyncio: a future that ends with an exception nobody asks for
+    is reported when it is collected, "Future exception was never
+    retrieved", with the exception and its message, through the loop's
+    exception handler and the `asyncio` logger. Both are watched."""
     monkeypatch.setattr(live, "ENCODER_CLOSE_TIMEOUT_S", 0.05)
 
     class _Late(_Encoder):
@@ -490,9 +530,24 @@ def test_a_close_that_finishes_after_the_wait_is_over_is_not_reported_twice(monk
             finally:
                 self.left.set()
 
+    class _Records(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(self.format(record))
+
     async def scenario():
         encoder = _Late()
         handler, watched = _capturing()
+        asyncio_log = logging.getLogger("asyncio")
+        asyncio_records = _Records()
+        asyncio_log.addHandler(asyncio_records)
+        reported_to_the_loop = []
+        asyncio.get_running_loop().set_exception_handler(
+            lambda loop, context: reported_to_the_loop.append(context)
+        )
         try:
             pub = _publisher(_FakeSignal(), _SeamConnection(), _FakeTrack(), encoder=encoder)
             await pub.start("wss://media.example", "room-1", "test-token")
@@ -503,16 +558,22 @@ def test_a_close_that_finishes_after_the_wait_is_over_is_not_reported_twice(monk
                     break
                 await asyncio.sleep(0.01)
             await asyncio.sleep(0.05)  # the loop gets to hear about it
-            return encoder.left.is_set(), handler.messages[:]
+            del pub
+            gc.collect()  # where an unasked-for exception of a future is reported
+            await asyncio.sleep(0.05)
+            return encoder.left.is_set(), handler.messages[:], reported_to_the_loop, asyncio_records.lines
         finally:
             encoder.release.set()
             watched.removeHandler(handler)
+            asyncio_log.removeHandler(asyncio_records)
 
-    left, logged = asyncio.run(scenario())
+    left, logged, reported_to_the_loop, asyncio_lines = asyncio.run(scenario())
     assert left
     about_the_encoder = [line for line in logged if "encoder" in line.lower()]
     assert len(about_the_encoder) == 1 and "did not finish closing" in about_the_encoder[0]
     assert not any("secret" in line for line in logged)
+    assert reported_to_the_loop == []
+    assert not any("secret" in line or "never retrieved" in line for line in asyncio_lines)
 
 
 def test_an_encoder_without_a_close_is_not_an_error():

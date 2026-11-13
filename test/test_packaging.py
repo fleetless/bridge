@@ -90,3 +90,32 @@ def test_the_launch_file_and_the_readme_name_the_live_default_the_bridge_declare
     readme = (ROOT / "README.md").read_text()
     assert "| `live.max_packet_bytes` | `{}` |".format(default) in readme
     assert "An integer from `{}` to `{}`.".format(bounds["min"], bounds["max"]) in readme
+    # And the same for the encoder: its default, and every name it takes.
+    encoder = LIVE_DEFAULTS["encoder"]
+    assert '"live.encoder": "{}",'.format(encoder) in launch_source
+    assert "| `live.encoder` | `{}` |".format(encoder) in readme
+    for name in LIVE_BOUNDS["encoder"]["values"]:
+        assert "`{}`".format(name) in readme, name
+        assert name in launch_source, name
+
+
+# --- GStreamer is not a dependency -------------------------------------------------
+
+
+def test_no_manifest_names_gstreamer_or_gi():
+    """`live.encoder` other than `software` needs GStreamer at run time. The
+    package does not depend on it: the bridge imports `gi` only when such a
+    session starts, and falls back to software when it is not there. So
+    neither the ROS manifest nor the Debian control file may name it, and a
+    robot that never uses a hardware encoder never installs it. The test
+    image gets it from `Dockerfile.dev`, by hand."""
+    import re
+
+    for name in ("package.xml", "debian/control.in"):
+        text = (ROOT / name).read_text()
+        hits = re.findall(r"gstreamer|python3-gi\b|gir1\.2|\bgst\b", text, re.IGNORECASE)
+        assert hits == [], "{} names {}".format(name, sorted(set(hits)))
+    dockerfile = (ROOT / "Dockerfile.dev").read_text()
+    for package in ("python3-gi", "gir1.2-gstreamer-1.0", "gir1.2-gst-plugins-base-1.0",
+                    "gstreamer1.0-plugins-bad", "gstreamer1.0-plugins-ugly"):
+        assert package in dockerfile, package

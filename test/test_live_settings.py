@@ -10,9 +10,11 @@ import pytest
 from schemas import SCHEMA_DIR
 
 from fleetless_bridge.live_settings import (
+    ENCODERS,
     MAX_PACKET_BYTES_MAX,
     MAX_PACKET_BYTES_MIN,
     LiveSettings,
+    check_encoder,
 )
 from fleetless_bridge.protocol import LIVE_BOUNDS, LIVE_DEFAULTS
 
@@ -48,7 +50,7 @@ def test_none_in_a_layer_falls_through():
 def test_unknown_keys_are_ignored_in_both_layers():
     """A console that writes a newer key must not take this bridge off the
     air; the section is read whole and only what is known is used."""
-    resolved = LiveSettings.resolve({"encoder": "h264"}, {"encoder": "vp8", "max_packet_bytes": 800})
+    resolved = LiveSettings.resolve({"codec": "h264"}, {"codec": "vp8", "max_packet_bytes": 800})
     assert resolved == LiveSettings(max_packet_bytes=800)
 
 
@@ -88,7 +90,10 @@ def test_the_bounds_are_read_from_the_vendored_constants():
     accept, something else. The literals are here once, so a re-vendor that
     moves a bound is a decision somebody reads rather than a number that
     changed under a green suite."""
-    assert LIVE_BOUNDS == {"max_packet_bytes": {"min": 576, "max": 1350}}
+    assert LIVE_BOUNDS == {
+        "max_packet_bytes": {"min": 576, "max": 1350},
+        "encoder": {"values": ["software", "auto", "nvenc", "vaapi", "v4l2"]},
+    }
     assert (MAX_PACKET_BYTES_MIN, MAX_PACKET_BYTES_MAX) == (576, 1350)
     assert MAX_PACKET_BYTES_MIN <= LIVE_DEFAULTS["max_packet_bytes"] <= MAX_PACKET_BYTES_MAX
 
@@ -107,3 +112,79 @@ def test_the_settings_are_frozen_and_comparable():
     assert LiveSettings.resolve({}, {}) == LiveSettings(max_packet_bytes=1200)
     with pytest.raises(Exception):
         LiveSettings.resolve({}, {}).max_packet_bytes = 1  # type: ignore[misc]
+
+
+# --- encoder ---------------------------------------------------------------------
+
+_ENCODER_RULE = "live.encoder must be one of software, auto, nvenc, vaapi, v4l2"
+
+
+def test_the_encoder_is_software_with_neither_layer():
+    """The default changes no robot: `software` is the encoder the bridge has
+    always had."""
+    assert LiveSettings.resolve({}, {}).encoder == LIVE_DEFAULTS["encoder"] == "software"
+    assert LiveSettings(max_packet_bytes=1200).encoder == "software"
+
+
+def test_the_encoder_goes_through_the_same_three_layers():
+    assert LiveSettings.resolve({"encoder": "nvenc"}, {}).encoder == "nvenc"
+    assert LiveSettings.resolve({"encoder": "nvenc"}, {"encoder": "auto"}).encoder == "auto"
+    assert LiveSettings.resolve({}, {"encoder": "v4l2"}).encoder == "v4l2"
+    assert LiveSettings.resolve({"encoder": None}, {}).encoder == "software"
+    assert LiveSettings.resolve({"encoder": "vaapi"}, {"encoder": None}).encoder == "vaapi"
+    # Each key by itself: one layer naming the packet size does not touch the encoder.
+    resolved = LiveSettings.resolve({"encoder": "nvenc"}, {"max_packet_bytes": 900})
+    assert resolved == LiveSettings(max_packet_bytes=900, encoder="nvenc")
+
+
+@pytest.mark.parametrize("value", ["software", "auto", "nvenc", "vaapi", "v4l2"])
+def test_the_five_values_are_accepted(value):
+    assert check_encoder(value) == value
+    assert LiveSettings.resolve({}, {"encoder": value}).encoder == value
+
+
+@pytest.mark.parametrize(
+    "value", ["hardware", "NVENC", "nvenc ", "", "x264", "none", 0, 1, True, None, ["nvenc"]]
+)
+def test_a_sixth_name_is_refused_with_the_key_and_the_list(value):
+    with pytest.raises(ValueError) as refused:
+        check_encoder(value)
+    assert str(refused.value) == _ENCODER_RULE
+    if value is not None:  # `None` in a layer is an absent key, not a value
+        for layers in (({"encoder": value}, {}), ({}, {"encoder": value})):
+            with pytest.raises(ValueError) as refused:
+                LiveSettings.resolve(*layers)
+            assert str(refused.value) == _ENCODER_RULE
+
+
+def test_a_bad_packet_size_and_a_bad_encoder_are_each_refused_by_their_own_sentence():
+    with pytest.raises(ValueError) as refused:
+        LiveSettings.resolve({"max_packet_bytes": 99999, "encoder": "nvenc"}, {})
+    assert str(refused.value) == _RULE
+    with pytest.raises(ValueError) as refused:
+        LiveSettings.resolve({"max_packet_bytes": 1000, "encoder": "h264"}, {})
+    assert str(refused.value) == _ENCODER_RULE
+
+
+def test_the_encoder_names_are_read_from_the_vendored_constants_in_their_order():
+    assert ENCODERS == tuple(LIVE_BOUNDS["encoder"]["values"])
+    assert ENCODERS == ("software", "auto", "nvenc", "vaapi", "v4l2")
+    assert LIVE_DEFAULTS["encoder"] in ENCODERS
+
+
+def test_the_encoder_names_are_the_ones_the_config_frame_schema_carries():
+    schema = json.loads((SCHEMA_DIR / "cloud-config.schema.json").read_text(encoding="utf-8"))
+    key = schema["properties"]["doc"]["properties"]["live"]["properties"]["encoder"]
+    assert tuple(key["enum"]) == ENCODERS
+
+
+def test_every_hardware_name_has_its_chains_and_auto_tries_them_in_the_contract_s_order():
+    """The names are contracts'; what each one means is `live_encoder.py`'s.
+    A name added on one side and not on the other shows here."""
+    from fleetless_bridge.live_encoder import AUTO_ORDER, CHAINS, chains_for
+
+    hardware = tuple(name for name in ENCODERS if name not in ("software", "auto"))
+    assert tuple(CHAINS) == hardware == AUTO_ORDER
+    for name in hardware:
+        assert chains_for(name)
+    assert chains_for("software") == ()
