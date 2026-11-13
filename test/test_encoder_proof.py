@@ -42,12 +42,11 @@ def _run(*argv):
     return code, out.getvalue()
 
 
-def _prove(chain):
+def _prove(chain, **changes):
     out = io.StringIO()
-    args = proof.argparse.Namespace(
-        width=320, height=240, fps=15, frames=45, keyframe_every=15, bitrate_kbps=1500
-    )
-    return proof.prove(chain, args, out), out.getvalue()
+    stream = dict(width=320, height=240, fps=15, frames=45, keyframe_every=15, bitrate_kbps=1500)
+    stream.update(changes)
+    return proof.prove(chain, proof.argparse.Namespace(**stream), out), out.getvalue()
 
 
 def test_the_stand_in_passes_every_check():
@@ -60,6 +59,8 @@ def test_the_stand_in_passes_every_check():
         "ok   the first frame is a keyframe",
         "ok   every frame a keyframe was asked for is one (asked at [15, 30], got [0, 15, 30])",
         "ok   no keyframe nobody asked for",
+        "the stream names its colours: matrix 6 (BT.601), primaries 6, transfer 6, limited range",
+        "ok   the colours are right when shown the way the stream says",
         "ok   the bitrate follows the target",
         "ok   the pipeline goes back to NULL",
         "encodes with stand-in/x264",
@@ -118,6 +119,104 @@ def test_a_chain_that_draws_the_wrong_picture_fails_the_proof():
     result, said = _prove(swapped)
     assert result == "fail"
     assert "FAIL frame 0: the picture that comes out is the one that went in" in said
+
+
+def test_a_chain_that_names_the_wrong_colours_fails_the_proof():
+    """The stream decodes, the pictures match by the decoder library's own
+    conversion, and a viewer shows every colour wrong: BT.601 samples under
+    a BT.709 label. The chain here forgets what it was told about the
+    colours, and anything of more than 576 lines is then taken for BT.709."""
+    relabelled = _variant(
+        name="stand-in/relabelled",
+        convert="rawvideoparse use-sink-caps=false format=i420 width=320 height=608 "
+        "framerate=15/1 ! videoconvert",
+        elements=("rawvideoparse", "videoconvert", "x264enc"),
+    )
+    result, said = _prove(relabelled, height=608)
+    assert result == "fail"
+    assert "the stream names its colours: matrix 1 (BT.709)" in said
+    assert (
+        "FAIL the colours are right when shown the way the stream says "
+        "(the bar that went in as (200, 30, 200) is shown as (2"
+    ) in said
+    # Every check before it passed: the picture check cannot see this.
+    assert "ok   45 frames in, 45 access units out, each decoded to its own picture" in said
+    # The same size through the stand-in itself, which says what it carries.
+    result, said = _prove(STAND_IN, height=608)
+    assert result == "pass" and "matrix 6 (BT.601)" in said
+
+
+def test_a_chain_that_converts_its_colours_and_says_so_passes_the_proof():
+    """The check follows the label, it does not insist on BT.601: a chain
+    that really converts to BT.709 names BT.709 and is right."""
+    converted = _variant(
+        name="stand-in/converted", convert="videoconvert ! video/x-raw,format=I420,colorimetry=bt709"
+    )
+    result, said = _prove(converted)
+    assert result == "pass", said
+    assert "the stream names its colours: matrix 1 (BT.709)" in said
+
+
+def test_the_parameter_set_is_read_as_a_receiver_reads_it():
+    """Against `h264parse`, for the stand-in's baseline stream, and for a
+    high-profile stream with every colour field set, which takes the other
+    branch through the syntax."""
+    import av
+    import numpy as np
+    from fractions import Fraction
+
+    from fleetless_bridge.live_encoder import Pipeline
+    from test_live_encoder_pipeline import _what_the_stream_says, moving_frame
+
+    pipeline = Pipeline(STAND_IN, width=1024, height=768, fps=15, bitrate_bps=2_000_000)
+    try:
+        unit = pipeline.encode(moving_frame(0, 1024, 768), False)
+    finally:
+        pipeline.close()
+    said = proof.sps_of(unit)
+    theirs = _what_the_stream_says(unit)
+    assert said == {
+        "profile_idc": 66, "constraints": 0xC0, "level_idc": 31,
+        "colours": (6, 6, 6), "full_range": False,
+    }
+    assert (theirs.get_string("profile"), theirs.get_string("level")) == ("constrained-baseline", "3.1")
+    assert theirs.get_string("colorimetry") == "bt601"
+
+    encoder = av.CodecContext.create("libx264", "w")
+    encoder.width, encoder.height, encoder.pix_fmt = 320, 240, "yuv420p"
+    encoder.time_base = Fraction(1, 15)
+    encoder.options = {
+        "profile": "high",
+        "x264-params": "colorprim=bt709:transfer=bt709:colormatrix=bt709:fullrange=on:cqm=jvt",
+    }
+    frame = av.VideoFrame.from_ndarray(np.zeros((240, 320, 3), np.uint8), format="rgb24").reformat(
+        format="yuv420p"
+    )
+    frame.pts = 0
+    packets = list(encoder.encode(frame)) + list(encoder.encode(None))
+    high = proof.sps_of(b"".join(bytes(packet) for packet in packets))
+    assert high is not None and high["profile_idc"] == 100
+    assert high["colours"] == (1, 1, 1) and high["full_range"] is True
+
+    # A stream without a parameter set, and one that ends early.
+    assert proof.sps_of(b"\x00\x00\x00\x01\x65picture") is None
+    assert proof.sps_of(b"\x00\x00\x00\x01\x67\x42") is None
+    # The bytes that keep start codes out of a unit are not part of it.
+    assert proof._payload(b"\x67\x00\x00\x03\x01\x00\x00\x03\x00") == b"\x00\x00\x01\x00\x00\x00"
+
+
+def test_a_colour_is_converted_by_the_matrix_and_the_range_it_is_given():
+    """The numbers of the finding this check exists for: (200, 30, 30) is
+    85.42, 102.80, 202.67 in BT.601, and a viewer told BT.709 shows that
+    as (215, 46, 28)."""
+    as_bt601 = proof.as_a_viewer_shows_it(85.42, 102.80, 202.67, 6, False)
+    as_bt709 = proof.as_a_viewer_shows_it(85.42, 102.80, 202.67, 1, False)
+    assert [round(channel) for channel in as_bt601] == [200, 30, 30]
+    assert [round(channel) for channel in as_bt709] == [215, 46, 28]
+    # Limited-range grey read as full range is darker at the top and lighter
+    # at the bottom.
+    assert round(proof.as_a_viewer_shows_it(218.0, 128.0, 128.0, 6, False)[0]) == 235
+    assert round(proof.as_a_viewer_shows_it(218.0, 128.0, 128.0, 6, True)[0]) == 218
 
 
 def test_a_chain_that_does_not_follow_the_bitrate_fails_the_proof():

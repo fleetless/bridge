@@ -87,6 +87,15 @@ GST_PACKAGES = (
     "gstreamer1.0-plugins-bad",
 )
 
+#: The colours of the pictures pushed into a chain, in GStreamer's name for
+#: it: BT.601, limited range. That is what libswscale makes of an RGB frame
+#: when it is asked for `yuv420p` and told nothing else, at every picture
+#: size, and it is what aiortc's own encoders are fed. The chain is told, so
+#: that an encoder which labels its stream labels it with what is in it; a
+#: viewer converts by that label. `test_live_encoder_pipeline.py` holds the
+#: two against each other: the samples that arrive, and the label on them.
+PICTURE_COLORIMETRY = "bt601"
+
 _NAL_ACCESS_UNIT_DELIMITER = 9
 
 
@@ -472,13 +481,15 @@ class Pipeline:
             self._bus = pipeline.get_bus()
 
             # The frame rate is what the rate control divides the bitrate
-            # by, so it is the camera's and not a constant.
+            # by, so it is the camera's and not a constant. The colorimetry
+            # is what the pictures are in (`PICTURE_COLORIMETRY`): caps that
+            # leave it out are read as BT.709 above 576 lines, and the
+            # encoder then writes that into the stream.
             self._src.set_property(
                 "caps",
                 Gst.Caps.from_string(
-                    "video/x-raw,format=I420,width={},height={},framerate={}/1".format(
-                        width, height, max(1, fps)
-                    )
+                    "video/x-raw,format=I420,width={},height={},framerate={}/1,"
+                    "colorimetry={}".format(width, height, max(1, fps), PICTURE_COLORIMETRY)
                 ),
             )
             self._src.set_property("format", Gst.Format.TIME)
