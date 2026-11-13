@@ -73,3 +73,20 @@ def test_the_launch_file_respawns_the_bridge_on_a_real_robot():
     launch_source = (ROOT / "launch" / "bridge.launch.py").read_text()
     assert "respawn=True" in launch_source
     assert "respawn_delay=" in launch_source
+
+
+def test_the_launch_file_and_the_readme_name_the_live_default_the_bridge_declares():
+    # The launch file spells `live.max_packet_bytes` out "at its default" and
+    # the README's table says what that default is. Both are text nothing
+    # imports, so a contracts release that moves the number would otherwise
+    # leave two places saying the old one -- and the launch file's copy is
+    # not a comment: a value written there is the one the node starts with.
+    from fleetless_bridge.protocol import LIVE_BOUNDS, LIVE_DEFAULTS
+
+    default = LIVE_DEFAULTS["max_packet_bytes"]
+    bounds = LIVE_BOUNDS["max_packet_bytes"]
+    launch_source = (ROOT / "launch" / "bridge.launch.py").read_text()
+    assert '"live.max_packet_bytes": {},'.format(default) in launch_source
+    readme = (ROOT / "README.md").read_text()
+    assert "| `live.max_packet_bytes` | `{}` |".format(default) in readme
+    assert "An integer from `{}` to `{}`.".format(bounds["min"], bounds["max"]) in readme

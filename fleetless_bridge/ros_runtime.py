@@ -104,7 +104,7 @@ from defusedxml import DefusedXmlException
 import rclpy
 from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
-from rcl_interfaces.msg import SetParametersResult
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
@@ -125,6 +125,12 @@ from fleetless_bridge.goal_state import (
     load_mapping, load_terminal_observations, mapping_path, save_mapping,
 )
 from fleetless_bridge.link_mode import LowBandwidthSettings
+from fleetless_bridge.live_settings import (
+    MAX_PACKET_BYTES_MAX,
+    MAX_PACKET_BYTES_MIN,
+    LiveSettings,
+    check_max_packet_bytes,
+)
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_FIELD_PATH_INVALID,
     APPLY_ERROR_CODE_UNKNOWN,
@@ -142,6 +148,7 @@ from fleetless_bridge.protocol import (
     CAMERA_STATE_CAUSE_CONFIG_CHANGE,
     CAMERA_STATE_CAUSE_LIVE_LOST,
     CAMERA_STATE_CAUSE_SOURCE,
+    LIVE_DEFAULTS,
     LOW_BANDWIDTH_DEFAULTS,
     ActionConfig,
     ApplyError,
@@ -1690,6 +1697,9 @@ class RosRuntime:
         # nobody asked: it refuses a set the section makes valid, and accepts
         # one the section makes impossible.
         self._lb_yaml: Dict[str, Any] = {}
+        # What client.py wants told after a successful `ros2 param set` of a
+        # `live.*` parameter.
+        self._live_params_callback: Optional[Callable[[Dict[str, Any]], None]] = None
         self.samples = SampleQueue(maxsize=sample_queue_maxsize)
         self.backlog = BacklogStore()
         self.jobs = JobManager()
@@ -1807,6 +1817,25 @@ class RosRuntime:
             if key == "datapoint_max_hz":
                 default = float(default)
             self._node.declare_parameter("low_bandwidth." + key, default)
+        # The live settings, declared the same way: `ros2 param set
+        # /fleetless_bridge live.max_packet_bytes 1000` tries a packet size
+        # on a running robot, and the `live` section of the published
+        # `fleetless.yaml` overrides it. Dynamically typed on purpose: with
+        # the type fixed at declaration ROS itself refuses `1200.5` in its
+        # own words before the callback below is asked, and the callback's
+        # sentence is the one that names the rule.
+        self._node.declare_parameter(
+            "live.max_packet_bytes",
+            LIVE_DEFAULTS["max_packet_bytes"],
+            ParameterDescriptor(
+                description=(
+                    "The largest RTP packet the bridge sends, in bytes, before SRTP: "
+                    "header, header extensions and payload, retransmissions included. "
+                    "An integer in [{}, {}].".format(MAX_PACKET_BYTES_MIN, MAX_PACKET_BYTES_MAX)
+                ),
+                dynamic_typing=True,
+            ),
+        )
         self._node.add_on_set_parameters_callback(self._on_set_parameters)
         # One shared watchdog, two independent checks on the same cadence —
         # same "one rule beats juggling a lifecycle per entity" reasoning
@@ -2032,6 +2061,31 @@ class RosRuntime:
         and can repeat."""
         self._lb_yaml = dict(section)
 
+    def live_params(self) -> Dict[str, Any]:
+        """The `live.*` parameters, shaped for `LiveSettings.resolve`.
+
+        `{}` before `start()`, for `low_bandwidth_params`' reason: the node
+        does not exist yet, and an empty layer resolves to the default."""
+        if self._node is None:
+            return {}
+        return {"max_packet_bytes": self._node.get_parameter("live.max_packet_bytes").value}
+
+    def on_live_params(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        """Ask to be told when a `ros2 param set` changes a `live.*`
+        parameter. The callback runs on the asyncio loop and is handed the
+        whole layer."""
+        self._live_params_callback = callback
+
+    def set_live_settings(self, settings: LiveSettings) -> int:
+        """Apply the resolved `live` settings; returns the packet cap in
+        force. client.py calls this whenever the resolved value changes.
+
+        Plain and loop-side: the cap is a module constant of aiortc's that
+        its packetizers read at call time, so it holds from the next frame of
+        every stream, running ones included, and there is no node to wait
+        for."""
+        return live.set_max_packet_bytes(settings.max_packet_bytes)
+
     def _on_set_parameters(self, params) -> SetParametersResult:
         """rclpy's pre-set hook: refuse a value the settings would reject,
         before it is stored.
@@ -2047,9 +2101,20 @@ class RosRuntime:
 
         Refused with exactly the sentence a bad YAML section is refused with.
         Nothing here mutates on a bad value — the parameter keeps what it
-        had, and no callback fires."""
+        had, and no callback fires.
+
+        `live.max_packet_bytes` is judged on its own, without the published
+        section: it has no rule that spans two keys, and a parameter the
+        section currently overrides is in force again the day the key leaves
+        the YAML, so it has to be a usable value by itself. An unset value is
+        refused as well, since unsetting would delete the parameter.
+
+        One call can carry both groups (`set_parameters_atomically`), and
+        ROS stores all of it or none: every check runs before either
+        callback is told."""
         touched = [p for p in params if p.name.startswith("low_bandwidth.")]
-        if not touched:
+        live_touched = [p for p in params if p.name == "live.max_packet_bytes"]
+        if not touched and not live_touched:
             # `use_sim_time` and anything else on this node: none of this
             # mode's business, and re-applying the levers for it would be a
             # lever pull nobody asked for.
@@ -2057,12 +2122,21 @@ class RosRuntime:
         proposed = self.low_bandwidth_params()
         for param in touched:
             proposed[param.name[len("low_bandwidth."):]] = param.value
+        live_proposed = self.live_params()
+        for param in live_touched:
+            live_proposed["max_packet_bytes"] = param.value
         try:
-            LowBandwidthSettings.resolve(proposed, self._lb_yaml)
+            if live_touched:
+                check_max_packet_bytes(live_proposed["max_packet_bytes"])
+            if touched:
+                LowBandwidthSettings.resolve(proposed, self._lb_yaml)
         except ValueError as exc:
             return SetParametersResult(successful=False, reason=str(exc))
-        if self._loop is not None and self._lb_params_callback is not None:
-            self._loop.call_soon_threadsafe(self._lb_params_callback, proposed)
+        if self._loop is not None:
+            if touched and self._lb_params_callback is not None:
+                self._loop.call_soon_threadsafe(self._lb_params_callback, proposed)
+            if live_touched and self._live_params_callback is not None:
+                self._loop.call_soon_threadsafe(self._live_params_callback, live_proposed)
         return SetParametersResult(successful=True)
 
     async def set_low_bandwidth(

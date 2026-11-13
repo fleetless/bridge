@@ -71,6 +71,7 @@ from fleetless_bridge import __version__
 from fleetless_bridge.camera import SNAPSHOT_MAX_BYTES
 from fleetless_bridge.config import BridgeConfig
 from fleetless_bridge.link_mode import LinkMode, LowBandwidthSettings, Transition
+from fleetless_bridge.live_settings import LiveSettings
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_LOW_BANDWIDTH_INVALID,
     APPLY_ERROR_CODE_WHOLE_KIND_FAILED,
@@ -1317,8 +1318,16 @@ class BridgeClient:
         # `timestamp_ms` uses — see `_observe_dwell`. Set here too, not only
         # per session, so the attribute exists before the first connection.
         self._session_started_ms = capture_timestamp_ms()
+        # The `live` settings, in the same two layers. `_live_settings` is
+        # what is in force: `live.py` applies the default when it is
+        # imported, so this starts equal to it and the runtime is told only
+        # when a resolve says something else.
+        self._param_live: Dict[str, Any] = {}
+        self._yaml_live: Dict[str, Any] = {}
+        self._live_settings = LiveSettings.resolve({}, {})
         if self._ros is not None:
             self._ros.on_low_bandwidth_params(self._on_low_bandwidth_params)
+            self._ros.on_live_params(self._on_live_params)
 
     def stop(self) -> None:
         """Ask the bridge to shut down; safe to call from a signal handler."""
@@ -1391,6 +1400,65 @@ class BridgeClient:
             return await self._converse(ws)
         finally:
             await self._close(ws)
+
+    # --- live settings -----------------------------------------------------
+
+    def _on_live_params(self, values: Dict[str, Any]) -> None:
+        """A `ros2 param set` of a `live.*` parameter the runtime already
+        validated and accepted. Needs no session: the packet size is the
+        robot's own."""
+        previous = self._param_live
+        self._param_live = dict(values)
+        if not self._apply_live_settings():
+            self._param_live = previous
+
+    def _apply_live_section(self, message: Config) -> None:
+        """The document's `live` section, on top of the parameters.
+
+        Nothing goes into the ack. The cloud bounds every key of this section
+        before a configuration is published, so a value that does not resolve
+        is a frame no conforming cloud sends, and there is no apply-error
+        kind for it. If one arrives anyway the section the bridge had stays
+        in force and the log says so."""
+        previous = self._yaml_live
+        self._yaml_live = dict(message.live)
+        if not self._apply_live_settings():
+            self._yaml_live = previous
+
+    def _apply_live_settings(self) -> bool:
+        """Re-resolve both layers and tell the runtime if the result moved.
+
+        Returns `False`, having changed nothing and logged an error, when the
+        layers do not resolve or the runtime could not apply the result; the
+        caller puts its layer back. The runtime is told only on a change:
+        every reconnect brings the same config again, and a stream is not
+        re-capped at the number it already has."""
+        try:
+            settings = LiveSettings.resolve(self._param_live, self._yaml_live)
+        except ValueError as exc:
+            log.error(
+                "%s. The bridge keeps sending RTP packets of at most %d bytes.",
+                exc, self._live_settings.max_packet_bytes,
+            )
+            return False
+        if settings == self._live_settings:
+            return True
+        if self._ros is not None:
+            try:
+                in_force = self._ros.set_live_settings(settings)
+            except Exception:  # noqa: BLE001 - a packet size must not cost the session
+                log.exception(
+                    "Unexpected error applying live.max_packet_bytes=%d; the bridge "
+                    "keeps sending RTP packets of at most %d bytes",
+                    settings.max_packet_bytes, self._live_settings.max_packet_bytes,
+                )
+                return False
+            log.info(
+                "live.max_packet_bytes is %d: RTP packets are at most %d bytes from "
+                "the next frame on", settings.max_packet_bytes, in_force,
+            )
+        self._live_settings = settings
+        return True
 
     # --- low-bandwidth mode ------------------------------------------------
 
@@ -1824,6 +1892,14 @@ class BridgeClient:
                     # the runtime still believes nobody is connected for.
                     self._session_open = True
                     writer.wake()
+                    if self._ros is not None:
+                        # The node exists by now, so this is the first moment
+                        # the parameter layer can be read: before any
+                        # `camera_start` this session can carry.
+                        try:
+                            self._on_live_params(self._ros.live_params())
+                        except Exception:  # noqa: BLE001 - a packet size must not cost the greeting
+                            log.exception("Unexpected error reading the live parameters")
                     await self._start_link_mode()
                 elif isinstance(message, HelloError):
                     if message.terminal:
@@ -2165,6 +2241,9 @@ class BridgeClient:
         # First, because the mode's ceiling is what the datapoint apply below
         # builds each subscription's cap against.
         errors.extend(await self._apply_low_bandwidth_section(message))
+        # Before the cameras: a stream this config starts is packetized under
+        # the size this config names.
+        self._apply_live_section(message)
         if self._ros is not None:
             errors.extend(await self._apply_or_report(
                 APPLY_ERROR_KIND_DATAPOINT, message.version,

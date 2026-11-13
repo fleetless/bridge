@@ -276,6 +276,7 @@ class Session:
         cameras: dict = None,
         messages: dict = None,
         low_bandwidth: dict = None,
+        live: dict = None,
     ) -> None:
         # Every section is a slug-keyed mapping and optional, so an omitted
         # section stays omitted rather than empty — the shape a real cloud
@@ -290,6 +291,7 @@ class Session:
             ("publishers", publishers),
             ("cameras", cameras),
             ("low_bandwidth", low_bandwidth),
+            ("live", live),
         ):
             if section is not None:
                 doc[key] = section
