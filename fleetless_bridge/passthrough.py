@@ -58,13 +58,20 @@ QUEUE_MAX_UNITS = 512
 QUEUE_MAX_BYTES = 32 * 1024 * 1024
 
 #: The largest access unit a camera's stream may hand over: this many bytes
-#: for every pixel of the configured size, which is twice a raw 4:2:0 picture
-#: -- no encoder makes a frame larger than the picture it encodes, let alone
-#: twice as large -- and never less than the floor, for the small sizes.
+#: for every pixel of the configured size, which is twice a raw 4:2:0
+#: picture, and never less than the floor, for the small sizes. An encoder
+#: can make a frame larger than the picture it encodes: x264 on noise, at its
+#: finest quantizers, comes to a little over two bytes a pixel. Three leaves
+#: room above that.
 #: The one bound that keeps three things small: what the queue holds per
 #: unit, the newest keyframe, and the decode a snapshot costs.
 UNIT_BYTES_PER_PIXEL = 3
 UNIT_MAX_BYTES_FLOOR = 4 * 1024 * 1024
+
+#: How much of an access unit over that bound is still looked at: enough for
+#: an access unit delimiter and a parameter set of the largest size in front
+#: of the SPS, and the SPS itself.
+OVERSIZED_HEAD_BYTES = 3 * h264.PARAMETER_SET_MAX_BYTES
 
 #: A stream without a keyframe for this long is refused, and a refusal for
 #: B-frames stands this long after the last one.
@@ -93,7 +100,8 @@ class Unit:
     nals: Tuple[bytes, ...]
     timestamp_ms: int
     keyframe: bool
-    #: Bytes this unit takes in the queue.
+    #: Bytes this unit takes in the queue and on its way out: its NAL
+    #: units, the parameter sets put in front of a keyframe included.
     size: int = 0
 
 
@@ -194,12 +202,16 @@ class PassthroughStream:
         """
         size = len(data)
         if size > self.max_unit_bytes:
-            # Before a byte of it is looked at. Dropped like a unit that
-            # does not parse: no stream of this camera's size has units
-            # this large, and what follows it has a hole in front.
+            # Dropped like a unit that does not parse: no stream of this
+            # camera's size has units this large, and what follows it has a
+            # hole in front. Nothing of it is read but an SPS at its head,
+            # for the size it declares: a stream far larger than the camera
+            # is configured as is then refused for its size, at once, and
+            # not ten seconds later for keyframes that were all dropped.
             return self._push_unparseable(
                 "an access unit of {} bytes, more than the {} this camera's "
-                "size allows".format(size, self.max_unit_bytes)
+                "size allows".format(size, self.max_unit_bytes),
+                leading_sps=_leading_sps(data),
             )
         try:
             info = h264.inspect_access_unit(data)
@@ -253,11 +265,17 @@ class PassthroughStream:
                 nals = self._with_parameter_sets(info)
                 self._keyframe = Keyframe(data=h264.join_annexb(nals), timestamp_ms=timestamp_ms)
                 self._started = True
-                unit = Unit(nals=nals, timestamp_ms=timestamp_ms, keyframe=True, size=size)
             elif not self._started:
                 return False  # nothing to build on yet
             else:
-                unit = Unit(nals=info.nals, timestamp_ms=timestamp_ms, keyframe=False, size=size)
+                nals = info.nals
+            # Counted as what is queued and sent, not as what arrived: a
+            # keyframe that lacked its parameter sets carries the stored
+            # ones now.
+            unit = Unit(
+                nals=nals, timestamp_ms=timestamp_ms, keyframe=usable_keyframe,
+                size=sum(len(nal) for nal in nals),
+            )
 
             woke = self._offer(unit)
         if woke:
@@ -479,12 +497,19 @@ class PassthroughStream:
 
     # -- outside the lock --------------------------------------------------
 
-    def _push_unparseable(self, reason: str) -> bool:
+    def _push_unparseable(
+        self, reason: str, leading_sps: Optional[Tuple[bytes, h264.Sps]] = None
+    ) -> bool:
         with self._lock:
             now = self._clock()
             self._note_arrival(now)
             # A hole: what follows was predicted from a unit nobody has.
             self._forwarding = False
+            if leading_sps is not None:
+                nal, sps = leading_sps
+                self._sps[sps.sps_id] = nal
+                self._size = (sps.width, sps.height)
+                self._check_size(now)
             if (
                 self._parse_logged_at is None
                 or now - self._parse_logged_at >= PARSE_LOG_INTERVAL_S
@@ -517,6 +542,23 @@ class PassthroughStream:
 
 def _max_unit_bytes(width: int, height: int) -> int:
     return max(UNIT_MAX_BYTES_FLOOR, UNIT_BYTES_PER_PIXEL * width * height)
+
+
+def _leading_sps(data: bytes) -> Optional[Tuple[bytes, h264.Sps]]:
+    """The SPS at the head of an access unit too large to be read whole: the
+    NAL unit and what it declares, or `None`. Only the first
+    `OVERSIZED_HEAD_BYTES` are looked at, which is where an encoder puts it;
+    whatever else is in them is passed over, and anything that does not read
+    as H.264 there is no SPS."""
+    try:
+        nals = h264.split_nal_units(data[:OVERSIZED_HEAD_BYTES])
+        # The last unit of a head that was cut off is cut off itself.
+        for nal in nals[:-1]:
+            if h264.nal_type(nal) == h264.NAL_SPS:
+                return nal, h264.parse_sps(nal)
+    except h264.H264ParseError:
+        pass
+    return None
 
 
 def _new_decoder():
