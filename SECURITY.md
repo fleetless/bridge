@@ -63,9 +63,10 @@ sockets for as long as somebody is watching a camera.
 **The bridge is ROS-pure** — no shell, systemd or HTTP features, and that's a
 security property, not a style choice. No code path runs from a cloud
 message to a system change. None runs to a process launch or to a file write
-outside the upload path either, with the one exception named below: a
-process whose command line the cloud has no say in, and a cache file of
-GStreamer's own. A robot that needs local limits (a speed cap, an area
+outside the upload path either, with the one exception named below:
+GStreamer's plugin scanner, a process whose command line the cloud has no say
+in, and the files GStreamer and its libraries write for themselves. A robot
+that needs local limits (a speed cap, an area
 restriction) sets them robot-side, in ROS, in a node the robot's owner
 controls — not through this bridge.
 
@@ -80,12 +81,19 @@ GStreamer starts a second one, and only on a robot whose `live.encoder` is
 not `software`. The hardware encoders are reached through GStreamer, which
 the bridge loads with the first live session that uses one. When GStreamer's
 plugin registry is missing or stale, its initialisation runs GStreamer's own
-plugin scanner (`gst-plugin-scanner`) as a child process and writes the
-registry file to the bridge user's cache directory,
-`$XDG_CACHE_HOME/gstreamer-1.0/` (`~/.cache/gstreamer-1.0/` by default). That
-happens at the first hardware start, again after an update of a GStreamer
-package, and at every start of a bridge whose user cannot write that
-directory.
+plugin scanner (`gst-plugin-scanner`) as a child process, and starts it again
+for the rest of the scan whenever a plugin crashes it, so one scan can start
+it several times. The scanner writes the registry file to the bridge user's
+cache directory, `$XDG_CACHE_HOME/gstreamer-1.0/` (`~/.cache/gstreamer-1.0/`
+by default). That happens at the first hardware start, again after an update
+of a GStreamer package, and at every start of a bridge whose user cannot
+write that directory.
+
+GStreamer's libraries may write short-lived files of their own besides the
+registry. One is known: with liborc 0.4.42 the scanner creates a file for
+code it compiles, `orcexec.*`, in `$XDG_RUNTIME_DIR` or else in `$HOME`, and
+deletes it at once. The driver of an encoder chip is a library GStreamer
+loads too, and may keep files of its own; this project has run none yet.
 
 Nothing from a cloud message reaches the scanner's command line: the binary
 and its arguments are GStreamer's. What the cloud can do is cause it to run,
