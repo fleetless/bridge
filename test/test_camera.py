@@ -354,6 +354,43 @@ def test_jpeg_size_refuses_what_not_every_browser_shows(what, data):
     assert jpeg_size(data) is None, what
 
 
+@pytest.mark.parametrize(
+    "marker, what",
+    [
+        (0xDE, "DHP, a hierarchical file"),
+        (0xDF, "EXP, a hierarchical file"),
+        (0xF0, "the first JPEG-extension marker"),
+        (0xFD, "the last JPEG-extension marker"),
+        (0x02, "a reserved code"),
+        (0xBF, "the last reserved code"),
+        (0xC8, "the reserved code among the frame headers"),
+        (0xDC, "DNL, the number of lines given after the scan"),
+    ],
+)
+def test_jpeg_size_refuses_a_segment_no_decoder_accepts_before_the_scan(marker, what):
+    """A real file with one extra segment. libjpeg, which decodes for OpenCV
+    and for the browsers, gives up on these, so a file that carries one is
+    a file nobody shows, and it must not go out as a snapshot unlooked at.
+    Stepping over it by its length, as over an application segment, is what
+    this refuses."""
+    data = _jpeg(64, 48)
+    assert jpeg_size(data) == (64, 48)
+    assert jpeg_size(data[:2] + _segment(marker, b"\x00\x01\x02\x03") + data[2:]) is None, what
+
+
+@pytest.mark.parametrize("marker", [0xE0, 0xE5, 0xEF, 0xFE, 0xDD])
+def test_jpeg_size_steps_over_the_segments_a_decoder_accepts(marker):
+    """The control: application data, a comment and a restart interval are
+    what cameras really put there, and the file is still the picture."""
+    import cv2
+
+    data = _jpeg(64, 48)
+    payload = b"\x00\x00" if marker == 0xDD else b"made by a camera"
+    with_segment = data[:2] + _segment(marker, payload) + data[2:]
+    assert jpeg_size(with_segment) == (64, 48)
+    assert cv2.imdecode(np.frombuffer(with_segment, np.uint8), cv2.IMREAD_COLOR) is not None
+
+
 def test_jpeg_size_refuses_every_truncation_of_a_real_file():
     data = _jpeg(64, 48, quality=30)
     assert jpeg_size(data) == (64, 48)

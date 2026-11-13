@@ -173,6 +173,16 @@ _JPEG_SOF_SHOWN_EVERYWHERE = (0xC0, 0xC2)
 #: unknown segment and then mistaken for a file without a frame header.
 _JPEG_SOF_ANY = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
 
+#: The segments that may stand between the start marker and the scan of a
+#: file every browser shows: application data (0xE0 to 0xEF), a comment,
+#: quantisation and Huffman tables, the restart interval, and arithmetic
+#: conditioning, which a decoder reads and a Huffman file ignores. Anything
+#: else that is not a frame header is refused, not stepped over: libjpeg,
+#: which decodes for OpenCV and for the browsers, gives up on a hierarchical
+#: marker (DHP, EXP), a JPEG-extension marker (0xF0 to 0xFD) and the reserved
+#: codes, so a file that carries one is a file nobody shows.
+_JPEG_BEFORE_THE_SCAN = frozenset(range(0xE0, 0xF0)) | {0xFE, 0xDB, 0xC4, 0xDD, 0xCC}
+
 
 def jpeg_size(data: object) -> Optional[Tuple[int, int]]:
     """`(width, height)` of a JPEG that every browser shows, read from its
@@ -181,8 +191,9 @@ def jpeg_size(data: object) -> Optional[Tuple[int, int]]:
     What it takes to get a size back, all of it:
 
     - the bytes begin with the start marker and end with the end marker;
-    - every segment up to the scan can be walked by its own length, and none
-      runs past the end;
+    - every segment up to the scan can be walked by its own length, none
+      runs past the end, and each is of a kind a decoder accepts there:
+      application data, a comment, tables, the restart interval;
     - exactly one frame header comes before the scan, baseline or
       progressive, with 8 bits a sample, one or three components and a size
       that is not zero;
@@ -258,6 +269,8 @@ def jpeg_size(data: object) -> Optional[Tuple[int, int]]:
             ):
                 return None
             size = (width, height)
+        elif code not in _JPEG_BEFORE_THE_SCAN:
+            return None
         at += length
 
 

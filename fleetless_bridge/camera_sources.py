@@ -69,8 +69,10 @@ log = logging.getLogger(__name__)
 
 OnFrame = Callable[["np.ndarray", int], None]
 OnError = Callable[[str, str], None]
-#: A frame as the source encoded it: the bytes of one JPEG and its capture time.
-OnJpeg = Callable[[bytes, int], None]
+#: A frame as the source encoded it: the bytes of one JPEG, its capture time,
+#: and whether the adapter goes on to decode this very part itself (then it
+#: follows through `on_frame`, and nobody else needs to decode it).
+OnJpeg = Callable[[bytes, int, bool], None]
 
 # ffmpeg's own diagnostics (via OpenCV's ffmpeg backend) go straight to the
 # process's real stderr — outside Python's logging, outside every `except`
@@ -838,11 +840,11 @@ class MjpegSourceAdapter(_ThreadedSourceAdapter):
 
     **A part is a frame, decoded or not.** The camera has already encoded
     it; finding its two markers is all it takes to know one arrived. Every
-    part goes to `on_jpeg` as bytes with its capture time. It is decoded,
-    on this adapter's own thread, only while `conversion_wanted()` says a
-    converted frame is wanted, and then goes to `on_frame` as before. So a
-    camera nobody watches costs a read and a search, not a JPEG decode per
-    frame.
+    part goes to `on_jpeg` as bytes with its capture time, and with whether
+    this adapter is about to decode it. It is decoded, on this adapter's own
+    thread, only while `conversion_wanted()` says a converted frame is
+    wanted, and then goes to `on_frame` as before. So a camera nobody
+    watches costs a read and a search, not a JPEG decode per frame.
 
     A part that does not decode is skipped and the next one is the recovery.
     It is said once per run of bad parts, without the URL: a stream that
@@ -958,8 +960,11 @@ class MjpegSourceAdapter(_ThreadedSourceAdapter):
                 timestamp_ms = sampling.capture_timestamp_ms()
                 frame_bytes = buf[start : end + 2]
                 buf = buf[end + 2 :]
-                self._emit_jpeg(frame_bytes, timestamp_ms)
-                if self._conversion_wanted is not None and not self._conversion_wanted():
+                # Asked once per part, so the answer handed over with the
+                # bytes is the one acted on below.
+                wanted = self._conversion_wanted is None or self._conversion_wanted()
+                self._emit_jpeg(frame_bytes, timestamp_ms, wanted)
+                if not wanted:
                     continue  # nobody needs the pixels; the bytes are handed over
                 frame = cv2.imdecode(np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
@@ -974,11 +979,11 @@ class MjpegSourceAdapter(_ThreadedSourceAdapter):
                 self._undecodable_reported = False
                 self._emit_frame(frame, timestamp_ms)
 
-    def _emit_jpeg(self, data: bytes, timestamp_ms: int) -> None:
+    def _emit_jpeg(self, data: bytes, timestamp_ms: int, decoded_here: bool) -> None:
         if self._on_jpeg is None:
             return
         try:
-            self._on_jpeg(data, timestamp_ms)
+            self._on_jpeg(data, timestamp_ms, decoded_here)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the adapter
             # Same module-wide rule as `_report_once`: the type name only.
             log.error("Error handling a camera frame's bytes: %s (message redacted)", type(exc).__name__)

@@ -2533,16 +2533,8 @@ class RosRuntime:
                     )
                 )
                 continue
-            # The newest frame the camera is known by: the converted one,
-            # or the one kept as the source encoded it. A camera whose
-            # snapshots are passed through never has the first, and it
-            # works all the same.
-            seen_ms = [
-                frame.timestamp_ms
-                for frame in (entry.latest.get(), entry.encoded.get())
-                if frame is not None
-            ]
-            if seen_ms:
+            seen_ms = self._newest_frame_ms(entry)
+            if seen_ms is not None:
                 # Confirmed ok as of the latest frame's own capture time —
                 # not "now": this is a restatement of a fact already true,
                 # same reasoning as the error branch above.
@@ -2550,7 +2542,7 @@ class RosRuntime:
                     self._loop,
                     CameraStateUpdate(
                         slug, False, None,
-                        cause=CAMERA_STATE_CAUSE_SOURCE, observed_at_ms=max(seen_ms),
+                        cause=CAMERA_STATE_CAUSE_SOURCE, observed_at_ms=seen_ms,
                         request_id=None,
                     )
                 )
@@ -2558,6 +2550,30 @@ class RosRuntime:
             # honest answer, not `unknown`. The adapter's own first
             # success or failure reports for itself shortly, through the
             # ordinary unsolicited path (_on_source_frame/_on_source_error).
+
+    @staticmethod
+    def _newest_frame_ms(entry: _CameraEntry) -> Optional[int]:
+        """The capture time of the newest frame this camera is known by, or
+        `None` for a camera that has delivered none.
+
+        **The one answer to "has this camera a frame".** A frame is known
+        in two places: converted, in `latest`, and as the source encoded it,
+        in `encoded`. A camera whose snapshots are all passed through never
+        has the first and works all the same, so whoever asks only `latest`
+        takes a working camera for one that never delivered: the health
+        restatement would say nothing about it, and a live start would
+        answer with an error from a stream drop it has long had frames
+        since. Both ask here. A third place a frame can be held belongs in
+        this method and nowhere else.
+
+        Both holders carry their own lock, so this may be asked from the
+        loop thread as well as from the executor."""
+        seen_ms = [
+            frame.timestamp_ms
+            for frame in (entry.latest.get(), entry.encoded.get())
+            if frame is not None
+        ]
+        return max(seen_ms) if seen_ms else None
 
     def _live_lock(self, slug: str) -> asyncio.Lock:
         """One lock per slug, created on first use and kept for the life of
@@ -2697,7 +2713,7 @@ class RosRuntime:
             # unsolicited background reporting `_on_source_error`/
             # `_on_source_frame` do (`cause: 'source'`) — it only
             # ever fires in response to this joiner's own request.
-            if entry.latest.get() is None and entry.last_source_error is not None:
+            if self._newest_frame_ms(entry) is None and entry.last_source_error is not None:
                 code, message, observed_at_ms = entry.last_source_error
                 self.camera_states.put(
                     CameraStateUpdate(
@@ -4560,8 +4576,10 @@ class RosRuntime:
 
         # The MJPEG adapter's third callback, from its own thread like the
         # two above and marshalled the same way.
-        def on_jpeg(data, timestamp_ms):
-            self._enqueue(lambda: self._on_source_jpeg(slug, entry, data, timestamp_ms))
+        def on_jpeg(data, timestamp_ms, decoded_by_the_adapter):
+            self._enqueue(lambda: self._on_source_jpeg(
+                slug, entry, data, timestamp_ms, decoded_by_the_adapter
+            ))
 
         # See `_build_source_adapter` for why these are built
         # unconditionally regardless of source kind.
@@ -4745,19 +4763,21 @@ class RosRuntime:
         self._clear_source_error(slug, entry, timestamp_ms)
 
     def _on_source_jpeg(
-        self, slug: str, expected_entry: _CameraEntry, data: bytes, timestamp_ms: int
+        self, slug: str, expected_entry: _CameraEntry, data: bytes, timestamp_ms: int,
+        decoded_by_the_adapter: bool = False,
     ) -> None:
-        """A part of an MJPEG stream, as bytes, not decoded. On the executor
-        thread, like every other hand-off.
+        """A part of an MJPEG stream, as bytes. On the executor thread, like
+        every other hand-off.
 
-        Kept twice, and both are references to the same bytes. `encoded` is
-        what a snapshot is passed through from. `raw` is what gets decoded
-        when a converted frame is needed after all: by a due snapshot that
-        cannot be passed through, or by a live start, both through
-        `_convert_due_raw_frame`. While a stream is live the adapter decodes
-        on its own thread and `_on_source_frame` gets the result; the frame
-        held here is then no newer than `latest`, and the lazy path leaves
-        it alone.
+        `encoded` always gets it: that is what a snapshot is passed through
+        from. `raw` gets it only when the adapter is not decoding the part
+        itself: `raw` is what the lazy path decodes when a converted frame
+        is needed after all, for a due snapshot that cannot be passed
+        through or for a live start, both through `_convert_due_raw_frame`.
+        A part the adapter decodes arrives as a frame through
+        `_on_source_frame` instead. Held in `raw` as well, it would be
+        decoded a second time, on this thread, whenever the rate limit had
+        dropped the adapter's frame: the same rule the ROS callback follows.
 
         A part arriving is a camera that works: it clears a source error as
         any accepted frame does, decoded or not. Same stale-adapter guard as
@@ -4766,7 +4786,8 @@ class RosRuntime:
         if entry is not expected_entry:
             return
         entry.encoded.set(data, timestamp_ms)
-        entry.raw.set(data, timestamp_ms)
+        if not decoded_by_the_adapter:
+            entry.raw.set(data, timestamp_ms)
         self._clear_source_error(slug, entry, timestamp_ms)
 
     def _clear_source_error(self, slug: str, expected_entry: _CameraEntry, timestamp_ms: int) -> None:
