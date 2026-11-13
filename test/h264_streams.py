@@ -47,6 +47,8 @@ def encode_stream(
     profile: str = "high",
     codec: str = "libx264",
     noisy: bool = False,
+    pix_fmt: str = "yuv420p",
+    x264_params: str = "",
 ) -> List[bytes]:
     """`frames` pictures as access units.
 
@@ -58,6 +60,11 @@ def encode_stream(
     that wants them only once, or out of band, strips them with
     `strip_parameter_sets`.
 
+    `pix_fmt` and `x264_params` reach for the SPS shapes the defaults never
+    write: another chroma format or bit depth (`yuv422p`, `yuv444p`,
+    `yuv420p10le`, with the profile that carries it), and whatever x264 takes
+    as a parameter (`cqm=jvt` for scaling lists, `interlaced=1`).
+
     `profile` picks the SPS's profile: with the `veryfast` preset x264 uses
     CABAC and the 8x8 transform where the profile allows them, so `baseline`,
     `main` and `high` come out as 66, 77 and 100. (`ultrafast` uses neither
@@ -66,12 +73,14 @@ def encode_stream(
     context = av.CodecContext.create(codec, "w")
     context.width = width
     context.height = height
-    context.pix_fmt = "yuv420p"
+    context.pix_fmt = pix_fmt
     context.time_base = fractions.Fraction(1, 30)
     if codec == "libx264":
         params = "keyint={g}:min-keyint={g}:scenecut=0:bframes={b}:b-adapt=0:repeat-headers=1".format(
             g=gop, b=bframes
         )
+        if x264_params:
+            params += ":" + x264_params
         options = {"preset": "veryfast", "profile": profile, "x264-params": params}
         if bframes == 0:
             options["tune"] = "zerolatency"
@@ -81,7 +90,7 @@ def encode_stream(
 
     units: List[bytes] = []
     for index, picture in enumerate(source_pictures(width, height, frames, noisy)):
-        frame = av.VideoFrame.from_ndarray(picture, format="bgr24").reformat(format="yuv420p")
+        frame = av.VideoFrame.from_ndarray(picture, format="bgr24").reformat(format=pix_fmt)
         frame.pts = index
         units.extend(bytes(packet) for packet in context.encode(frame))
     units.extend(bytes(packet) for packet in context.encode(None))
@@ -180,6 +189,16 @@ def nal_types(unit: bytes) -> List[int]:
 
 def is_idr(unit: bytes) -> bool:
     return 5 in nal_types(unit)
+
+
+def decoded_size(units: List[bytes]) -> Tuple[int, int]:
+    """`(width, height)` of the first picture as PyAV's decoder shows it."""
+    decoder = av.CodecContext.create("h264", "r")
+    frames = []
+    for unit in units:
+        frames.extend(decoder.decode(av.Packet(unit)))
+    frames.extend(decoder.decode(None))
+    return frames[0].width, frames[0].height
 
 
 def decode_all(units: List[bytes]) -> List["np.ndarray"]:

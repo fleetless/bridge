@@ -109,6 +109,42 @@ def test_the_size_is_the_cropped_one_not_the_macroblock_grid(profile, width, hei
     assert (sps.width, sps.height) == (width, height)
 
 
+@pytest.mark.parametrize("profile, pix_fmt, x264_params, profile_idc", [
+    ("high", "yuv420p", "cqm=jvt", 100),            # scaling lists in the SPS
+    ("high422", "yuv422p", "", 122),                # 4:2:2: another cropping unit
+    ("high444", "yuv444p", "", 244),                # 4:4:4: cropping in luma samples
+    ("high444", "yuv444p", "cqm=jvt", 244),         # twelve scaling lists, not eight
+    ("high10", "yuv420p10le", "", 110),             # ten bits a sample
+    ("high", "yuv420p", "interlaced=1", 100),       # fields: the height counts twice
+    ("high422", "yuv422p", "interlaced=1", 122),
+    ("high", "yuv420p", "slices=4", 100),
+])
+# Heights divisible by four: x264 codes 4:2:0 fields of no other height. None
+# of the three is a whole number of macroblocks, so each one is cropped.
+@pytest.mark.parametrize("width, height", [(100, 52), (322, 244), (1920, 1080)])
+def test_the_size_holds_for_the_sps_shapes_a_camera_can_send(
+    profile, pix_fmt, x264_params, profile_idc, width, height
+):
+    """The size sits behind fields whose presence and length depend on the
+    profile: the chroma format, the bit depths, up to twelve scaling lists.
+    And how much one cropping unit is depends on the chroma format and on
+    whether the stream codes fields. Each shape is written by libx264 and the
+    answer is held against the decoder's, not against what was asked for."""
+    try:
+        units = streams.encode_stream(
+            width=width, height=height, frames=2, gop=2, profile=profile,
+            pix_fmt=pix_fmt, x264_params=x264_params,
+        )
+    except Exception as exc:  # noqa: BLE001 - this libx264 does not write that shape
+        pytest.skip("libx264 here refuses {} {} {}x{}: {}".format(
+            profile, x264_params, width, height, type(exc).__name__))
+    if not units:
+        pytest.skip("libx264 here wrote nothing for {} {}".format(profile, x264_params))
+    sps = h264.parse_sps(_first_slice(units[0], h264.NAL_SPS))
+    assert sps.profile_idc == profile_idc
+    assert (sps.width, sps.height) == streams.decoded_size(units) == (width, height)
+
+
 def test_an_sps_cut_short_raises():
     units = streams.encode_stream(frames=1)
     sps = _first_slice(units[0], h264.NAL_SPS)

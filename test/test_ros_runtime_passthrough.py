@@ -31,7 +31,6 @@ from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import CompressedImage
 
 import h264_streams as streams
-from conftest import wait_until
 from helpers import by_slug
 from test_ros_runtime import (
     _FakeLivePublisher,
@@ -110,6 +109,18 @@ def _settings(**overrides):
     values = dict(LOW_BANDWIDTH_DEFAULTS)
     values.update(overrides)
     return LowBandwidthSettings.resolve(values, {})
+
+
+async def _eventually(condition, timeout=5.0, what="the condition"):
+    """Waits for `condition` without holding the event loop: a body that
+    runs on the loop and waits with `wait_until` blocks the very loop the
+    thing it waits for has to run on, and passes only if that thing had
+    already happened."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("{} never became true within {}s".format(what, timeout))
+        await asyncio.sleep(0.01)
 
 
 async def _feed(rt, slug, units, *, start_ms=1_000_000, step_ms=33, codec="h264"):
@@ -216,7 +227,9 @@ def test_a_compressed_image_carrying_h264_reaches_the_stream_undecoded(units, mo
         try:
             assert await rt.apply_cameras(by_slug([_h264_camera("front")])) == []
             entry = rt._cameras["front"]
-            wait_until(lambda: entry.h264_stream.newest_keyframe() is not None)
+            await _eventually(
+                lambda: entry.h264_stream.newest_keyframe() is not None, what="a keyframe"
+            )
             return entry.passes_through, entry.h264_stream.newest_keyframe(), entry.raw.take()
         finally:
             stop()
@@ -553,8 +566,8 @@ def test_b_frames_that_appear_mid_stream_end_the_running_stream(units, units_wit
         publisher = _FakeLivePublisher.instances[-1]
 
         await _feed(rt, "front", units_with_b_frames, start_ms=2_000_000)
-        wait_until(lambda: publisher.stop_calls == 1)
-        wait_until(lambda: "front" not in rt._live_publishers)
+        await _eventually(lambda: publisher.stop_calls == 1, what="the publisher's stop")
+        await _eventually(lambda: "front" not in rt._live_publishers, what="the stream's end")
         return started, await _drain_camera_states(rt), publisher
 
     started, states, publisher = run(body, live_publisher_factory=_factory())
@@ -580,8 +593,8 @@ def test_a_new_size_mid_stream_ends_the_running_stream(units):
         await _drain_camera_states(rt)
         publisher = _FakeLivePublisher.instances[-1]
         await _feed(rt, "front", larger, start_ms=2_000_000)
-        wait_until(lambda: publisher.stop_calls == 1)
-        wait_until(lambda: "front" not in rt._live_publishers)
+        await _eventually(lambda: publisher.stop_calls == 1, what="the publisher's stop")
+        await _eventually(lambda: "front" not in rt._live_publishers, what="the stream's end")
         return await _drain_camera_states(rt)
 
     states = run(body, live_publisher_factory=_factory())
@@ -705,8 +718,8 @@ def test_a_topic_that_turns_from_h264_to_pictures_ends_the_running_stream(units)
         publisher = _FakeLivePublisher.instances[-1]
         entry = rt._cameras["front"]
         await rt._submit_async(lambda: rt._on_camera_picture("front", entry))
-        wait_until(lambda: publisher.stop_calls == 1)
-        wait_until(lambda: "front" not in rt._live_publishers)
+        await _eventually(lambda: publisher.stop_calls == 1, what="the publisher's stop")
+        await _eventually(lambda: "front" not in rt._live_publishers, what="the stream's end")
         return await _drain_camera_states(rt), entry.passes_through, entry.h264_stream.newest_keyframe()
 
     states, passes_through, keyframe = run(body, live_publisher_factory=_factory())
