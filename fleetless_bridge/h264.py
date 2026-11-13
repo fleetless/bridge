@@ -69,7 +69,11 @@ class H264ParseError(ValueError):
     cut short, a field outside what the standard allows."""
 
 
-def split_nal_units(data: bytes) -> List[bytes]:
+class TooManyNalUnits(H264ParseError):
+    """More NAL units in one access unit than the caller allows."""
+
+
+def split_nal_units(data: bytes, max_units: Optional[int] = None) -> List[bytes]:
     """The NAL units of an Annex-B byte string, without their start codes.
 
     A unit runs from one start code (`00 00 01`, with any number of zero
@@ -80,6 +84,12 @@ def split_nal_units(data: bytes) -> List[bytes]:
     Raises `H264ParseError` when there is no unit to return, or when the
     bytes before the first start code are anything but padding -- that is
     what a JPEG, an AVCC sample or a truncated message looks like from here.
+
+    With `max_units`, raises `TooManyNalUnits` at the start code that comes
+    after that many. The count is taken while splitting and counts start
+    codes, so megabytes of five-byte units, or of start codes with nothing
+    between them, are turned away after `max_units` steps and not walked to
+    the end: every step here is Python.
     """
     data = bytes(data)
     position = data.find(_START_CODE)
@@ -88,7 +98,13 @@ def split_nal_units(data: bytes) -> List[bytes]:
     if data[:position].strip(b"\x00"):
         raise H264ParseError("bytes before the first start code")
     nals: List[bytes] = []
+    found = 0
     while position != -1:
+        found += 1
+        if max_units is not None and found > max_units:
+            raise TooManyNalUnits(
+                "more than {} NAL units in one access unit".format(max_units)
+            )
         start = position + 3
         position = data.find(_START_CODE, start)
         nal = data[start:len(data) if position == -1 else position].rstrip(b"\x00")
@@ -309,13 +325,14 @@ class AccessUnit:
     has_b_slice: bool
 
 
-def inspect_access_unit(data: bytes) -> AccessUnit:
+def inspect_access_unit(data: bytes, max_nal_units: Optional[int] = None) -> AccessUnit:
     """Splits one access unit and reads what passthrough needs to know about
     it. Raises `H264ParseError` for bytes that are not Annex B, a unit with
     the forbidden bit set, a slice header cut short, and data partitioning
     (NAL types 2 to 4): no browser decodes it, and it is what the slices of
-    an H.265 stream look like when somebody labels them H.264."""
-    nals = tuple(split_nal_units(data))
+    an H.265 stream look like when somebody labels them H.264. With
+    `max_nal_units`, raises `TooManyNalUnits` for a unit that holds more."""
+    nals = tuple(split_nal_units(data, max_nal_units))
     sps: Optional[bytes] = None
     pps: List[bytes] = []
     is_idr = has_slice = has_b_slice = False
