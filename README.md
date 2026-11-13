@@ -192,9 +192,10 @@ starts it again.
 ## 📦 Live video packet size
 
 Live video leaves the robot as RTP packets, and the largest one is a setting.
-The default is what browsers send and fits a path with an MTU of 1280, which
-is what a VPN usually leaves. A packet that does not fit such a path is not
-trimmed on the way. It is dropped, and the viewer gets a track and no picture.
+The default is 1200 bytes, which is what browsers send and fits a path with an
+MTU of 1280, the size NetBird and Tailscale set. A packet that does not fit
+such a path is not trimmed on the way. It is dropped, and the viewer gets a
+track and no picture.
 
 | Parameter | Default | Meaning |
 |---|---|---|
