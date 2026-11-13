@@ -39,6 +39,19 @@ logs land in `tools/live-proof/logs/<distro>-<codec>/`, and both matter: a
 viewer that saw nothing next to a publisher that never reached `connected` is
 a different finding from one next to a publisher that did.
 
+The publisher's log also says how long the start took, in the line the
+bridge logs on a robot:
+
+```
+grep "ready in" tools/live-proof/logs/humble-vp8/publisher.log
+... INFO fleetless_bridge.live: Live publish for proof ready in 29 ms
+```
+
+Here it counts from the call to `start()` to the answer applied; on a robot it
+counts from the `camera_start` command. `proof` is the name this harness gives
+its run (`relay-proof` and `soak` for the other two); a robot prints the
+camera's slug there.
+
 The target is the development LiveKit at `ws://localhost:7880` with the
 development credentials (`LK_URL`, `LK_KEY`, `LK_SECRET` override them). The
 room name carries the case and a random suffix, so a viewer cannot be looking
