@@ -112,8 +112,8 @@ and the descriptions of `width`, `height`, `fps`, `bitrate_kbps`, the ROS
 source's `type` and the low-bandwidth camera keys say what they mean for a
 camera that is passed through. `constants.json` gains `LIVE_DEFAULTS.encoder`
 (`software`) and `LIVE_BOUNDS.encoder` (`values`: the five names, in the
-schema's order). The bridge reads `encoder`, its default and its values.
-Every other vendored schema is byte-identical.
+schema's order). The bridge reads `encoder`, its default and its values, and
+`passthrough`. Every other vendored schema is byte-identical.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
