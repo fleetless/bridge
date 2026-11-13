@@ -15,6 +15,7 @@ any ROS graph.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -175,6 +176,11 @@ class LatestFrameHolder:
 class RawFrame:
     msg: object
     timestamp_ms: int
+    #: `time.monotonic()` when the message arrived. Beside `timestamp_ms`,
+    #: not instead of it: that one is the capture time the wire reports, on
+    #: the wall clock; this one is for arithmetic with other monotonic
+    #: readings, which a wall clock that can be stepped is no good for.
+    arrived_s: float = 0.0
 
 
 class RawFrameHolder:
@@ -209,13 +215,20 @@ class RawFrameHolder:
         self._frame: Optional[RawFrame] = None
 
     def set(self, msg: object, timestamp_ms: int) -> None:
+        arrived_s = time.monotonic()
         with self._lock:
-            self._frame = RawFrame(msg=msg, timestamp_ms=timestamp_ms)
+            self._frame = RawFrame(msg=msg, timestamp_ms=timestamp_ms, arrived_s=arrived_s)
 
-    def take(self) -> Optional[Tuple[object, int]]:
+    def take_frame(self) -> Optional[RawFrame]:
+        """The held message with everything known about it, and the slot
+        cleared."""
         with self._lock:
             frame = self._frame
             self._frame = None
+        return frame
+
+    def take(self) -> Optional[Tuple[object, int]]:
+        frame = self.take_frame()
         if frame is None:
             return None
         return frame.msg, frame.timestamp_ms
