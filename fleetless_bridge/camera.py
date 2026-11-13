@@ -8,6 +8,11 @@ BGR `uint8` array — so everything downstream (fps throttling in
 ros_runtime.py, resizing, JPEG-encoding for a snapshot, feeding a live
 publisher) has exactly one shape to work with, not two.
 
+A source that already delivers JPEG need not go through that array at all:
+`jpeg_size` reads what a JPEG is from its header, and `EncodedFrameHolder`
+keeps the source's own bytes beside the converted frame, so a snapshot can be
+those bytes unchanged (ros_runtime.py decides when).
+
 Deliberately rclpy-free, like sampling.py: it needs message *types* to
 recognise a shape, never a node or executor — so it can be tested without
 any ROS graph.
@@ -35,16 +40,24 @@ class UnsupportedImageError(ValueError):
 def to_bgr(msg: object) -> "np.ndarray":
     """`Image` passes through `cv_bridge` (converting to `bgr8` if the
     source encoding differs); `CompressedImage` is decoded with
-    `cv2.imdecode`. Anything else, or bytes that fail to decode, raises
-    `UnsupportedImageError` — config-apply time already validated `type`
-    against the two known shapes (ros_runtime.py), so reaching this branch
-    at all would mean the message on the wire disagrees with its own
+    `cv2.imdecode`, and so are the bare bytes of an encoded image, which is
+    how an MJPEG part is held. Anything else, or bytes that fail to decode,
+    raises `UnsupportedImageError` — config-apply time already validated
+    `type` against the two known shapes (ros_runtime.py), so reaching this
+    branch at all would mean the message on the wire disagrees with its own
     declared type, not a normal-use case."""
     if isinstance(msg, CompressedImage):
         raw = np.frombuffer(bytes(msg.data), dtype=np.uint8)
         frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
         if frame is None:
             raise UnsupportedImageError("could not decode CompressedImage data")
+        return frame
+    if isinstance(msg, (bytes, bytearray, memoryview)):
+        frame = None
+        if len(msg):  # `imdecode` raises on an empty buffer instead of returning nothing
+            frame = cv2.imdecode(np.frombuffer(msg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise UnsupportedImageError("could not decode the image bytes")
         return frame
     if isinstance(msg, Image):
         try:
@@ -141,6 +154,150 @@ def encode_snapshot_jpeg(
     return None
 
 
+# --- a JPEG, read without decoding it -------------------------------------------
+
+_JPEG_RST0 = 0xD0
+_JPEG_SOI = 0xD8
+_JPEG_EOI = 0xD9
+_JPEG_SOS = 0xDA
+_JPEG_TEM = 0x01
+
+#: The frame headers a snapshot may be passed through under: baseline (SOF0)
+#: and progressive (SOF2), both Huffman-coded. Every browser shows these.
+_JPEG_SOF_SHOWN_EVERYWHERE = (0xC0, 0xC2)
+
+#: Every frame header there is: 0xC0 to 0xCF without the three codes in that
+#: range that mean something else (Huffman tables, a reserved code, arithmetic
+#: conditioning). Extended, lossless, hierarchical and arithmetic-coded files
+#: are recognised here so that they can be refused by name, not skipped as an
+#: unknown segment and then mistaken for a file without a frame header.
+_JPEG_SOF_ANY = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+
+
+def jpeg_size(data: object) -> Optional[Tuple[int, int]]:
+    """`(width, height)` of a JPEG that every browser shows, read from its
+    headers. `None` for anything else. Never decodes and never raises.
+
+    What it takes to get a size back, all of it:
+
+    - the bytes begin with the start marker and end with the end marker;
+    - every segment up to the scan can be walked by its own length, and none
+      runs past the end;
+    - exactly one frame header comes before the scan, baseline or
+      progressive, with 8 bits a sample, one or three components and a size
+      that is not zero;
+    - a scan follows.
+
+    So CMYK (four components), 12-bit, lossless and arithmetic-coded files
+    get `None`, and so does a file cut short anywhere, a PNG, and bytes that
+    merely begin like a JPEG. A thumbnail inside an EXIF block is a whole
+    JPEG of its own, frame header included; it sits inside an application
+    segment and is stepped over with it.
+
+    The scan itself is not read: whether it decodes is the viewer's to find
+    out, as it is for any picture nobody here looked at.
+
+    `data` is anything that exposes its bytes: `bytes`, a `bytearray`, a
+    `memoryview`, the `array('B')` a ROS message holds its data in.
+    """
+    try:
+        view = memoryview(data)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+    if view.ndim != 1 or view.itemsize != 1:
+        return None
+    try:
+        view = view.cast("B")
+    except (TypeError, ValueError):
+        return None
+    end = len(view)
+    if end < 4 or view[0] != 0xFF or view[1] != _JPEG_SOI:
+        return None
+    if view[end - 2] != 0xFF or view[end - 1] != _JPEG_EOI:
+        return None
+
+    size: Optional[Tuple[int, int]] = None
+    at = 2
+    while True:
+        # A marker: 0xFF, any number of 0xFF fill bytes, then its code.
+        if at >= end or view[at] != 0xFF:
+            return None
+        while at < end and view[at] == 0xFF:
+            at += 1
+        if at >= end:
+            return None
+        code = view[at]
+        at += 1
+        if code == _JPEG_TEM:
+            continue  # stands alone, no length
+        if code == 0x00 or _JPEG_RST0 <= code <= _JPEG_EOI:
+            # A stuffed byte, a restart marker (0xD0 to 0xD7), a second
+            # start or the end: none of them belongs between the start and
+            # the first scan.
+            return None
+        if at + 2 > end:
+            return None
+        length = (view[at] << 8) | view[at + 1]  # counts its own two bytes
+        if length < 2 or at + length > end:
+            return None
+        if code == _JPEG_SOS:
+            return size  # `None` when no frame header came first
+        if code in _JPEG_SOF_ANY:
+            if size is not None or code not in _JPEG_SOF_SHOWN_EVERYWHERE or length < 8:
+                return None
+            precision = view[at + 2]
+            height = (view[at + 3] << 8) | view[at + 4]
+            width = (view[at + 5] << 8) | view[at + 6]
+            components = view[at + 7]
+            if (
+                precision != 8
+                or components not in (1, 3)
+                or length != 8 + 3 * components
+                or width == 0
+                or height == 0
+            ):
+                return None
+            size = (width, height)
+        at += length
+
+
+@dataclass(frozen=True)
+class EncodedFrame:
+    #: The source's own bytes, as it delivered them: `bytes`, or whatever a
+    #: message holds its data in. Never copied on the way here.
+    data: object
+    timestamp_ms: int
+
+
+class EncodedFrameHolder:
+    """A single slot for one camera's newest frame as the source encoded it,
+    beside the converted one in `LatestFrameHolder`.
+
+    Written on every frame a source delivers already encoded, whether or not
+    anybody watches: keeping a reference costs nothing, and it is what lets
+    a snapshot be the source's own JPEG. Nothing is looked at when it is
+    stored; `jpeg_size` reads it when a snapshot is due.
+
+    `get()` does not clear the slot. The same frame may be the snapshot
+    again an interval later, exactly as the converted one may: a camera that
+    has stopped sending is seen by the age its snapshot reports.
+
+    Written and read on the executor thread; the lock is for whoever reads
+    it from somewhere else one day, as in `RawFrameHolder`."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._frame: Optional[EncodedFrame] = None
+
+    def set(self, data: object, timestamp_ms: int) -> None:
+        with self._lock:
+            self._frame = EncodedFrame(data=data, timestamp_ms=timestamp_ms)
+
+    def get(self) -> Optional[EncodedFrame]:
+        with self._lock:
+            return self._frame
+
+
 @dataclass(frozen=True)
 class LatestFrame:
     bgr: "np.ndarray"
@@ -187,19 +344,20 @@ class RawFrameHolder:
     """A single-slot, mutex-guarded holder for one camera's newest *un*converted
     source message — the lazy half of "decode only what someone will see".
     `LatestFrameHolder` above holds a converted BGR frame, cheap to keep
-    updating; this holds the raw message (an `Image`/`CompressedImage`, for
-    the `kind: 'ros'` adapter — the only source that can retain a message
-    without paying the imgmsg->BGR conversion, since the three threaded
-    adapters must decode on their own thread just to know a frame arrived).
+    updating; this holds what `to_bgr` takes: the raw message of the `kind:
+    'ros'` adapter (an `Image`/`CompressedImage`) or the bytes of an MJPEG
+    part. Those are the two sources that can retain a frame without paying
+    for its conversion; an RTSP or V4L2 adapter must decode on its own
+    thread just to know a frame arrived.
 
     `take()` — unlike `LatestFrameHolder.get()` — clears the slot: the
     frame is converted at most once, by whichever path consumes it. There
     are two, and both go through `RosRuntime._convert_due_raw_frame`: the
     dueness walk of `_next_snapshot`, and a live start
-    (`RosRuntime.convert_newest_raw_frame`). Written from the ROS
-    subscription callback (the executor thread); `take()` runs on that same
-    thread for both readers, so the lock here is defensive rather than
-    load-bearing.
+    (`RosRuntime.convert_newest_raw_frame`). Written on the executor thread
+    (the ROS subscription callback, or the hand-off of an MJPEG part);
+    `take()` runs on that same thread for both readers, so the lock here is
+    defensive rather than load-bearing.
 
     **What a live start does with it.** It takes the raw frame once, as the
     start begins, and converts it into `entry.latest`, where the publisher

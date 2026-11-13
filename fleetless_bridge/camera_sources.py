@@ -14,6 +14,10 @@ through the same two callbacks, `on_frame(bgr, timestamp_ms)` and
 above an adapter (ros_runtime.py's shared resize/rate-limit/holder-write,
 or its camera_state report) ever branches on which kind produced a frame.
 
+The MJPEG adapter has a third, `on_jpeg(data, timestamp_ms)`: its source
+sends finished JPEGs, so it hands each one over as it came and decodes only
+while a converted frame is wanted.
+
 Credentials: resolved once per config-apply by `resolve_credentials`
 and handed to an adapter as an already-decided `Credentials` value — an
 adapter never re-derives ref-vs-URL-userinfo precedence itself. MJPEG
@@ -65,6 +69,8 @@ log = logging.getLogger(__name__)
 
 OnFrame = Callable[["np.ndarray", int], None]
 OnError = Callable[[str, str], None]
+#: A frame as the source encoded it: the bytes of one JPEG and its capture time.
+OnJpeg = Callable[[bytes, int], None]
 
 # ffmpeg's own diagnostics (via OpenCV's ffmpeg backend) go straight to the
 # process's real stderr — outside Python's logging, outside every `except`
@@ -828,7 +834,23 @@ class MjpegSourceAdapter(_ThreadedSourceAdapter):
     than trusting a per-part `Content-Length`, which is more robust across
     the variety of real MJPEG server implementations. Authentication is a
     real HTTP `Authorization` header, added to the request before it is
-    ever sent — the one adapter that never has to touch the URL at all."""
+    ever sent — the one adapter that never has to touch the URL at all.
+
+    **A part is a frame, decoded or not.** The camera has already encoded
+    it; finding its two markers is all it takes to know one arrived. Every
+    part goes to `on_jpeg` as bytes with its capture time. It is decoded,
+    on this adapter's own thread, only while `conversion_wanted()` says a
+    converted frame is wanted, and then goes to `on_frame` as before. So a
+    camera nobody watches costs a read and a search, not a JPEG decode per
+    frame.
+
+    A part that does not decode is skipped and the next one is the recovery.
+    It is said once per run of bad parts, without the URL: a stream that
+    sends nothing decodable must not be silent, and must not write a line
+    per frame either.
+
+    Without `conversion_wanted` every part is decoded, and without `on_jpeg`
+    no bytes are handed over: the adapter as it was."""
 
     _JPEG_SOI = b"\xff\xd8"
     _JPEG_EOI = b"\xff\xd9"
@@ -846,12 +868,18 @@ class MjpegSourceAdapter(_ThreadedSourceAdapter):
         on_error: OnError,
         opener: Optional[Callable[["urllib.request.Request"], object]] = None,
         backoff: Optional[Backoff] = None,
+        on_jpeg: Optional[OnJpeg] = None,
+        conversion_wanted: Optional[Callable[[], bool]] = None,
     ) -> None:
         validate_source_scheme(url, ("http", "https"))  # see its own docstring
         super().__init__(on_frame=on_frame, on_error=on_error, backoff=backoff)
         self._url = url
         self._credentials = credentials
         self._opener = opener or _default_mjpeg_opener
+        self._on_jpeg = on_jpeg
+        self._conversion_wanted = conversion_wanted
+        # Set by a part that did not decode, cleared by one that did.
+        self._undecodable_reported = False
         self._response = None
         self._response_lock = threading.Lock()
 
@@ -930,10 +958,30 @@ class MjpegSourceAdapter(_ThreadedSourceAdapter):
                 timestamp_ms = sampling.capture_timestamp_ms()
                 frame_bytes = buf[start : end + 2]
                 buf = buf[end + 2 :]
+                self._emit_jpeg(frame_bytes, timestamp_ms)
+                if self._conversion_wanted is not None and not self._conversion_wanted():
+                    continue  # nobody needs the pixels; the bytes are handed over
                 frame = cv2.imdecode(np.frombuffer(frame_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
-                    continue  # one corrupt part; the next SOI/EOI pair is the recovery
+                    # One corrupt part; the next SOI/EOI pair is the recovery.
+                    if not self._undecodable_reported:
+                        self._undecodable_reported = True
+                        log.error(
+                            "A part of an MJPEG stream did not decode as an image; "
+                            "skipping it and every such part until one decodes"
+                        )
+                    continue
+                self._undecodable_reported = False
                 self._emit_frame(frame, timestamp_ms)
+
+    def _emit_jpeg(self, data: bytes, timestamp_ms: int) -> None:
+        if self._on_jpeg is None:
+            return
+        try:
+            self._on_jpeg(data, timestamp_ms)
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the adapter
+            # Same module-wide rule as `_report_once`: the type name only.
+            log.error("Error handling a camera frame's bytes: %s (message redacted)", type(exc).__name__)
 
     def _close(self) -> None:
         with self._response_lock:

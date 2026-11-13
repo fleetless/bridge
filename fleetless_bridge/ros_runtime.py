@@ -1352,20 +1352,26 @@ class _RosSourceAdapter(camera_sources.CameraSourceAdapter):
     `config_applied` error), the same promise the earlier code made, not
     surface later as a silent subscription to nothing.
 
-    Decode-on-demand — decode only what someone will see — is
-    scoped to this adapter only: the three threaded adapters in
-    camera_sources.py decode on their own background thread at source
-    rate regardless of whether anyone is watching — they must, to know a
-    frame arrived at all — so there is nothing to gate there. ROS is the
-    one source that can retain a deserialized message (near-free — DDS
+    Decode-on-demand — decode only what someone will see — works here
+    because ROS can retain a deserialized message (near-free — DDS
     deserialization itself still happens, rclpy gives no way to skip
-    that) without ever converting it, which is what makes `raw` worth
-    having here specifically."""
+    that) without ever converting it, which is what `raw` is for. The MJPEG
+    adapter follows the same scheme with the bytes of a part; the RTSP and
+    V4L2 adapters in camera_sources.py decode on their own background
+    thread at source rate regardless of whether anyone is watching — they
+    must, to know a frame arrived at all.
+
+    A `CompressedImage` is also kept as the source encoded it: `encoded`
+    gets a reference to its data on every message, watched or not, so a
+    snapshot can be those bytes unchanged (`RosRuntime._passthrough_snapshot`).
+    Nothing is read here, the `format` string least of all: what the bytes
+    are is found out when a snapshot is due."""
 
     def __init__(
         self, *, node, topic: str, type_name: str, on_frame: camera_sources.OnFrame,
         on_error: camera_sources.OnError, raw: "camera.RawFrameHolder",
         conversion_wanted: Callable[[], bool], on_raw_frame: Callable[[int], None],
+        encoded: Optional["camera.EncodedFrameHolder"] = None,
     ) -> None:
         try:
             message_class = get_message(type_name)
@@ -1388,6 +1394,9 @@ class _RosSourceAdapter(camera_sources.CameraSourceAdapter):
         self._raw = raw
         self._conversion_wanted = conversion_wanted
         self._on_raw_frame = on_raw_frame
+        # Only a `CompressedImage` arrives encoded; an `Image` has nothing
+        # to keep here.
+        self._encoded = encoded if message_class is CompressedImage else None
         self._handle: Optional[object] = None
 
     def start(self) -> None:
@@ -1399,6 +1408,8 @@ class _RosSourceAdapter(camera_sources.CameraSourceAdapter):
             # reports capture time, never the moment it happened to be
             # decoded.
             timestamp_ms = sampling.capture_timestamp_ms()
+            if self._encoded is not None:
+                self._encoded.set(msg.data, timestamp_ms)
             if self._conversion_wanted():
                 try:
                     bgr = camera.to_bgr(msg)
@@ -1450,15 +1461,21 @@ class _CameraEntry:
     snapshot_interval_seconds: int
     rate: sampling.RatePolicy
     latest: camera.LatestFrameHolder
-    # The `kind: 'ros'` adapter's not-yet-converted newest message — always
-    # constructed, even for the three threaded sources that
-    # never write to it (they decode on their own thread regardless; see
-    # `_RosSourceAdapter`'s docstring), so `_CameraEntry`'s shape stays
-    # uniform across all four source kinds and `_next_snapshot`'s lazy
-    # conversion never needs an `isinstance`/`hasattr` check to run its
-    # dueness walk.
+    # The newest frame nobody has converted yet: a message of the `kind:
+    # 'ros'` adapter, or the bytes of an MJPEG part. Always constructed,
+    # even for the RTSP and V4L2 sources that never write to it (they decode
+    # on their own thread regardless; see `_RosSourceAdapter`'s docstring),
+    # so `_CameraEntry`'s shape stays uniform across all four source kinds
+    # and `_next_snapshot`'s lazy conversion never needs an
+    # `isinstance`/`hasattr` check to run its dueness walk.
     raw: camera.RawFrameHolder
     adapter: camera_sources.CameraSourceAdapter
+    # The newest frame as the source encoded it, for a source that delivers
+    # JPEG: a `CompressedImage` topic or an MJPEG stream. Written on every
+    # frame, watched or not; read when a snapshot is due
+    # (`_passthrough_snapshot`). Empty for every other source, and one of
+    # its own for an entry that is built without naming it.
+    encoded: camera.EncodedFrameHolder = field(default_factory=camera.EncodedFrameHolder)
     # Watchdog bookkeeping for the snapshot timer, same shape as
     # `_PublisherEntry.last_activity_at`: `None` means "never sent one yet",
     # which is what makes the first snapshot go out as soon as a frame is
@@ -2516,8 +2533,16 @@ class RosRuntime:
                     )
                 )
                 continue
-            latest = entry.latest.get()
-            if latest is not None:
+            # The newest frame the camera is known by: the converted one,
+            # or the one kept as the source encoded it. A camera whose
+            # snapshots are passed through never has the first, and it
+            # works all the same.
+            seen_ms = [
+                frame.timestamp_ms
+                for frame in (entry.latest.get(), entry.encoded.get())
+                if frame is not None
+            ]
+            if seen_ms:
                 # Confirmed ok as of the latest frame's own capture time —
                 # not "now": this is a restatement of a fact already true,
                 # same reasoning as the error branch above.
@@ -2525,7 +2550,7 @@ class RosRuntime:
                     self._loop,
                     CameraStateUpdate(
                         slug, False, None,
-                        cause=CAMERA_STATE_CAUSE_SOURCE, observed_at_ms=latest.timestamp_ms,
+                        cause=CAMERA_STATE_CAUSE_SOURCE, observed_at_ms=max(seen_ms),
                         request_id=None,
                     )
                 )
@@ -2570,7 +2595,7 @@ class RosRuntime:
         like every other, and whoever reads the holder finds it there.
 
         A no-op for a slug with no camera, for a camera holding nothing raw
-        -- the three threaded sources never do, they decode continuously --
+        -- an RTSP or V4L2 source never does, it decodes continuously --
         and for a raw message older than what `latest` already has."""
         return self._enqueue(lambda: self._convert_newest_raw_frame(slug))
 
@@ -4341,6 +4366,8 @@ class RosRuntime:
         raw: camera.RawFrameHolder,
         conversion_wanted: Callable[[], bool],
         on_raw_frame: Callable[[int], None],
+        encoded: Optional[camera.EncodedFrameHolder] = None,
+        on_jpeg: Optional[camera_sources.OnJpeg] = None,
     ) -> camera_sources.CameraSourceAdapter:
         """The one place that turns a `CameraSource` into a running
         adapter. Everything below this — `_on_source_frame`, the snapshot
@@ -4349,17 +4376,19 @@ class RosRuntime:
         future adapter needs a downstream special case, the seam moved to
         the wrong place.
 
-        `raw`/`conversion_wanted`/`on_raw_frame` are `_RosSourceAdapter`-only
-        (the decode-on-demand gate is scoped to `kind: 'ros'`, see
-        its own docstring) — accepted here unconditionally anyway, from
-        `_create_camera`, which builds all three regardless of source kind,
-        so this stays a uniform call for all four rather than special-casing
-        one of them at the call site too."""
+        `raw`/`on_raw_frame`/`encoded` are `_RosSourceAdapter`-only and
+        `on_jpeg` is the MJPEG adapter's; `conversion_wanted` goes to both,
+        the two sources that can hold a frame without decoding it. All are
+        accepted here unconditionally anyway, from `_create_camera`, which
+        builds them regardless of source kind, so this stays a uniform call
+        for all four rather than special-casing one of them at the call
+        site too."""
         if isinstance(source, RosSource):
             return _RosSourceAdapter(
                 node=self._node, topic=source.topic, type_name=source.type,
                 on_frame=on_frame, on_error=on_error,
                 raw=raw, conversion_wanted=conversion_wanted, on_raw_frame=on_raw_frame,
+                encoded=encoded,
             )
         if isinstance(source, RtspSource):
             return camera_sources.RtspSourceAdapter(
@@ -4370,6 +4399,7 @@ class RosRuntime:
             return camera_sources.MjpegSourceAdapter(
                 url=source.url, credentials=resolved_credentials,
                 on_frame=on_frame, on_error=on_error,
+                on_jpeg=on_jpeg, conversion_wanted=conversion_wanted,
             )
         if isinstance(source, V4l2Source):
             return camera_sources.V4l2SourceAdapter(
@@ -4528,10 +4558,15 @@ class RosRuntime:
         def on_error(code, message):
             self._enqueue(lambda: self._on_source_error(slug, entry, code, message))
 
-        # `_RosSourceAdapter`-only — see `_build_source_adapter`
-        # for why these three are built unconditionally regardless of
-        # source kind.
+        # The MJPEG adapter's third callback, from its own thread like the
+        # two above and marshalled the same way.
+        def on_jpeg(data, timestamp_ms):
+            self._enqueue(lambda: self._on_source_jpeg(slug, entry, data, timestamp_ms))
+
+        # See `_build_source_adapter` for why these are built
+        # unconditionally regardless of source kind.
         raw = camera.RawFrameHolder()
+        encoded = camera.EncodedFrameHolder()
 
         def conversion_wanted() -> bool:
             # `True` iff a live publish task for this slug is currently
@@ -4553,6 +4588,11 @@ class RosRuntime:
             # served as current. A lock on this hot path would cost every
             # single incoming frame to close a race whose worst case is
             # that cheap.
+            #
+            # The MJPEG adapter asks the same question from its own thread,
+            # once per part, and the same holds there: a part decoded for a
+            # stream that has just ended, or one left as bytes for the lazy
+            # path to pick up.
             return slug in self._live_publishers
 
         def on_raw_frame(timestamp_ms: int) -> None:
@@ -4570,6 +4610,7 @@ class RosRuntime:
         adapter = self._build_source_adapter(
             cfg.source, resolved_credentials, on_frame, on_error,
             raw=raw, conversion_wanted=conversion_wanted, on_raw_frame=on_raw_frame,
+            encoded=encoded, on_jpeg=on_jpeg,
         )
         entry = _CameraEntry(
             source=cfg.source,
@@ -4582,6 +4623,7 @@ class RosRuntime:
             rate=sampling.MaxHzPolicy(cfg.fps),
             latest=camera.LatestFrameHolder(),
             raw=raw,
+            encoded=encoded,
             adapter=adapter,
         )
         adapter.start()
@@ -4664,16 +4706,16 @@ class RosRuntime:
         rotation was supposed to have retired — silently refreshing the
         wrong camera's freshness indefinitely, not merely for a moment.
 
-        This does mean every source's frame is decoded before the rate
-        limit ever sees it for the three threaded sources (RTSP/MJPEG/
-        V4L2), which must decode on their own thread just to know a frame
-        arrived at all — but no longer for ROS: `_RosSourceAdapter` only
-        reaches this hand-off (via `on_frame`) when something is actually
-        going to use the result — decode only what someone will see —
-        otherwise it stores the raw message and clears any source
-        error through `_clear_source_error` directly, bypassing this
-        method's resize/rate-limit/`latest.set` entirely, since those only
-        make sense for a frame that was actually converted.
+        This does mean every frame of an RTSP or V4L2 source is decoded
+        before the rate limit ever sees it: those two must decode on their
+        own thread just to know a frame arrived at all. Not so for ROS and
+        MJPEG: their adapters only reach this hand-off (via `on_frame`)
+        when something is actually going to use the result — decode only
+        what someone will see — otherwise the frame is held undecoded and
+        any source error is cleared through `_clear_source_error` directly,
+        bypassing this method's resize/rate-limit/`latest.set` entirely,
+        since those only make sense for a frame that was actually
+        converted.
 
         `arrived_s` is the `time.monotonic()` at which the frame arrived,
         for the one caller that hands a frame over later than that: a raw
@@ -4700,6 +4742,31 @@ class RosRuntime:
             return
 
         entry.latest.set(frame, timestamp_ms)
+        self._clear_source_error(slug, entry, timestamp_ms)
+
+    def _on_source_jpeg(
+        self, slug: str, expected_entry: _CameraEntry, data: bytes, timestamp_ms: int
+    ) -> None:
+        """A part of an MJPEG stream, as bytes, not decoded. On the executor
+        thread, like every other hand-off.
+
+        Kept twice, and both are references to the same bytes. `encoded` is
+        what a snapshot is passed through from. `raw` is what gets decoded
+        when a converted frame is needed after all: by a due snapshot that
+        cannot be passed through, or by a live start, both through
+        `_convert_due_raw_frame`. While a stream is live the adapter decodes
+        on its own thread and `_on_source_frame` gets the result; the frame
+        held here is then no newer than `latest`, and the lazy path leaves
+        it alone.
+
+        A part arriving is a camera that works: it clears a source error as
+        any accepted frame does, decoded or not. Same stale-adapter guard as
+        `_on_source_frame`."""
+        entry = self._cameras.get(slug)
+        if entry is not expected_entry:
+            return
+        entry.encoded.set(data, timestamp_ms)
+        entry.raw.set(data, timestamp_ms)
         self._clear_source_error(slug, entry, timestamp_ms)
 
     def _clear_source_error(self, slug: str, expected_entry: _CameraEntry, timestamp_ms: int) -> None:
@@ -5156,7 +5223,8 @@ class RosRuntime:
         """Lazy half of the decode gate: when nobody has a live
         publisher running for `slug`, `_RosSourceAdapter`'s callback leaves
         each arriving message in `entry.raw` instead of converting it (the
-        eager half — see `conversion_wanted` in `_create_camera`). Called
+        eager half — see `conversion_wanted` in `_create_camera`), and the
+        parts of an MJPEG stream are held there the same way. Called
         for a camera `_next_snapshot`'s dueness walk has just decided is
         actually due, and for one whose live stream is starting
         (`convert_newest_raw_frame`) — so a camera nobody ever pulls a
@@ -5199,6 +5267,55 @@ class RosRuntime:
         # and the wait is not part of the camera's cadence.
         self._on_source_frame(slug, entry, bgr, raw_timestamp_ms, arrived_s=raw.arrived_s)
 
+    def _passthrough_snapshot(
+        self, slug: str, entry: _CameraEntry, max_bytes: int
+    ) -> Optional[bytes]:
+        """The source's own JPEG as the snapshot: its bytes, unchanged, in a
+        frame that reports its own size and capture time. `None` when the
+        decode-resize-encode path has to run instead.
+
+        It applies when the newest frame the source encoded is a JPEG every
+        browser shows, in exactly the configured `width`×`height`, and no
+        longer than `max_bytes` — the budget of this pull, which
+        `next_snapshot` has already cut down to the wire's ceiling. Then
+        nothing is decoded, resized or encoded: the camera has done that
+        work once and the bridge does not do it again.
+
+        What the bytes are is read from the bytes (`camera.jpeg_size`). A
+        `CompressedImage` says in `format` what it holds, and nothing checks
+        that it is true.
+
+        Whether somebody is watching live makes no difference: the encoded
+        frame is kept on every message either way. A frame too long for
+        this pull is not held against the next one, which may have more
+        room."""
+        held = entry.encoded.get()
+        if held is None:
+            return None
+        data = held.data
+        try:
+            if len(data) > max_bytes:  # type: ignore[arg-type]
+                return None
+            if camera.jpeg_size(data) != (entry.width, entry.height):
+                return None
+            image_bytes = bytes(data)  # type: ignore[arg-type]
+        except Exception as exc:  # noqa: BLE001 - whatever a source holds its data in
+            log.error(
+                "Could not read the encoded frame of camera slug %r: %s",
+                slug, type(exc).__name__,
+            )
+            return None
+        return snapshot_frame(
+            slug=slug,
+            mime="image/jpeg",
+            width=entry.width,
+            height=entry.height,
+            # Capture time of this very frame (the standing `timestamp_ms`
+            # rule), not of whatever was converted last.
+            timestamp_ms=held.timestamp_ms,
+            image_bytes=image_bytes,
+        )
+
     def _next_snapshot(self, max_bytes: int) -> Optional[bytes]:
         """The dueness walk, on the executor thread. Every configured
         camera, independent of live — a camera nobody is
@@ -5224,9 +5341,13 @@ class RosRuntime:
         starts at whichever camera is.
 
         Only *now*, for a camera that is actually due, does
-        `_convert_due_raw_frame` decode anything ROS left raw —
+        `_convert_due_raw_frame` decode anything a source left raw —
         a camera that never has a snapshot pulled for it, and no live
-        publisher either, never pays the conversion cost at all."""
+        publisher either, never pays the conversion cost at all.
+
+        And not even then for a source that already delivers the snapshot:
+        `_passthrough_snapshot` is asked first, and a JPEG in the configured
+        size goes out as it came."""
         now = time.monotonic()
         for slug, entry in list(self._cameras.items()):
             if entry.last_snapshot_at is not None:
@@ -5245,6 +5366,10 @@ class RosRuntime:
                 # the old `_ms` name is a NameError, not a silent 1000x bug.
                 if now - entry.last_snapshot_at < entry.snapshot_interval_seconds:
                     continue
+            passed_through = self._passthrough_snapshot(slug, entry, max_bytes)
+            if passed_through is not None:
+                entry.last_snapshot_at = now
+                return passed_through
             self._convert_due_raw_frame(slug, entry)
             frame = entry.latest.get()
             if frame is None:

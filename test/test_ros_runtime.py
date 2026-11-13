@@ -5384,7 +5384,8 @@ class _InertCameraAdapter:
     """A stand-in for `camera_sources.MjpegSourceAdapter` (or any other
     `CameraSourceAdapter`) that never calls `on_frame`/`on_error` on its
     own — matches the real constructor's keyword shape (`url`,
-    `credentials`, `on_frame`, `on_error`; V4L2's `device` too, unused
+    `credentials`, `on_frame`, `on_error`, MJPEG's `on_jpeg` and
+    `conversion_wanted`; V4L2's `device` too, unused
     here) so it can swap in via `mock.patch` wherever `_build_source_
     adapter` builds one, for a test whose claim is about `RosRuntime`'s own
     bookkeeping, not a real adapter's connect behaviour. Built to remove
@@ -5394,7 +5395,10 @@ class _InertCameraAdapter:
     which reproduced 5 isolated failures in 150 runs before this
     existed)."""
 
-    def __init__(self, *, url=None, device=None, credentials=None, on_frame=None, on_error=None):
+    def __init__(
+        self, *, url=None, device=None, credentials=None, on_frame=None, on_error=None,
+        on_jpeg=None, conversion_wanted=None,
+    ):
         pass
 
     def start(self) -> None:
