@@ -1668,7 +1668,7 @@
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 7680,
-                "description": "The width the bridge scales frames to before sending, in pixels — what the bridge produces, not what the sensor captures; a snapshot can arrive narrower, since the bridge reduces both dimensions together to fit its JPEG byte ceiling. It stands in the configuration and never in a viewer's request, so no client can make the robot encode a larger frame than the developer allowed. A passthrough camera is the exception for live video: the bridge does not scale what it does not encode, so `width` and `height` must equal the stream's own size.",
+                "description": "The width the bridge scales frames to before sending, in pixels — what the bridge produces, not what the sensor captures; a snapshot can arrive narrower, since the bridge reduces both dimensions together to fit its JPEG byte ceiling. It stands in the configuration and never in a viewer's request, so no client can make the robot encode a larger frame than the developer allowed. A passthrough camera is the exception for live video: the bridge does not scale what it does not encode, so `width` and `height` must equal the stream's own size. With any `live.encoder` but `software` the width must be even: the bridge then sends H.264, which takes no odd size, and a document with an odd one is refused.",
                 "examples": [
                   1280
                 ]
@@ -1677,7 +1677,7 @@
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 4320,
-                "description": "The height the bridge scales every frame to, in pixels; with `width` it is the size the live stream carries. A snapshot can arrive **smaller** than this — its JPEG has a byte ceiling, and the bridge gives up quality first and then resolution to fit, reporting the size it actually encoded. The live video of a passthrough camera is not scaled: `height` and `width` must equal the stream's own size.",
+                "description": "The height the bridge scales every frame to, in pixels; with `width` it is the size the live stream carries. A snapshot can arrive **smaller** than this — its JPEG has a byte ceiling, and the bridge gives up quality first and then resolution to fit, reporting the size it actually encoded. The live video of a passthrough camera is not scaled: `height` and `width` must equal the stream's own size. With any `live.encoder` but `software` the height must be even: the bridge then sends H.264, which takes no odd size, and a document with an odd one is refused.",
                 "examples": [
                   720
                 ]
@@ -2086,12 +2086,12 @@
               "maximum": 1350
             },
             "encoder": {
-              "description": "What encodes live video on the robot. `software` is the bridge's own encoder on the CPU. Every other value sends H.264 from a hardware encoder, reached through GStreamer, which the robot has to have installed. An encoder that does not start, or stops delivering, is replaced by software H.264 for the rest of that session, with one warning in the bridge's log; one that did not start is not tried again until this setting changes or the bridge restarts. The fallback catches an encoder that fails, not one that draws a wrong picture, so look at the stream once after choosing one. The hardware encoders are written from the documentation of their GStreamer elements and tested through a software stand-in; the reference page of this section says which have been proven on hardware. It is one setting for the robot, not one per camera: the chip is part of the computer. It does not apply to a camera whose source already delivers H.264 and is passed through: that video is forwarded, not encoded. Overrides the bridge's ROS parameter `live.encoder`; without either, the bridge uses `software`. A change holds from the next live start; a running stream keeps its encoder.",
+              "description": "What encodes live video on the robot. `software` is the bridge's own encoder on the CPU. Every other value sends H.264 from a hardware encoder, reached through GStreamer, which the robot has to have installed. H.264 takes no odd size, so with any value but `software` every camera's `width` and `height` must be even, passthrough cameras included, and a document with an odd one is refused. An encoder that does not start, or stops delivering, is replaced by software H.264 for the rest of that session, with one warning in the bridge's log; one that did not start is not tried again until this setting changes or the bridge restarts. The fallback catches an encoder that fails, not one that draws a wrong picture, so look at the stream once after choosing one. The hardware encoders are written from the documentation of their GStreamer elements and tested through a software stand-in; the reference page of this section says which have been proven on hardware. It is one setting for the robot, not one per camera: the chip is part of the computer. It does not apply to a camera whose source already delivers H.264 and is passed through: that video is forwarded, not encoded. Overrides the bridge's ROS parameter `live.encoder`; without either, the bridge uses `software`. A change holds from the next live start; a running stream keeps its encoder.",
               "enumDescriptions": [
                 "The bridge encodes on the CPU: VP8 or H.264, whichever the media server picks, as every robot did before the setting existed.",
                 "Tries `nvenc`, then `vaapi`, then `v4l2`, and uses the first that starts. With none of them, software H.264.",
                 "NVIDIA. On a Jetson the board's encoder (`nvv4l2h264enc`); a Jetson Orin Nano has none and ends on software. On a desktop card `nvh264enc`.",
-                "Intel and AMD graphics through VA-API: `vah264enc` where the installed GStreamer has it, else `vaapih264enc`.",
+                "Intel and AMD graphics through VA-API: `vah264enc`, then `vah264lpenc`, then `vaapih264enc`, the first that starts. `vah264lpenc` is the low-power encoder, the only one some Intel chips encode H.264 with.",
                 "A V4L2 encoder (`v4l2h264enc`), as on a Raspberry Pi 4. A Raspberry Pi 5 has no hardware encoder and ends on software."
               ],
               "type": "string",
