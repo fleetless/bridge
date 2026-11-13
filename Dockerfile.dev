@@ -67,3 +67,20 @@ RUN apt-get update \
     && rosdep update \
     && rosdep install --from-paths /tmp/fleetless_bridge --ignore-src -y \
     && rm -rf /var/lib/apt/lists/*
+
+# GStreamer, for the tests of the hardware encoder and for nothing a robot
+# needs. The bridge imports `gi` only when `live.encoder` is not `software`,
+# and without these packages it falls back to software encoding and says so;
+# that is why package.xml and debian/control do not name them, and why they
+# are installed here by hand and not through rosdep. The suite has to run the
+# real pipeline: `appsrc`, `appsink` and `videoconvert` (plugins-base, with
+# the GstApp and GstVideo typelibs), `h264parse` (plugins-bad), and `x264enc`
+# (plugins-ugly) as the software stand-in for an encoder chip this image does
+# not have.
+#
+# A layer of its own, so that a change here does not repeat the layer above.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+        gstreamer1.0-plugins-base gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+    && rm -rf /var/lib/apt/lists/*
