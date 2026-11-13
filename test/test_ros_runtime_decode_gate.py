@@ -38,6 +38,7 @@ from test_ros_runtime import (
     _start_image_publisher,
     run,
 )
+from test_ros_runtime_snapshot_passthrough import _Counters, _deliver_part, _jpeg, _mjpeg_cfg, _with_stream
 
 
 def _counting_to_bgr(monkeypatch, *, delay: float = 0.0):
@@ -742,3 +743,42 @@ def test_the_first_frame_after_a_resume_is_the_held_message_not_the_one_from_bef
     after_resume = run(body, live_publisher_factory=_publisher_factory_with_a_pulling_sender(pulled, signals))
     # BGR (10, 20, 30) and (40, 50, 60), as RGB.
     assert after_resume == [[30, 20, 10], [60, 50, 40]]
+
+
+def test_a_paused_publisher_leaves_an_mjpeg_streams_parts_undecoded_and_a_resume_decodes_the_newest(monkeypatch):
+    """The MJPEG adapter asks `conversion_wanted` on its own reader thread,
+    once per part, and so reads the publisher's `paused` from a third thread.
+    While nobody is subscribed its parts are handed over as bytes and nothing
+    decodes them, there or on the executor; the resume decodes the newest
+    one, like a ROS camera's held message."""
+    tracks, signals = [], []
+    parts = [_jpeg(seed=seed) for seed in range(1, 4)]
+
+    async def body(rt, stream):
+        await rt.apply_cameras(by_slug([_mjpeg_cfg(fps=50)]))
+        entry = rt._cameras["front"]
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        signals[0].fire("on_quality_update", _quality(*_NOBODY))
+        counters = _Counters(monkeypatch)
+        for part in parts:
+            held = await _deliver_part(rt, stream, part)
+            await asyncio.sleep(0.03)  # more than a frame interval between two arrivals
+        while_paused = (dict(counters.calls), entry.latest.get(), len(tracks[0].pushed))
+
+        signals[0].fire("on_quality_update", _quality(*_SOMEBODY))
+        await _executor_caught_up(rt)
+        await _eventually(lambda: tracks[0].pushed)
+        after_resume = (dict(counters.calls), entry.latest.get(), len(tracks[0].pushed))
+        await rt.stop_live("front", request_id="req-2")
+        return held, while_paused, after_resume
+
+    held, while_paused, after_resume = _with_stream(
+        body, monkeypatch, live_publisher_factory=_publisher_factory_with_fake_peers(tracks, signals)
+    )
+    calls, latest, pushed = while_paused
+    assert sum(calls.values()) == 0  # three parts arrived, and nothing decoded one
+    assert latest is None and pushed == 0
+    calls, latest, pushed = after_resume
+    assert calls["to_bgr"] == 1  # the newest part, once, on the executor
+    assert latest.timestamp_ms == held.timestamp_ms
+    assert pushed == 1
