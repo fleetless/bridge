@@ -13,6 +13,7 @@ come out, after aiortc has packetized, depacketized and decoded them, are the
 pictures those units decode to. Bit for bit: nothing was encoded on the way.
 """
 import asyncio
+import concurrent.futures
 import logging
 import threading
 import time
@@ -613,6 +614,40 @@ def test_a_pause_and_a_resume_reach_the_stream():
     assert states.count(False) == 1
     # The sender stopped pulling and pulls again, as for any camera.
     assert replaced == [None, track]
+
+
+def test_a_resume_asks_the_camera_for_no_held_frame_and_waits_for_none():
+    """`LivePublisher` calls `on_resume` when a viewer comes back, and holds
+    the track until the conversion that hook started has landed. A
+    passthrough camera has nothing to convert. Handed the hook all the same,
+    its publisher never calls it, and the track goes back in the same
+    moment -- also when the conversion it would have waited for never
+    lands."""
+    asked = []
+
+    def on_resume():
+        asked.append(True)
+        return concurrent.futures.Future()  # never done
+
+    async def scenario():
+        stream = _StreamSpy()
+        publisher, connection, signal, events = _passthrough_publisher(stream, on_resume=on_resume)
+        await publisher.start("wss://media.example", "room-1", "tok-1")
+        track = connection.added_tracks[0]
+        off = {"trackSid": "TR_camera", "subscribedQualities": [{"quality": "HIGH"}]}
+        on = {"trackSid": "TR_camera", "subscribedQualities": [{"quality": "HIGH", "enabled": True}]}
+        signal.fire("on_quality_update", off)
+        signal.fire("on_quality_update", on)
+        # Read before anything is awaited: a resume that waited would not
+        # have handed the track back yet.
+        replaced = list(connection.sender.replaced)
+        await publisher.stop()
+        return stream.calls, replaced, track
+
+    calls, replaced, track = asyncio.run(scenario())
+    assert asked == []
+    assert replaced == [None, track]
+    assert [call[1] for call in calls if isinstance(call, tuple)][-1] is False
 
 
 def test_stopping_the_publisher_releases_the_stream():

@@ -885,6 +885,11 @@ def test_a_passthrough_camera_hands_its_stream_to_the_publisher(units):
     video, front = _FakeLivePublisher.instances
     assert video.passthrough is stream
     assert front.passthrough is None
+    # A picture camera's publisher is told how to have the held message
+    # converted when a viewer comes back. A passthrough camera holds none,
+    # and its publisher is handed no such hook to wait for.
+    assert callable(front.on_resume)
+    assert video.on_resume is None
     # What the track declares to the media server is still the configured
     # bitrate; the configured size is the stream's own.
     assert (video.width, video.height, video.bitrate_kbps) == (WIDTH, HEIGHT, 500)
@@ -967,6 +972,9 @@ def test_start_live_starts_the_real_passthrough_publisher_through_the_default_fa
     # the picture camera's none of ours: aiortc builds its own there.
     assert isinstance(installed[0], live_passthrough.PassthroughEncoder)
     assert installed[1] is None
+    # Only the picture camera's publisher asks its camera for the held
+    # message at a resume.
+    assert video._on_resume is None and callable(front._on_resume)
 
 
 @pytest.mark.parametrize("handed", ["none", "an encoder"])
