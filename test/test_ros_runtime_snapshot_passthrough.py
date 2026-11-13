@@ -560,6 +560,41 @@ def test_a_live_start_converts_the_newest_part_and_decoding_follows_the_stream(m
     assert after_stop["imdecode"] == 2
 
 
+def test_a_part_the_adapter_decodes_for_live_is_not_decoded_again_for_a_snapshot(monkeypatch):
+    """A stream faster than the camera's `fps`: the adapter decodes every
+    part for the live stream and the rate limit drops most of the frames.
+    Those parts must not also be held for the lazy path, or a due snapshot
+    that cannot be passed through decodes the newest of them a second time,
+    on the executor thread, only to have the rate limit drop it again."""
+    parts = [_jpeg(32, 24, seed=seed) for seed in range(1, 4)]
+
+    async def body(rt, stream):
+        await rt.apply_cameras(by_slug([_mjpeg_cfg(fps=2, snapshot_interval_seconds=1)]))
+        await rt.start_live("front", "ws://livekit.invalid", "room", "token", "req-1")
+        counters = _Counters(monkeypatch)
+        for part in parts:
+            await _deliver_part(rt, stream, part)
+        wait_until(lambda: counters.calls["imdecode"] == 3)
+        wait_until(lambda: rt._cameras["front"].latest.get() is not None)
+        held_for_the_lazy_path = rt._cameras["front"].raw.take()
+        before = dict(counters.calls)
+        wire = await _pull_snapshot(rt)
+        return before, held_for_the_lazy_path, wire, dict(counters.calls)
+
+    before, held, wire, after = _with_stream(
+        body, monkeypatch, live_publisher_factory=_fake_live_factory()
+    )
+    # Three parts, three decodes, all on the adapter's thread; nothing held.
+    assert before["imdecode"] == 3 and before["to_bgr"] == 0
+    assert held is None
+    # The snapshot is of another size, so it is encoded from the frame live
+    # already has, and nothing is decoded for it.
+    header, _ = _split_snapshot_frame(wire)
+    assert (header["width"], header["height"]) == (WIDTH, HEIGHT)
+    assert after["imdecode"] == 3 and after["to_bgr"] == 0
+    assert after["encode_snapshot_jpeg"] == 1
+
+
 # --- a camera that is never converted is still a camera that works ----------------
 
 
@@ -631,3 +666,62 @@ def test_the_restatement_is_dated_to_the_newer_of_the_two_frames(monkeypatch):
     states, converted, held = _with_publisher(body)
     assert converted is not None and held.timestamp_ms > converted.timestamp_ms
     assert [s.observed_at_ms for s in states] == [held.timestamp_ms]
+
+
+
+def test_a_live_start_is_not_refused_for_a_passed_through_camera_whose_stream_dropped(monkeypatch):
+    """`start_live` answers a camera that has never delivered a frame with
+    its source error and opens nothing. "Never delivered" is not "has no
+    converted frame": a matching MJPEG camera nobody watched has none, every
+    snapshot having been passed through. When its stream drops and somebody
+    goes live while the adapter reconnects, the camera gets its publisher,
+    and the part it holds is the first picture."""
+    part = _jpeg()
+
+    async def body(rt, stream):
+        from test_ros_runtime import _drain_camera_states
+
+        await rt.apply_cameras(by_slug([_mjpeg_cfg()]))
+        await _deliver_part(rt, stream, part)
+        await _pull_snapshot(rt)
+        entry = rt._cameras["front"]
+        assert entry.latest.get() is None  # passed through: nothing was converted
+        # The stream ends; the adapter reports it and goes into its backoff.
+        await rt._submit_async(lambda: rt._on_source_error(
+            "front", entry, "source_unreachable", "could not reach the camera"
+        ))
+        await _drain_camera_states(rt)
+        await rt.start_live("front", "ws://livekit.invalid", "room", "token", "req-1")
+        states = await _drain_camera_states(rt)
+        wait_until(lambda: entry.latest.get() is not None)
+        return "front" in rt._live_publishers, states, entry.latest.get().bgr.shape
+
+    live, states, first_picture = _with_stream(
+        body, monkeypatch, live_publisher_factory=_fake_live_factory()
+    )
+    assert live
+    assert [(s.publishing, s.error, s.cause) for s in states] == [(True, None, "command")]
+    assert first_picture == (HEIGHT, WIDTH, 3)
+
+
+def test_a_camera_that_never_delivered_a_frame_is_still_answered_with_its_source_error(monkeypatch):
+    """The control: nothing converted and nothing encoded is a camera that
+    never delivered, and a join attempt hears why."""
+
+    async def body(rt, stream):
+        from test_ros_runtime import _drain_camera_states
+
+        await rt.apply_cameras(by_slug([_mjpeg_cfg()]))
+        entry = rt._cameras["front"]
+        await rt._submit_async(lambda: rt._on_source_error(
+            "front", entry, "source_unreachable", "could not reach the camera"
+        ))
+        await _drain_camera_states(rt)
+        await rt.start_live("front", "ws://livekit.invalid", "room", "token", "req-1")
+        return "front" in rt._live_publishers, await _drain_camera_states(rt)
+
+    live, states = _with_stream(body, monkeypatch, live_publisher_factory=_fake_live_factory())
+    assert not live
+    assert [(s.publishing, s.error, s.cause) for s in states] == [
+        (False, ("source_unreachable", "could not reach the camera"), "command")
+    ]

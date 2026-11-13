@@ -2028,12 +2028,14 @@ class _JpegRecorder(_Recorder):
     def __init__(self):
         super().__init__()
         self.jpegs = []
+        self.decoded_by_the_adapter = []
         self.jpeg_threads = set()
         self.frame_threads = set()
 
-    def on_jpeg(self, data, timestamp_ms):
+    def on_jpeg(self, data, timestamp_ms, decoded_by_the_adapter):
         with self._lock:
             self.jpegs.append((data, timestamp_ms))
+            self.decoded_by_the_adapter.append(decoded_by_the_adapter)
             self.jpeg_threads.add(threading.get_ident())
 
     def on_frame(self, bgr, timestamp_ms):
@@ -2115,6 +2117,9 @@ def test_mjpeg_adapter_hands_over_every_part_as_bytes_with_its_capture_time():
     assert stamps == sorted(stamps) and before_ms <= stamps[0] <= int(time.time() * 1000)
     # A part and the frame decoded from it carry the same capture time.
     assert [timestamp_ms for _, timestamp_ms in rec.frames] == stamps
+    # Nobody said a frame is not wanted, so each part is decoded here, and
+    # each hand-over says so.
+    assert rec.decoded_by_the_adapter == [True, True, True]
 
 
 def test_mjpeg_adapter_decodes_nothing_while_no_converted_frame_is_wanted(monkeypatch):
@@ -2139,6 +2144,7 @@ def test_mjpeg_adapter_decodes_nothing_while_no_converted_frame_is_wanted(monkey
         adapter.stop()
     # Four frames are known to have arrived, and none was decoded for it.
     assert [data for data, _ in rec.jpegs] == parts
+    assert rec.decoded_by_the_adapter == [False, False, False, False]
     assert decodes == []
     assert rec.frames == [] and errors_while_running == []
 
@@ -2173,6 +2179,9 @@ def test_mjpeg_adapter_decodes_on_its_own_thread_once_a_frame_is_wanted(monkeypa
         adapter.stop()
     assert len(decodes) == 1 and len(rec.frames) == 1
     assert rec.frames[0][1] == rec.jpegs[1][1]
+    # What is handed over with each part is what was then done with it: the
+    # receiver holds a part for a later decode only when this is false.
+    assert rec.decoded_by_the_adapter == [False, True, False]
     # Decoded where the stream is read, not on whoever asked.
     assert set(decodes) == rec.jpeg_threads == rec.frame_threads
     assert threading.get_ident() not in rec.jpeg_threads
@@ -2215,7 +2224,7 @@ def test_a_failing_on_jpeg_does_not_end_the_stream(capfd):
     response = _FedMjpegResponse()
     rec = _JpegRecorder()
 
-    def failing(data, timestamp_ms):
+    def failing(data, timestamp_ms, decoded_by_the_adapter):
         raise RuntimeError("http://user:campass@192.0.2.1/video")
 
     adapter = MjpegSourceAdapter(
