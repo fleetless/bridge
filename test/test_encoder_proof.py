@@ -97,7 +97,7 @@ def test_a_backend_whose_hardware_is_missing_is_exit_2_and_says_what_is_missing(
 def test_auto_goes_through_every_chain_in_the_bridge_s_order():
     code, said = _run("--backend", "auto")
     assert code == 2
-    names = ["nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/vaapi", "v4l2"]
+    names = ["nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/va-lp", "vaapi/vaapi", "v4l2"]
     positions = [said.index("chain {}:".format(name)) for name in names]
     assert positions == sorted(positions)
 
