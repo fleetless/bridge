@@ -973,7 +973,7 @@ class HardwareH264Encoder(H264Encoder):
             # aiortc builds a new codec for one. The old one gets its time
             # to let go of the device before the new one opens it.
             self._pipeline = None
-            self._shut_down(pipeline).wait(STOP_TIMEOUT_S)
+            self._stopped(pipeline)
             pipeline = None
         if pipeline is None:
             data = self._probe(frame)
@@ -1122,9 +1122,11 @@ class HardwareH264Encoder(H264Encoder):
             raise outcome["error"]
         return outcome["pipeline"]
 
-    def _shut_down(self, pipeline: Pipeline) -> threading.Event:
-        """Close a pipeline in a thread of its own. Returns at once; the
-        event is set when the pipeline is closed.
+    def _shut_down(self, pipeline: Pipeline) -> Tuple[threading.Event, Callable[[], None]]:
+        """Close a pipeline in a thread of its own. Returns at once, with
+        `(closed, overdue)`: the event is set when the pipeline is closed,
+        and the function is for a caller that waited `STOP_TIMEOUT_S` for it
+        in vain (`_stopped`).
 
         Stopping a pipeline waits for its streaming thread, and that thread
         can be inside an encoder element that does not return. Whoever
@@ -1136,11 +1138,24 @@ class HardwareH264Encoder(H264Encoder):
         it is, in a daemon thread that holds the process up for nothing. Its
         chain is not built again in this process, also when it had passed
         its probe: every further start would leave another thread there.
-        That is said once, at WARNING. What goes wrong in a close that does
-        return is logged by type name and goes no further.
+        That is recorded and said once, at WARNING, by whoever's wait runs
+        out first: the watcher here, or a caller that waited itself and is
+        about to probe. What goes wrong in a close that does return is
+        logged by type name and goes no further.
         """
         closed = threading.Event()
+        once = threading.Lock()
         chain, memory, backend = pipeline.chain, self._memory, self._backend
+
+        def overdue() -> None:
+            if not once.acquire(blocking=False):
+                return
+            memory.did_not_shut_down(chain, STOP_TIMEOUT_S)
+            log.warning(
+                "live.encoder=%s: %s. A thread of its pipeline is left behind, and the "
+                "chain is not built again until live.encoder changes or the bridge restarts.",
+                backend, did_not_shut_down(chain, STOP_TIMEOUT_S),
+            )
 
         def close() -> None:
             try:
@@ -1152,17 +1167,27 @@ class HardwareH264Encoder(H264Encoder):
 
         def watch() -> None:
             threading.Thread(target=close, name="live-pipeline-stop", daemon=True).start()
-            if closed.wait(STOP_TIMEOUT_S):
-                return
-            memory.did_not_shut_down(chain, STOP_TIMEOUT_S)
-            log.warning(
-                "live.encoder=%s: %s. A thread of its pipeline is left behind, and the "
-                "chain is not built again until live.encoder changes or the bridge restarts.",
-                backend, did_not_shut_down(chain, STOP_TIMEOUT_S),
-            )
+            if not closed.wait(STOP_TIMEOUT_S):
+                overdue()
 
         threading.Thread(target=watch, name="live-pipeline-watch", daemon=True).start()
-        return closed
+        return closed, overdue
+
+    def _stopped(self, pipeline: Pipeline) -> bool:
+        """Shut a pipeline down and wait `STOP_TIMEOUT_S` for it: whether it
+        stopped.
+
+        One that did not is recorded here, by the side that waited, and not
+        left to the watcher in `_shut_down`. The watcher waits the same time
+        and starts a moment later, so whoever goes on to probe after this
+        would read the memory before the watcher had written it, and build
+        the chain again. Whichever of the two is first records it and logs
+        the one WARNING; the other finds it done."""
+        closed, overdue = self._shut_down(pipeline)
+        if closed.wait(STOP_TIMEOUT_S):
+            return True
+        overdue()
+        return False
 
     def close(self) -> None:
         """Release the pipeline and the codec. Called once by the publisher,
@@ -1175,7 +1200,7 @@ class HardwareH264Encoder(H264Encoder):
             pipeline, self._pipeline = self._pipeline, None
             self.codec = None
         if pipeline is not None:
-            self._shut_down(pipeline).wait(STOP_TIMEOUT_S)
+            self._stopped(pipeline)
 
 
 def build_encoder(setting: str, *, fps: int) -> Optional[HardwareH264Encoder]:
