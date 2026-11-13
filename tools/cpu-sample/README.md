@@ -19,6 +19,13 @@ contains the text and refuses when there are none or several. `--interval`
 prints the share of each stretch on the way (30 seconds by default), so a
 window that was not steady shows as one.
 
+A bridge started by `ros2 launch` is two processes whose command lines both
+name the package: the launcher and the node. `--match` then refuses and lists
+them with their pids; take the node's with `--pid`.
+
+`--log` reads a file. For a bridge that logs to the journal, write one for
+the length of the window first: `journalctl -u <unit> -f > bridge.log`.
+
 ## The comparison it is for
 
 Two scenarios, five minutes each, with the bridge and its cameras running for
