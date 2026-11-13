@@ -524,11 +524,13 @@ def test_a_held_message_with_no_arrival_time_counts_as_arriving_when_it_is_conve
 
 # --- a paused publisher needs no frames (fleetless/fleetless#1118) ----------
 #
-# The cloud now keeps a robot in its room for 30 s after the last viewer, so
-# "a publisher exists and nobody is subscribed" is no longer a moment between
-# two commands: it is half a minute, after every viewing. The publisher has
-# always paused its encoder and its feed for it. The camera source had not:
-# it converted every message for as long as a publisher existed.
+# "A publisher exists and nobody is subscribed" happens between a
+# `camera_start` and the first viewer, and while a viewer's client has
+# unsubscribed. The cloud can also keep a robot in its room after the last
+# viewer (off unless configured), and then it is up to half a minute after
+# every viewing. The publisher has always paused its encoder and its feed for
+# it. The camera source had not: it converted every message for as long as a
+# publisher existed.
 
 _NOBODY = (False, False, False)
 _SOMEBODY = (False, False, True)
