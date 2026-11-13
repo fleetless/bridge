@@ -68,7 +68,15 @@ QUEUE_MAX_BYTES = 32 * 1024 * 1024
 UNIT_BYTES_PER_PIXEL = 3
 UNIT_MAX_BYTES_FLOOR = 4 * 1024 * 1024
 
-#: How much of an access unit over that bound is still looked at: enough for
+#: The most NAL units one access unit may hold: one per macroblock of the
+#: configured size -- a slice holds at least one macroblock, so no picture
+#: has more slices than that -- and this many more for what travels beside
+#: the slices: a delimiter, parameter sets, SEI, filler. The byte bound
+#: alone lets through megabytes of five-byte units, and every NAL unit is a
+#: step in Python here and an RTP packet at the sender.
+UNIT_NALS_BESIDE_SLICES = 32
+
+#: How much of an access unit over one of those bounds is still looked at: enough for
 #: an access unit delimiter and a parameter set of the largest size in front
 #: of the SPS, and the SPS itself.
 OVERSIZED_HEAD_BYTES = 3 * h264.PARAMETER_SET_MAX_BYTES
@@ -131,8 +139,10 @@ class PassthroughStream:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._configured = (width, height)
-        #: The largest access unit this camera's size allows, in bytes.
+        #: The largest access unit this camera's size allows, in bytes and
+        #: in NAL units.
         self.max_unit_bytes = _max_unit_bytes(width, height)
+        self.max_unit_nals = _max_unit_nals(width, height)
         self._slug = slug
         self._clock = clock
         self._lock = threading.Lock()
@@ -175,7 +185,7 @@ class PassthroughStream:
         RTSP carries them in the session description. Raises
         `PassthroughRefused` if the size they declare is not the configured
         one, and `h264.H264ParseError` if they do not parse."""
-        info = h264.inspect_access_unit(data)
+        info = h264.inspect_access_unit(data, self.max_unit_nals)
         sps = h264.parse_sps(info.sps) if info.sps is not None else None
         pps_ids = [h264.pps_id(nal) for nal in info.pps]
         with self._lock:
@@ -214,9 +224,17 @@ class PassthroughStream:
                 leading_sps=_leading_sps(data),
             )
         try:
-            info = h264.inspect_access_unit(data)
+            info = h264.inspect_access_unit(data, self.max_unit_nals)
             sps = h264.parse_sps(info.sps) if info.sps is not None else None
             pps_ids = [h264.pps_id(nal) for nal in info.pps]
+        except h264.TooManyNalUnits as exc:
+            # The same, for a unit of more pieces than a picture of this
+            # camera's size can have: dropped where the count ran out, and
+            # read no further than its head.
+            return self._push_unparseable(
+                "{}; this camera's size allows that many".format(exc),
+                leading_sps=_leading_sps(data),
+            )
         except h264.H264ParseError as exc:
             return self._push_unparseable(str(exc))
 
@@ -308,6 +326,7 @@ class PassthroughStream:
         with self._lock:
             self._configured = (width, height)
             self.max_unit_bytes = _max_unit_bytes(width, height)
+            self.max_unit_nals = _max_unit_nals(width, height)
             self._refusal = None
             self._refused_until = 0.0
             self._started = False
@@ -542,6 +561,11 @@ class PassthroughStream:
 
 def _max_unit_bytes(width: int, height: int) -> int:
     return max(UNIT_MAX_BYTES_FLOOR, UNIT_BYTES_PER_PIXEL * width * height)
+
+
+def _max_unit_nals(width: int, height: int) -> int:
+    macroblocks = -(-width // 16) * -(-height // 16)
+    return macroblocks + UNIT_NALS_BESIDE_SLICES
 
 
 def _leading_sps(data: bytes) -> Optional[Tuple[bytes, h264.Sps]]:

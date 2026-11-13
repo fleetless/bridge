@@ -5,6 +5,8 @@ so every number asserted below is one an encoder produced, not one typed in.
 
 No rclpy, no aiortc: `h264.py` imports neither.
 """
+import time
+
 import pytest
 
 import h264_streams as streams
@@ -66,6 +68,35 @@ def test_splitting_reproduces_what_an_encoder_wrote():
 def test_bytes_that_are_not_annex_b_raise(data):
     with pytest.raises(h264.H264ParseError):
         h264.split_nal_units(data)
+
+
+def test_the_splitter_stops_at_the_number_of_units_it_is_allowed():
+    """A count taken after splitting would have split everything first. The
+    limit is checked at each start code, so what lies behind it is never
+    walked: megabytes of five-byte units cost as much as the first few."""
+    nal = b"\x41\xc0"  # the smallest slice there is
+    assert len(h264.split_nal_units(b"\x00\x00\x01" + nal, max_units=1)) == 1
+    assert len(h264.split_nal_units((b"\x00\x00\x01" + nal) * 40, max_units=40)) == 40
+    with pytest.raises(h264.TooManyNalUnits) as too_many:
+        h264.split_nal_units((b"\x00\x00\x01" + nal) * 41, max_units=40)
+    assert "40" in str(too_many.value)
+    assert isinstance(too_many.value, h264.H264ParseError)
+
+    megabytes = (b"\x00\x00\x01" + nal) * 800_000
+    started = time.perf_counter()
+    with pytest.raises(h264.TooManyNalUnits):
+        h264.split_nal_units(megabytes, max_units=8192)
+    with pytest.raises(h264.TooManyNalUnits):
+        h264.inspect_access_unit(megabytes, max_nal_units=8192)
+    # Whole, the split alone takes a second or two.
+    assert time.perf_counter() - started < 0.5
+
+
+def test_start_codes_with_nothing_between_them_count_as_well():
+    """Otherwise a megabyte of bare start codes is a third of a million
+    steps that add no unit and trip no limit."""
+    with pytest.raises(h264.TooManyNalUnits):
+        h264.split_nal_units(b"\x00\x00\x01" * 1000 + b"\x41\xc0", max_units=8)
 
 
 def test_a_unit_with_the_forbidden_bit_set_is_not_h264():

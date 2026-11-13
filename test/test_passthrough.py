@@ -16,12 +16,13 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 
 import numpy as np
 import pytest
 
 import h264_streams as streams
-from fleetless_bridge import passthrough
+from fleetless_bridge import h264, passthrough
 from fleetless_bridge.passthrough import PassthroughRefused, PassthroughStream
 
 WIDTH, HEIGHT = 64, 48
@@ -450,13 +451,74 @@ def test_an_access_unit_larger_than_the_cameras_size_allows_is_dropped():
     assert "bytes" in lines[0]
 
 
+def test_an_access_unit_of_more_pieces_than_the_picture_has_macroblocks_is_dropped():
+    """The byte bound alone lets through four megabytes of five-byte NAL
+    units: each one parses, each is a step in Python and a packet at the
+    sender, and together they held the thread for seconds. A slice holds at
+    least one macroblock, so a picture has no more slices than macroblocks;
+    a unit of more NAL units than that, and a few dozen beside, is dropped
+    like one over the byte bound."""
+    units = streams.encode_stream(frames=8, gop=4)
+    piece = b"\x00\x00\x01\x41\xc0"  # a P-slice of two bytes
+
+    async def scenario():
+        stream = _stream()
+        limit = stream.max_unit_nals
+        stream.attach(asyncio.get_running_loop())
+        with _logged() as lines:
+            stream.push(units[0], 10_000)
+            at_the_limit = stream.push(piece * limit, 10_033)
+            over = stream.push(piece * (limit + 1), 10_066)
+            stream.push(units[3], 10_100)  # behind the hole
+            _push_all(stream, units[4:], start_ms=10_133)
+            started = time.perf_counter()
+            hostile = stream.push(piece * (stream.max_unit_bytes // len(piece)), 10_300)
+            elapsed = time.perf_counter() - started
+        return limit, at_the_limit, over, hostile, elapsed, await _drain(stream), lines
+
+    limit, at_the_limit, over, hostile, elapsed, out, lines = asyncio.run(scenario())
+    assert limit == 4 * 3 + passthrough.UNIT_NALS_BESIDE_SLICES  # 64x48 is twelve macroblocks
+    assert at_the_limit is True and over is False and hostile is False
+    assert elapsed < 0.5  # read whole, that one unit took one to three seconds
+    # The keyframe and the unit at the limit went out; the one over it was
+    # dropped, and what followed it waited for the next keyframe.
+    assert [unit.timestamp_ms for unit in out] == [10_000, 10_033] + [10_133 + i * 33 for i in range(4)]
+    assert len(out[1].nals) == limit
+    assert len([line for line in lines if "NAL units" in line]) == 1
+
+
+def test_a_stream_of_many_slices_on_a_camera_configured_far_smaller_is_refused_for_its_size():
+    """The count bound follows the configured size, like the byte bound, and
+    like it must not hide what is actually wrong: 1920x1080 in some eighty slices
+    on a camera configured as 64x48 is the wrong size, not an unreadable
+    stream."""
+    big = streams.encode_stream(width=1920, height=1080, frames=1, x264_params="slice-max-mbs=100")[0]
+    stream = _stream()
+    assert len(streams.split(big)) > stream.max_unit_nals
+    with pytest.raises(PassthroughRefused) as refused:
+        stream.push(big, 10_000)
+    assert "1920x1080" in str(refused.value) and "64x48" in str(refused.value)
+
+
+def test_parameter_sets_from_outside_the_stream_are_counted_too():
+    stream = _stream()
+    with pytest.raises(h264.H264ParseError):
+        stream.set_parameter_sets(b"\x00\x00\x01\x41\xc0" * (stream.max_unit_nals + 1))
+
+
 def test_the_unit_bound_follows_the_configured_size():
     small, full_hd, uhd = _stream(), _stream(width=1920, height=1080), _stream(width=3840, height=2160)
     assert small.max_unit_bytes == passthrough.UNIT_MAX_BYTES_FLOOR
     assert full_hd.max_unit_bytes == 3 * 1920 * 1080
     assert uhd.max_unit_bytes == 3 * 3840 * 2160
+    # One slice per macroblock, the last row and column rounded up, and
+    # thirty-two NAL units beside them.
+    assert small.max_unit_nals == 12 + 32
+    assert full_hd.max_unit_nals == 120 * 68 + 32
+    assert uhd.max_unit_nals == 240 * 135 + 32
     small.set_size(3840, 2160)
     assert small.max_unit_bytes == uhd.max_unit_bytes
+    assert small.max_unit_nals == uhd.max_unit_nals
 
 
 def test_a_keyframe_over_the_bound_never_becomes_the_snapshots_keyframe():
