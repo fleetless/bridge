@@ -234,6 +234,26 @@ class PassthroughEncoder(H264Encoder):
                 log.error("Error after a unit that was not forwarded: %s", type(failure).__name__)
 
 
+def _close_unused(encoder: Optional[object]) -> None:
+    """Closes an encoder a passthrough publisher was handed and has no use
+    for. Off the calling thread, logged by type name if it fails, and never
+    raised: a start must not fail over an object it does not use."""
+    close = getattr(encoder, "close", None)
+    if not callable(close):
+        return
+
+    def run() -> None:
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001 - the type, never the text: see PassthroughEncoder
+            log.error(
+                "Error closing an encoder a passthrough camera has no use for: %s",
+                type(exc).__name__,
+            )
+
+    threading.Thread(target=run, name="passthrough-unused-encoder-close", daemon=True).start()
+
+
 class PassthroughPublisher(live.LivePublisher):
     """One passthrough camera's live session.
 
@@ -254,9 +274,19 @@ class PassthroughPublisher(live.LivePublisher):
     the budget loop still writes it onto the encoder, where it changes
     nothing. `width`, `height` and `fps` are declared as configured; the
     stream was checked against the first two before it got here.
+
+    **`encoder` is taken and not used.** Whoever starts publishers may hand
+    every one of them the encoder the robot's `live.encoder` names. That
+    setting does not apply to a passthrough camera: nothing is encoded. An
+    encoder handed over here is therefore never installed, and is closed at
+    once, in a thread of its own -- the publisher is the only one left who
+    could close it, and closing a hardware pipeline may take a moment.
     """
 
-    def __init__(self, *, passthrough: PassthroughStream, **kwargs) -> None:
+    def __init__(
+        self, *, passthrough: PassthroughStream, encoder: Optional[object] = None, **kwargs
+    ) -> None:
+        _close_unused(encoder)
         handoff = UnitHandoff()
 
         def track_factory(width: int, height: int, fps: int, bitrate_kbps: int) -> PassthroughTrack:
