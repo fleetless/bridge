@@ -1985,7 +1985,12 @@ class RosRuntime:
             self.jobs.start(job_id, slug, "action")
             self._job_goal_ids[job_id] = goal_id
             self._unreconciled_goals[job_id] = (slug, goal_id)
-        rclpy.init(args=[])
+        # No signal handlers of rclpy's own. Its handler shuts the context
+        # down on a SIGINT or a SIGTERM, and a start that is still creating
+        # its node then fails on the next line with "context is invalid", a
+        # stack trace where a stop was asked for. `main.py` hears both
+        # signals itself, from before this line on, and ends ROS in `stop()`.
+        rclpy.init(args=[], signal_handler_options=rclpy.signals.SignalHandlerOptions.NO)
         self._node = rclpy.create_node(self._node_name)
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
