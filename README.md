@@ -288,11 +288,19 @@ to 3000 kbps. A session that fell back from a hardware encoder is the
 exception: its software H.264 keeps the whole range.
 
 GStreamer is loaded with the first frame of the first hardware session after
-the bridge starts. It then scans its plugins once and keeps the result in
-`~/.cache/gstreamer-1.0`, which delays that one picture: by 0.2 s for the 250
-plugins of this repository's test image, by more where more are installed. A
-bridge whose user cannot write there scans at every start; `GST_REGISTRY`
-names another file.
+the bridge starts. When its plugin registry is missing or stale, it then runs
+its own plugin scanner, `gst-plugin-scanner`, as a child process and writes
+the registry to `~/.cache/gstreamer-1.0`. That delays that one picture: by
+0.2 s for the 250 plugins of this repository's test image, by more where more
+are installed. It happens again after an update of a GStreamer package, and
+at every start of a bridge whose user cannot write there; `GST_REGISTRY`
+names another file. [SECURITY.md](SECURITY.md) says what that child is and is
+not.
+
+A hardware encoder whose driver stops answering costs one late frame: the
+session goes on in software, and a pipeline that does not shut down within
+two seconds is left behind and its chain not built again until `live.encoder`
+changes or the bridge restarts.
 
 ## 📄 What the robot exposes
 
