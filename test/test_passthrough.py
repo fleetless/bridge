@@ -386,6 +386,128 @@ def test_the_queue_is_bounded_in_units_as_well_as_in_time():
     assert asyncio.run(scenario()) == 0
 
 
+# --- nothing grows without a bound -------------------------------------------
+
+
+def test_parameter_sets_are_kept_per_id_and_no_more_than_the_standard_has_ids():
+    """A source that sends an SPS under every id it can think of. The store
+    holds one per id, the standard has 32 of them, and the keyframe a new
+    viewer starts with carries those and not two thousand."""
+    units = streams.encode_stream(frames=4, gop=4)
+    sps, pps = streams.parameter_sets(units[0])
+    stream = _stream()
+    for sps_id in range(2000):
+        stream.push(streams.join([streams.with_sps_id(sps, sps_id)]), 10_000 + sps_id)
+    stream.push(streams.join([pps]), 20_000)
+    assert stream.push(streams.strip_nal_types(units[0], {7, 8}), 20_001) is True
+    keyframe = streams.split(stream.newest_keyframe().data)
+    stored = [nal for nal in keyframe if nal[0] & 0x1F == 7]
+    assert len(stored) == 32  # ids 0 to 31, one each; the other 1968 were never kept
+    assert len(stream.newest_keyframe().data) < 32 * 64 + 4096
+    # And the keyframe still decodes: id 0, the one its PPS refers to, is among them.
+    assert passthrough.decode_keyframe(stream.newest_keyframe().data).shape == (HEIGHT, WIDTH, 3)
+
+
+def test_an_oversized_parameter_set_is_dropped_and_nothing_of_it_is_kept():
+    units = streams.encode_stream(frames=4, gop=4)
+    sps, pps = streams.parameter_sets(units[0])
+    huge = sps + b"\xff" * (passthrough.h264.PARAMETER_SET_MAX_BYTES + 1)
+    stream = _stream()
+    assert stream.push(streams.join([huge, pps]), 10_000) is False
+    # It was not stored: a keyframe without sets of its own still cannot start.
+    assert stream.push(streams.strip_nal_types(units[0], {7, 8}), 10_001) is False
+    assert stream.newest_keyframe() is None
+
+
+def test_an_access_unit_larger_than_the_cameras_size_allows_is_dropped():
+    """No honest keyframe of a 64x48 camera is four megabytes. A unit over
+    the bound is dropped like one that does not parse: one line, and
+    forwarding waits for the next keyframe. The bound is what keeps the
+    queue, the newest keyframe and the snapshot's decode small."""
+    units = streams.encode_stream(frames=8, gop=4)
+
+    async def scenario():
+        stream = _stream()
+        limit = stream.max_unit_bytes
+        stream.attach(asyncio.get_running_loop())
+        with _logged() as lines:
+            at_the_limit = stream.push(streams.padded(units[0], limit), 10_000)
+            kept = stream.newest_keyframe()
+            stream.push(units[1], 10_033)
+            over = stream.push(streams.padded(units[2], limit + 1), 10_066)
+            stream.push(units[3], 10_100)  # depends on the one that was dropped
+            _push_all(stream, units[4:], start_ms=10_133)
+        return limit, at_the_limit, kept, over, await _drain(stream), lines
+
+    limit, at_the_limit, kept, over, out, lines = asyncio.run(scenario())
+    assert limit == passthrough.UNIT_MAX_BYTES_FLOOR  # 64x48: the floor decides
+    assert at_the_limit is True and kept.timestamp_ms == 10_000
+    assert over is False
+    # Units 0 and 1 went out; 2 was dropped, 3 with it; 4 is the next keyframe.
+    assert [unit.timestamp_ms for unit in out] == [10_000, 10_033] + [10_133 + i * 33 for i in range(4)]
+    assert out[2].keyframe
+    assert len([line for line in lines if "not parseable" in line]) == 1
+    assert "bytes" in lines[0]
+
+
+def test_the_unit_bound_follows_the_configured_size():
+    small, full_hd, uhd = _stream(), _stream(width=1920, height=1080), _stream(width=3840, height=2160)
+    assert small.max_unit_bytes == passthrough.UNIT_MAX_BYTES_FLOOR
+    assert full_hd.max_unit_bytes == 3 * 1920 * 1080
+    assert uhd.max_unit_bytes == 3 * 3840 * 2160
+    small.set_size(3840, 2160)
+    assert small.max_unit_bytes == uhd.max_unit_bytes
+
+
+def test_a_keyframe_over_the_bound_never_becomes_the_snapshots_keyframe():
+    units = streams.encode_stream(frames=4, gop=1)
+    stream = _stream()
+    stream.push(units[0], 10_000)
+    stream.push(streams.padded(units[1], stream.max_unit_bytes + 1), 10_033)
+    assert stream.newest_keyframe().timestamp_ms == 10_000
+
+
+def test_the_queue_is_bounded_in_bytes_as_well():
+    """Five hundred units inside two seconds trip neither of the other two
+    bounds, and at half a megabyte each they are a quarter of a gigabyte."""
+    units = streams.encode_stream(frames=8, gop=4)
+    big = streams.padded(units[1], 1024 * 1024)
+
+    async def scenario():
+        stream = _stream()
+        stream.attach(asyncio.get_running_loop())
+        stream.push(units[0], 10_000)
+        with _logged() as lines:
+            peak = 0
+            for index in range(60):
+                stream.push(big, 10_001 + index)
+                peak = max(peak, stream.pending_bytes())
+        return peak, stream.pending(), stream.pending_bytes(), lines
+
+    peak, pending, pending_bytes, lines = asyncio.run(scenario())
+    assert peak <= passthrough.QUEUE_MAX_BYTES
+    assert pending == 0 and pending_bytes == 0  # emptied, and waiting for a keyframe
+    assert len([line for line in lines if "queue" in line]) == 1
+
+
+def test_the_byte_count_follows_what_is_taken_out():
+    units = streams.encode_stream(frames=4, gop=4)
+
+    async def scenario():
+        stream = _stream()
+        stream.attach(asyncio.get_running_loop())
+        _push_all(stream, units)
+        full = stream.pending_bytes()
+        await stream.get()
+        after_one = stream.pending_bytes()
+        await _drain(stream)
+        return full, after_one, stream.pending_bytes()
+
+    full, after_one, empty = asyncio.run(scenario())
+    assert full == sum(len(unit) for unit in units)
+    assert after_one == full - len(units[0]) and empty == 0
+
+
 # --- pause and resume (spec test 9), and nobody watching ---------------------
 
 

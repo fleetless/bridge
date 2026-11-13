@@ -118,6 +118,33 @@ def test_an_sps_cut_short_raises():
         h264.parse_sps(_first_slice(units[0], h264.NAL_PPS))  # not an SPS at all
 
 
+def test_an_sps_id_outside_the_standard_is_refused():
+    """`seq_parameter_set_id` is 0 to 31. A reader that takes any number
+    lets a source that counts upward have every one of its parameter sets
+    kept."""
+    sps = _first_slice(streams.encode_stream(frames=1)[0], h264.NAL_SPS)
+    assert h264.parse_sps(streams.with_sps_id(sps, h264.SPS_ID_MAX)).sps_id == 31
+    assert h264.parse_sps(streams.with_sps_id(sps, 7)).sps_id == 7
+    for sps_id in (32, 33, 1000):
+        with pytest.raises(h264.H264ParseError):
+            h264.parse_sps(streams.with_sps_id(sps, sps_id))
+
+
+def test_a_parameter_set_longer_than_any_real_one_is_refused_unread():
+    """An SPS is a few dozen bytes, a few hundred with scaling lists. One of
+    megabytes is not a parameter set, and reading it bit by bit would hold
+    the thread that reads it."""
+    unit = streams.encode_stream(frames=1)[0]
+    sps, pps = _first_slice(unit, h264.NAL_SPS), _first_slice(unit, h264.NAL_PPS)
+    filler = b"\xff" * h264.PARAMETER_SET_MAX_BYTES
+    assert h264.parse_sps(sps + b"\xff" * (h264.PARAMETER_SET_MAX_BYTES - len(sps))).width == 64
+    with pytest.raises(h264.H264ParseError):
+        h264.parse_sps(sps + filler)
+    assert h264.pps_id(pps + b"\xff" * (h264.PARAMETER_SET_MAX_BYTES - len(pps))) == 0
+    with pytest.raises(h264.H264ParseError):
+        h264.pps_id(pps + filler)
+
+
 # --- slice types and B-frames ------------------------------------------------
 
 

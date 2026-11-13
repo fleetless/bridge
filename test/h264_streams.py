@@ -132,6 +132,48 @@ def strip_nal_types(unit: bytes, kinds) -> bytes:
     return join([nal for nal in split(unit) if nal[0] & 0x1F not in kinds])
 
 
+def padded(unit: bytes, size: int) -> bytes:
+    """`unit` grown to exactly `size` bytes with one filler-data NAL unit
+    (type 12), which a decoder skips. For a unit of a chosen size that is
+    still the same picture."""
+    overhead = 4 + 1 + 1  # start code, NAL header, the stop bit's byte
+    assert size >= len(unit) + overhead, "the unit is already larger than that"
+    return unit + b"\x00\x00\x00\x01\x0c" + b"\xff" * (size - len(unit) - overhead) + b"\x80"
+
+
+def with_sps_id(sps: bytes, sps_id: int) -> bytes:
+    """`sps` with its `seq_parameter_set_id` rewritten. The id is the first
+    Exp-Golomb code after the three fixed bytes; libx264 writes 0 there, one
+    bit, and everything behind it moves along. The escape bytes are taken
+    out before the bits are moved and put back afterwards, as a writer of
+    the format does."""
+    payload = bytearray()
+    zeros = 0
+    for byte in sps[1:]:
+        if zeros >= 2 and byte == 3:
+            zeros = 0
+            continue
+        payload.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+
+    bits = "".join("{:08b}".format(byte) for byte in payload[3:])
+    assert bits[0] == "1", "this SPS does not carry id 0"
+    code = "{:b}".format(sps_id + 1)
+    bits = "0" * (len(code) - 1) + code + bits[1:]
+    bits += "0" * (-len(bits) % 8)
+    moved = bytes(payload[:3]) + bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))
+
+    escaped = bytearray()
+    zeros = 0
+    for byte in moved:
+        if zeros >= 2 and byte <= 3:
+            escaped.append(3)
+            zeros = 0
+        escaped.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    return sps[:1] + bytes(escaped).rstrip(b"\x00")
+
+
 def nal_types(unit: bytes) -> List[int]:
     return [nal[0] & 0x1F for nal in split(unit)]
 
