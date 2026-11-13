@@ -17,14 +17,20 @@ also confirm frames genuinely arrived (the raw slot is non-empty) or that a
 real, correctly decoded image came back.
 """
 import asyncio
+import logging
 import time
 
+import numpy as np
 from conftest import wait_until
+from cv_bridge import CvBridge
 from helpers import by_slug
 
 from fleetless_bridge import camera
+from fleetless_bridge.live import LivePublisher
+from test_live import _FakeConnection, _FakeSignal, _FakeTrack
 from test_ros_runtime import (
     _camera_cfg,
+    _drain_camera_states,
     _fake_live_factory,
     _pull_snapshot,
     _split_snapshot_frame,
@@ -179,3 +185,226 @@ def test_timestamp_is_capture_time_from_the_raw_path(monkeypatch):
     # factor of three.
     assert header["timestamp_ms"] < before_pull + 100
     assert after_pull - header["timestamp_ms"] > 250
+
+
+# --- a live start: the newest message already held is the first frame ----------
+
+
+def _image_msg(color, *, width=16, height=12, encoding="bgr8"):
+    """A `sensor_msgs/msg/Image` of one solid BGR colour, built by hand and
+    never published: a test that puts it into `entry.raw` itself knows no
+    second message can arrive behind it."""
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:, :] = color
+    msg = CvBridge().cv2_to_imgmsg(frame, encoding="bgr8")
+    msg.encoding = encoding
+    return msg
+
+
+def _publisher_factory_with_fake_peers(tracks):
+    """The shipped `LivePublisher` and its own feed loop, joined to a fake
+    room. `_fake_live_factory` would only show that `latest` was filled; what
+    a viewer gets is what the publisher pushes to its track, and that is read
+    here."""
+
+    def factory(**kwargs):
+        signal, track = _FakeSignal(), _FakeTrack()
+        tracks.append(track)
+
+        def signal_factory(url, token, **callbacks):
+            signal.callbacks = callbacks
+            return signal
+
+        return LivePublisher(
+            signal_factory=signal_factory,
+            connection_factory=lambda ice_servers: _FakeConnection(),
+            track_factory=lambda width, height, fps, bitrate_kbps: track,
+            **kwargs,
+        )
+
+    return factory
+
+
+async def _eventually(condition, timeout=2.0):
+    """`wait_until` for something the event loop itself has to do: that one
+    sleeps the thread, and the publisher's feed loop runs on it."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition never became true within {}s".format(timeout)
+        await asyncio.sleep(0.01)
+
+
+async def _executor_caught_up(rt):
+    """Returns once everything queued on the executor thread before this call
+    has run -- the queue is first in, first out."""
+    await rt._submit_async(lambda: None)
+
+
+def test_a_live_start_publishes_the_raw_message_already_held(monkeypatch):
+    """An idle camera keeps its newest message unconverted. A live start used
+    to leave it there and publish nothing until the next message had arrived
+    and been converted: up to a whole camera interval of a viewer looking at
+    nothing. Here no next message exists at all, and the picture goes out."""
+    tracks = []
+
+    async def body(rt):
+        calls = _counting_to_bgr(monkeypatch)
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=50)]))
+        entry = rt._cameras["front"]
+        entry.raw.set(_image_msg((10, 20, 30)), 1_000)
+        assert entry.latest.get() is None
+
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        await _executor_caught_up(rt)
+        latest = entry.latest.get()
+        await _eventually(lambda: tracks[0].pushed)
+        pushed = list(tracks[0].pushed)
+        await rt.stop_live("front", request_id="req-2")
+        return latest, pushed, len(calls)
+
+    latest, pushed, conversions = run(
+        body, live_publisher_factory=_publisher_factory_with_fake_peers(tracks)
+    )
+    assert latest is not None and latest.timestamp_ms == 1_000  # its own capture time
+    assert conversions == 1
+    # BGR (10, 20, 30) reaches the track as RGB, like every other frame.
+    assert pushed[0].shape == (12, 16, 3)
+    assert pushed[0][0, 0].tolist() == [30, 20, 10]
+
+
+def test_a_live_start_leaves_a_raw_message_older_than_latest_unconverted(monkeypatch):
+    """`latest` can be the newer of the two: a snapshot converted a message,
+    and what sits in the raw slot now is older than that. Converting it would
+    put the older picture in front of the newer one."""
+    tracks = []
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=50)]))
+        entry = rt._cameras["front"]
+        newer = np.zeros((12, 16, 3), dtype=np.uint8)
+        newer[:, :] = (1, 2, 3)
+        rt._on_source_frame("front", entry, newer, 2_000)
+        entry.raw.set(_image_msg((200, 200, 200)), 1_000)
+        calls = _counting_to_bgr(monkeypatch)
+
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        await _executor_caught_up(rt)
+        await _eventually(lambda: tracks[0].pushed)
+        pushed = list(tracks[0].pushed)
+        await rt.stop_live("front", request_id="req-2")
+        return entry.latest.get(), pushed, len(calls), entry.raw.take()
+
+    latest, pushed, conversions, left_raw = run(
+        body, live_publisher_factory=_publisher_factory_with_fake_peers(tracks)
+    )
+    assert conversions == 0
+    assert latest.timestamp_ms == 2_000
+    assert [frame[0, 0].tolist() for frame in pushed] == [[3, 2, 1]]
+    assert left_raw is None  # looked at once, and not kept for a second look
+
+
+def test_a_raw_message_that_cannot_be_converted_does_not_fail_the_start():
+    """The start goes ahead and the first picture is the next message's, as
+    it always was. Said in the log, by the line a bad frame already gets."""
+    tracks = []
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=50)]))
+        entry = rt._cameras["front"]
+        entry.raw.set(_image_msg((10, 20, 30), encoding="not-an-encoding"), 1_000)
+        await _drain_camera_states(rt)
+
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        await _executor_caught_up(rt)
+        states = await _drain_camera_states(rt)
+        await asyncio.sleep(0.1)  # several feed ticks
+        pushed = list(tracks[0].pushed)
+        await rt.stop_live("front", request_id="req-2")
+        return states, pushed, entry.latest.get()
+
+    handler = _Capture()
+    watched = logging.getLogger("fleetless_bridge.ros_runtime")
+    watched.addHandler(handler)
+    try:
+        states, pushed, latest = run(
+            body, live_publisher_factory=_publisher_factory_with_fake_peers(tracks)
+        )
+    finally:
+        watched.removeHandler(handler)
+    assert [(s.publishing, s.error, s.request_id) for s in states] == [(True, None, "req-1")]
+    assert pushed == [] and latest is None
+    assert len([m for m in handler.messages if "Could not convert a camera frame" in m]) == 1
+
+
+def test_an_unexpected_conversion_failure_at_a_start_is_logged_and_not_raised(monkeypatch):
+    """The conversion is queued and nobody waits for its result, so an
+    exception that escaped it would be lost without a line anywhere."""
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.messages = []
+
+        def emit(self, record):
+            self.messages.append(record.getMessage())
+
+    def explode(msg):
+        raise RuntimeError("decoder fell over")
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12)]))
+        rt._cameras["front"].raw.set(_image_msg((10, 20, 30)), 1_000)
+        monkeypatch.setattr(camera, "to_bgr", explode)
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        await _executor_caught_up(rt)
+        return "front" in rt._live_publishers
+
+    handler = _Capture()
+    watched = logging.getLogger("fleetless_bridge.ros_runtime")
+    watched.addHandler(handler)
+    try:
+        live = run(body, live_publisher_factory=_fake_live_factory())
+    finally:
+        watched.removeHandler(handler)
+    assert live is True
+    assert len([m for m in handler.messages if "newest camera frame" in m and "front" in m]) == 1
+
+
+def test_convert_newest_raw_frame_converts_on_request_and_only_what_is_newer(monkeypatch):
+    """The entry point on its own, as anything else that makes conversion
+    wanted would call it: no live start anywhere in this test."""
+
+    async def body(rt):
+        calls = _counting_to_bgr(monkeypatch)
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12)]))
+        entry = rt._cameras["front"]
+
+        entry.raw.set(_image_msg((10, 20, 30)), 1_000)
+        rt.convert_newest_raw_frame("front").result(timeout=5.0)
+        first = entry.latest.get()
+
+        rt.convert_newest_raw_frame("front").result(timeout=5.0)  # nothing held now
+        entry.raw.set(_image_msg((40, 50, 60)), 900)  # older than what `latest` has
+        rt.convert_newest_raw_frame("front").result(timeout=5.0)
+        return first, entry.latest.get(), len(calls)
+
+    first, latest, conversions = run(body)
+    assert first.timestamp_ms == 1_000
+    assert first.bgr[0, 0].tolist() == [10, 20, 30]
+    assert latest.timestamp_ms == 1_000
+    assert conversions == 1
+
+
+def test_convert_newest_raw_frame_is_a_no_op_for_a_slug_without_a_camera():
+    async def body(rt):
+        return rt.convert_newest_raw_frame("nobody").result(timeout=5.0)
+
+    assert run(body) is None

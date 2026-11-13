@@ -2479,13 +2479,49 @@ class RosRuntime:
             self._live_locks[slug] = lock
         return lock
 
+    def convert_newest_raw_frame(self, slug: str) -> "concurrent.futures.Future":
+        """Convert the newest message `slug`'s camera holds unconverted, now,
+        instead of leaving it for the next snapshot -- for the moment a
+        converted frame becomes wanted. A live start is that moment today.
+
+        While nobody watches, a ROS camera keeps only its newest raw message
+        (`_RosSourceAdapter`). Whoever starts watching would otherwise look at
+        whatever `entry.latest` last held -- an old snapshot's frame, or
+        nothing at all -- until the camera's next message arrived and was
+        converted: up to one whole camera interval.
+
+        Queues the work on the executor thread and returns at once with its
+        future, from the loop thread or any other. Nothing has to wait for
+        it: the frame lands in `entry.latest` through `_on_source_frame`,
+        like every other, and whoever reads the holder finds it there.
+
+        A no-op for a slug with no camera, for a camera holding nothing raw
+        -- the three threaded sources never do, they decode continuously --
+        and for a raw message older than what `latest` already has."""
+        return self._enqueue(lambda: self._convert_newest_raw_frame(slug))
+
+    def _convert_newest_raw_frame(self, slug: str) -> None:
+        """Runs on the executor thread, where `self._cameras` lives. Never
+        raises: nobody is waiting for this result, so an exception left in
+        the future would be an exception nobody ever reads."""
+        entry = self._cameras.get(slug)
+        if entry is None:
+            return
+        try:
+            self._convert_due_raw_frame(slug, entry)
+        except Exception:  # noqa: BLE001 - logged here or lost
+            log.exception("Could not convert the newest camera frame for slug %r", slug)
+
     async def start_live(
         self, slug: str, url: str, room: str, token: str, request_id: str
     ) -> None:
         """Starts live for `slug` on `cloudCameraStart`. Not
         routed through `_submit_async`/the executor thread — joining
         LiveKit is not a ROS/rclpy concern, only reading `entry.latest`
-        (already thread-safe on its own, camera.py) is. Idempotent for an
+        (already thread-safe on its own, camera.py) is. The one piece of
+        work it does queue there, and does not wait for, is the conversion
+        of the camera's newest raw message
+        (`convert_newest_raw_frame`). Idempotent for an
         already-live slug (a redelivered `camera_start` must not open a
         second connection), and a defensive `live_unavailable` for a slug
         this process has no camera configured for — the cloud enforces that
@@ -2572,6 +2608,14 @@ class RosRuntime:
                     )
                 )
                 return
+
+            # The first frame is the newest message the camera already
+            # holds, not the next one it sends. Queued before the join and
+            # not waited for: the join takes hundreds of milliseconds and
+            # this a few, so the frame is in `entry.latest` when the
+            # publisher's feed loop first looks. After the join it would
+            # come too late for that first look, and cost a frame interval.
+            self.convert_newest_raw_frame(slug)
 
             publisher = self._live_publisher_factory(
                 holder=entry.latest,
@@ -5024,10 +5068,11 @@ class RosRuntime:
         publisher running for `slug`, `_RosSourceAdapter`'s callback leaves
         each arriving message in `entry.raw` instead of converting it (the
         eager half — see `conversion_wanted` in `_create_camera`). Called
-        only for a camera `_next_snapshot`'s dueness walk has just decided
-        is actually due, so a camera nobody ever pulls a snapshot for, and
-        nobody watches live, never pays the imgmsg->BGR conversion cost at
-        all — the actual point of this whole task.
+        for a camera `_next_snapshot`'s dueness walk has just decided is
+        actually due, and for one whose live stream is starting
+        (`convert_newest_raw_frame`) — so a camera nobody ever pulls a
+        snapshot for, and nobody watches live, never pays the imgmsg->BGR
+        conversion cost at all — the actual point of this whole task.
 
         Runs on the executor thread, the same thread `_RosSourceAdapter`'s
         callback runs on (this whole walk does, via `_submit_async`), so
