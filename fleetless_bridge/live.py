@@ -208,28 +208,57 @@ class CameraTrack(VideoStreamTrack):
         return frame
 
 
-def _default_connection_factory(ice_servers: Sequence[IceServer]) -> RTCPeerConnection:
-    """The peer connection, configured with what `join` said.
+def _ice_servers_without_stun(ice_servers: Sequence[IceServer]) -> List[RTCIceServer]:
+    """What `join` advertised, minus every `stun:` and `stuns:` URL.
 
-    The ICE servers come from the server rather than from configuration here:
-    the cloud knows where its TURN sits and says so in `join`, and a second
-    list on the robot would be a second policy that goes stale. aiortc
-    honours only the **first** STUN and the **first** TURN entry it can
-    parse, so a `join` advertising two relays leaves one of them never
-    tried.
+    **The robot asks no STUN server.** A reflexive candidate is the answer to
+    "what does my address look like from outside", and nothing here needs it:
+    the robot only ever connects to a media server it can reach itself,
+    directly or through TURN, and that server learns the robot's address from
+    the first connectivity check it receives.
+
+    Asking is not free either. aioice sends the question from every host
+    address and then waits five seconds for all the answers together, so a
+    single address with no route to the STUN server -- a camera network, a
+    bridge interface that is down -- costs every start the full five seconds.
+
+    **Always a list, `[]` when nothing is left, never `None`.** aiortc reads
+    `None` as "use your own", and upstream's own list is a public STUN server.
+    Ubuntu's packages ship that list empty; an aiortc from anywhere else does
+    not, and this must hold there too.
+
+    An entry that names both kinds keeps its TURN URLs and its credentials.
+    Every other URL is passed on as it came. aiortc honours only the
+    **first** TURN entry it can parse, so a `join` advertising two relays
+    leaves one of them never tried.
     """
-    return RTCPeerConnection(
-        configuration=RTCConfiguration(
-            iceServers=[
+    kept = []
+    for server in ice_servers:
+        urls = [
+            url for url in server.urls
+            if not url.lower().startswith(("stun:", "stuns:"))
+        ]
+        if urls:
+            kept.append(
                 RTCIceServer(
-                    urls=list(server.urls),
+                    urls=urls,
                     username=server.username or None,
                     credential=server.credential or None,
                 )
-                for server in ice_servers
-                if server.urls
-            ]
-        )
+            )
+    return kept
+
+
+def _default_connection_factory(ice_servers: Sequence[IceServer]) -> RTCPeerConnection:
+    """The peer connection, configured with the TURN servers `join` named.
+
+    They come from the server rather than from configuration here: the cloud
+    knows where its TURN sits and says so in `join`, and a second list on the
+    robot would be a second policy that goes stale. STUN is left out, for the
+    reasons `_ice_servers_without_stun` gives.
+    """
+    return RTCPeerConnection(
+        configuration=RTCConfiguration(iceServers=_ice_servers_without_stun(ice_servers))
     )
 
 
