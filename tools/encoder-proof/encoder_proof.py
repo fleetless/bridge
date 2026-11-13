@@ -449,10 +449,19 @@ def _prove_colours(pipeline, decoder, sps, args, report, index):
     return index
 
 
+#: The fewest frames of one stretch of the bitrate check. A rate control
+#: follows over frames, not over time: at a camera's two frames a second,
+#: two seconds are four frames, and what is measured then is where the
+#: encoder happened to be, not where it settles.
+BITRATE_STRETCH_FRAMES = 30
+
+
 def _prove_bitrate(pipeline, args, report, index):
-    """Two seconds at the target, two at a quarter of it, two back: the
-    stream has to shrink and grow with it."""
-    settle = args.fps * 2
+    """A stretch at the target, one at a quarter of it, one back: the
+    stream has to shrink and grow with it. Each stretch is two seconds of
+    frames and never fewer than `BITRATE_STRETCH_FRAMES`; its second half
+    is what is measured."""
+    settle = max(BITRATE_STRETCH_FRAMES, args.fps * 2)
 
     def stretch(bitrate_bps):
         nonlocal index
