@@ -403,6 +403,49 @@ def test_convert_newest_raw_frame_converts_on_request_and_only_what_is_newer(mon
     assert conversions == 1
 
 
+def test_a_held_message_converted_late_does_not_cost_the_cameras_next_message():
+    """The frame limit lets one frame through per `1/fps`. Counted from the
+    moment a held message was *converted*, a camera publishing at about
+    `fps` loses the message after it: that one arrives a full interval after
+    the held one did, and only a fraction of an interval after the
+    conversion. The picture a viewer was just given would then stay up for
+    two intervals. Counted from when the message arrived, both go through."""
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=10)]))
+        entry = rt._cameras["front"]
+        following = np.zeros((12, 16, 3), dtype=np.uint8)
+
+        entry.raw.set(_image_msg((10, 20, 30)), 1_000)  # arrives now
+        await asyncio.sleep(0.07)  # held for most of the 100 ms interval
+        rt.convert_newest_raw_frame("front").result(timeout=5.0)
+        first = entry.latest.get().timestamp_ms
+        await asyncio.sleep(0.04)  # 110 ms after the held message arrived
+        await rt._submit_async(lambda: rt._on_source_frame("front", entry, following, 1_110))
+        return first, entry.latest.get().timestamp_ms
+
+    first, then = run(body)
+    assert first == 1_000
+    assert then == 1_110
+
+
+def test_the_frame_limit_still_holds_right_after_a_held_message():
+    """The control for the test above: a message that really is too early --
+    a few milliseconds behind the held one -- is still refused."""
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=10)]))
+        entry = rt._cameras["front"]
+        following = np.zeros((12, 16, 3), dtype=np.uint8)
+
+        entry.raw.set(_image_msg((10, 20, 30)), 1_000)
+        rt.convert_newest_raw_frame("front").result(timeout=5.0)
+        await rt._submit_async(lambda: rt._on_source_frame("front", entry, following, 1_005))
+        return entry.latest.get().timestamp_ms
+
+    assert run(body) == 1_000
+
+
 def test_convert_newest_raw_frame_is_a_no_op_for_a_slug_without_a_camera():
     async def body(rt):
         return rt.convert_newest_raw_frame("nobody").result(timeout=5.0)

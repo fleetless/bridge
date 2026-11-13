@@ -3,6 +3,7 @@
 encode, and the single-slot latest-frame handoff snapshot and live both
 read from. No rclpy node or executor needed — as free of ROS runtime as
 sampling.py, just with image messages."""
+import time
 import numpy as np
 import pytest
 from cv_bridge import CvBridge
@@ -201,3 +202,17 @@ def test_raw_frame_holder_set_overwrites_a_not_yet_taken_frame():
     newer = object()
     holder.set(newer, timestamp_ms=2)
     assert holder.take() == (newer, 2)
+
+
+def test_raw_frame_holder_remembers_when_the_message_arrived():
+    """`take_frame` hands over the arrival instant with the message, on the
+    monotonic clock: whoever converts the message later can tell how long it
+    was held without comparing two different clocks."""
+    holder = RawFrameHolder()
+    before = time.monotonic()
+    holder.set(object(), 123)
+    after = time.monotonic()
+    frame = holder.take_frame()
+    assert frame.timestamp_ms == 123
+    assert before <= frame.arrived_s <= after
+    assert holder.take_frame() is None

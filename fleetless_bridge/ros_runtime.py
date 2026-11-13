@@ -4566,7 +4566,10 @@ class RosRuntime:
 
     # --- cameras: sampling, fed by every adapter alike ---
 
-    def _on_source_frame(self, slug: str, expected_entry: _CameraEntry, bgr: Any, timestamp_ms: int) -> None:
+    def _on_source_frame(
+        self, slug: str, expected_entry: _CameraEntry, bgr: Any, timestamp_ms: int,
+        arrived_s: Optional[float] = None,
+    ) -> None:
         """The one hand-off every camera source feeds — ROS's own
         `_RosSourceAdapter` and the three from camera_sources.py alike.
         Resize and the `max_hz` rate limit happen here, uniformly, rather
@@ -4596,12 +4599,24 @@ class RosRuntime:
         otherwise it stores the raw message and clears any source
         error through `_clear_source_error` directly, bypassing this
         method's resize/rate-limit/`latest.set` entirely, since those only
-        make sense for a frame that was actually converted."""
+        make sense for a frame that was actually converted.
+
+        `arrived_s` is the `time.monotonic()` at which the frame arrived,
+        for the one caller that hands a frame over later than that: a raw
+        message converted after it was held (`_convert_due_raw_frame`). The
+        rate limit counts between arrivals. Counted from a late conversion
+        instead, the camera's very next message -- a full interval after
+        the held one, but only a fraction of one after its conversion --
+        would be refused as too early, and a camera publishing at about its
+        configured `fps` would lose a frame after every held one. `None`
+        means now, which is when every other frame arrives."""
         entry = self._cameras.get(slug)
         if entry is not expected_entry:
             return  # torn down, retargeted, or a stale adapter calling back in late
 
-        if not entry.rate.should_send(None, time.monotonic()):
+        if not entry.rate.should_send(
+            None, time.monotonic() if arrived_s is None else arrived_s
+        ):
             return
 
         try:
@@ -5079,7 +5094,7 @@ class RosRuntime:
         `entry.raw` needs no cross-thread handling beyond its own lock and
         `camera.to_bgr` is safe to call directly here.
 
-        `entry.raw.take()` unconditionally, even when the frame turns out
+        `entry.raw.take_frame()` unconditionally, even when the frame turns out
         to be the "already superseded" branch below: with the executor
         thread as the only reader and the only writer of both `raw` and
         `latest`, there is no concurrent second look to lose by consuming
@@ -5087,10 +5102,10 @@ class RosRuntime:
         has no value either way — leaving it in the slot would only make a
         later call redo this same comparison against the same stale
         answer."""
-        raw = entry.raw.take()
+        raw = entry.raw.take_frame()
         if raw is None:
             return
-        msg, raw_timestamp_ms = raw
+        msg, raw_timestamp_ms = raw.msg, raw.timestamp_ms
         latest = entry.latest.get()
         if latest is not None and latest.timestamp_ms >= raw_timestamp_ms:
             return  # `latest` is already at least as fresh as the raw frame was
@@ -5105,8 +5120,10 @@ class RosRuntime:
         # is the raw frame's own capture time (read in the ROS callback
         # before anything else), not this conversion's — the snapshot that
         # eventually goes out must report when the camera saw it, not when
-        # somebody got around to decoding it.
-        self._on_source_frame(slug, entry, bgr, raw_timestamp_ms)
+        # somebody got around to decoding it. The rate limit is told when
+        # the message arrived for the same reason: it has been waiting here,
+        # and the wait is not part of the camera's cadence.
+        self._on_source_frame(slug, entry, bgr, raw_timestamp_ms, arrived_s=raw.arrived_s)
 
     def _next_snapshot(self, max_bytes: int) -> Optional[bytes]:
         """The dueness walk, on the executor thread. Every configured
