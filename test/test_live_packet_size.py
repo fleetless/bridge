@@ -22,6 +22,7 @@ import pytest
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCRtpSender
 from aiortc.codecs import h264, vpx
 from aiortc.rtcrtpparameters import RTCRtpHeaderExtensionParameters, RTCRtpParameters
+from aiortc.rtcrtpsender import RTP_HISTORY_SIZE
 from aiortc.rtp import HeaderExtensionsMap, RtpPacket, is_rtcp, wrap_rtx
 from av import VideoFrame
 
@@ -421,18 +422,26 @@ def test_no_buffer_handed_to_the_transport_exceeds_the_setting(codec, setting):
             "the forced keyframe",
         )
 
-        # One retransmission, of the largest packet sent so far.
-        largest = max(recorder.packets)
+        # One retransmission, of the largest packet the sender still holds.
+        # It keeps the last `RTP_HISTORY_SIZE` packets and answers a request
+        # for an older one with nothing; a keyframe at the smallest setting
+        # is more packets than that, so the largest packet of the whole
+        # session may already be gone. Half the history is safely inside it.
+        # Nothing is awaited between choosing the packet and asking for it,
+        # so the sender cannot have moved on in between.
+        media = recorder.packets[0][3]
+        held = [p for p in recorder.packets[-(RTP_HISTORY_SIZE // 2):] if p[3] == media]
+        largest = max(held)
         count = len(recorder.packets)
         await sender._retransmit(largest[1])
-        await _until(lambda: len(recorder.packets) > count, 5.0, "the retransmission")
         result["largest"] = largest
         result["retransmission"] = next(
-            p for p in recorder.packets[count:] if p[3] != largest[3]
+            (p for p in recorder.packets[count:] if p[3] != media), None
         )
         # Two seconds at 15 frames a second.
         await _until(lambda: len(recorder.frames()) >= 30, 30.0, "a few seconds of video")
         result["lengths"] = recorder.lengths()
+        result["media"] = [p[0] for p in recorder.packets if p[3] == media]
 
     set_max_packet_bytes(setting)
     asyncio.run(_session(codec, body))
@@ -442,9 +451,13 @@ def test_no_buffer_handed_to_the_transport_exceeds_the_setting(codec, setting):
     assert max(lengths) <= setting
     # The retransmission went out under the RTX payload type and is the
     # original plus its two-byte sequence number.
+    assert result["retransmission"] is not None, "the sender retransmitted nothing"
     assert result["retransmission"][0] == result["largest"][0] + 2
     assert result["retransmission"][0] <= setting
     assert result["retransmission"][0] in lengths
+    # And the largest packet of the whole session, retransmitted, would fit
+    # too: the two bytes are the same on every packet.
+    assert max(result["media"]) + 2 <= setting
     # The cap is used. VP8 fills its packets to within the constant's margin;
     # H.264 cuts a NAL unit into equal fragments, between half the cap and
     # the cap.
