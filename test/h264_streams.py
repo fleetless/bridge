@@ -125,6 +125,13 @@ def strip_parameter_sets(unit: bytes) -> bytes:
     return join([nal for nal in split(unit) if nal[0] & 0x1F not in (7, 8)])
 
 
+def strip_nal_types(unit: bytes, kinds) -> bytes:
+    """The access unit without its NAL units of the given types: `{8}` for a
+    source that repeats its SPS and sends its PPS once, `{7}` for the other
+    way round."""
+    return join([nal for nal in split(unit) if nal[0] & 0x1F not in kinds])
+
+
 def nal_types(unit: bytes) -> List[int]:
     return [nal[0] & 0x1F for nal in split(unit)]
 

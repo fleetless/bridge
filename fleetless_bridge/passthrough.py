@@ -384,19 +384,27 @@ class PassthroughStream:
 
     def _with_parameter_sets(self, info: h264.AccessUnit) -> Tuple[bytes, ...]:
         """The keyframe's NAL units with SPS and PPS in front of its slices.
-        Sets the unit already carries are left where they are; missing ones
-        come from what the source sent earlier, behind an access unit
-        delimiter if the unit opens with one."""
-        missing = []
-        if info.sps is None:
-            missing.extend(self._sps[key] for key in sorted(self._sps))
-        if not info.pps:
-            missing.extend(self._pps[key] for key in sorted(self._pps))
-        if not missing:
+
+        A unit that carries both is handed on as it came. One that lacks a
+        set gets what the source sent earlier, and is put in the order a
+        decoder needs: an access unit delimiter if the unit opens with one,
+        then every SPS, then every PPS, then the rest as it stood. The order
+        matters when only one of the two is in band: a PPS in front of the
+        SPS it refers to is dropped by a decoder that has not seen that SPS
+        yet, which is every new viewer's and the snapshot's."""
+        if info.sps is not None and info.pps:
             return info.nals
         nals = list(info.nals)
-        at = 1 if h264.nal_type(nals[0]) == h264.NAL_AUD else 0
-        return tuple(nals[:at] + missing + nals[at:])
+        head = nals[:1] if h264.nal_type(nals[0]) == h264.NAL_AUD else []
+        body = nals[len(head):]
+        sps = [nal for nal in body if h264.nal_type(nal) == h264.NAL_SPS]
+        pps = [nal for nal in body if h264.nal_type(nal) == h264.NAL_PPS]
+        rest = [nal for nal in body if h264.nal_type(nal) not in (h264.NAL_SPS, h264.NAL_PPS)]
+        if not sps:
+            sps = [self._sps[key] for key in sorted(self._sps)]
+        if not pps:
+            pps = [self._pps[key] for key in sorted(self._pps)]
+        return tuple(head + sps + pps + rest)
 
     def _offer(self, unit: Unit) -> bool:
         """Queues `unit` if a sender wants it. Returns whether to wake it."""

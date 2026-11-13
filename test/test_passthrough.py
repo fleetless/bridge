@@ -184,6 +184,53 @@ def test_parameter_sets_given_out_of_band_reach_every_keyframe():
         assert list(keyframe.nals[:2]) == [sps, pps]
 
 
+@pytest.mark.parametrize("repeated, once", [(7, 8), (8, 7)])
+def test_a_keyframe_that_carries_one_set_gets_the_other_in_the_order_a_decoder_needs(repeated, once):
+    """A source that repeats its SPS with every keyframe and sent its PPS
+    once -- or the other way round. A PPS refers to its SPS, and a decoder
+    drops one whose SPS it has not seen: the stored set has to go where the
+    order is SPS, PPS, slices, whatever the unit carried in band. Checked on
+    the bytes and with a decoder that has seen nothing else, which is what a
+    new viewer's is and what the snapshot uses."""
+    units = streams.encode_stream(frames=12, gop=4)
+    source = [units[0]] + [streams.strip_nal_types(unit, {once}) for unit in units[1:]]
+    assert once not in streams.nal_types(source[4]) and repeated in streams.nal_types(source[4])
+
+    async def scenario():
+        stream = _stream()
+        _push_all(stream, source[:3])  # the sets, seen once; nobody watches yet
+        stream.attach(asyncio.get_running_loop())
+        _push_all(stream, source[3:], start_ms=20_000)
+        return await _drain(stream), stream.newest_keyframe()
+
+    out, keyframe = asyncio.run(scenario())
+    first = out[0]
+    kinds = _types(first)
+    assert first.keyframe
+    assert max(i for i, kind in enumerate(kinds) if kind == 7) < min(i for i, kind in enumerate(kinds) if kind == 8)
+    assert max(i for i, kind in enumerate(kinds) if kind == 8) < kinds.index(5)
+    assert kinds.count(7) == 1 and kinds.count(8) == 1
+
+    # A decoder that starts at this unit shows its picture, and the ones after.
+    pictures = streams.decode_all([streams.join(list(unit.nals)) for unit in out])
+    expected = streams.decode_all(units)[4:]
+    assert len(pictures) == len(expected) == 8
+    assert all(np.array_equal(a, b) for a, b in zip(pictures, expected))
+    # And so does the snapshot's, from the newest keyframe alone.
+    assert np.array_equal(passthrough.decode_keyframe(keyframe.data), streams.decode_all(units)[8])
+
+
+def test_sets_out_of_band_and_one_of_them_in_band_come_out_in_order_too():
+    units = streams.encode_stream(frames=4, gop=4)
+    sps, pps = streams.parameter_sets(units[0])
+    stream = _stream()
+    stream.set_parameter_sets(streams.join([sps, pps]))
+    stream.push(streams.strip_nal_types(units[0], {8}), 10_000)  # SPS in band, PPS from the SDP
+    nals = streams.split(stream.newest_keyframe().data)
+    assert nals[0] == sps and nals[1] == pps
+    assert passthrough.decode_keyframe(stream.newest_keyframe().data).shape == (HEIGHT, WIDTH, 3)
+
+
 def test_a_keyframe_without_any_parameter_sets_cannot_start_a_stream():
     units = [streams.strip_parameter_sets(unit) for unit in streams.encode_stream(frames=8, gop=4)]
 
