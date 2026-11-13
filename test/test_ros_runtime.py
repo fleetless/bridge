@@ -6572,9 +6572,10 @@ class _FakeLivePublisher:
 
     def __init__(
         self, *, holder, width, height, fps, bitrate_kbps, on_lost=None,
-        slug=None, received_s=None, on_resume=None,
+        slug=None, received_s=None, on_resume=None, encoder=None,
         fail_with=None, stop_delay=0.0, start_delay=0.0,
     ):
+        self.encoder = encoder
         self.slug = slug
         self.on_resume = on_resume
         self.received_s = received_s

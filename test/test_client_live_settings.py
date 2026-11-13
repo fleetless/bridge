@@ -184,7 +184,7 @@ def test_an_unknown_key_in_the_section_is_ignored():
         await session.send_raw(json.dumps({
             "type": "config",
             "version": 1,
-            "doc": {"fleetless": 1, "live": {"max_packet_bytes": 900, "encoder": "h264"}},
+            "doc": {"fleetless": 1, "live": {"max_packet_bytes": 900, "codec": "h264"}},
         }))
         box["applied"] = await session.recv_config_applied()
 
@@ -329,3 +329,103 @@ def test_a_client_with_no_runtime_resolves_and_acks():
     box = _session(None, script)
     assert box["applied"]["ok"] is True
     assert box["client"]._live_settings == LiveSettings(max_packet_bytes=900)
+
+
+# --- live.encoder, through the same layers -------------------------------------------
+
+
+def _encoders(ros):
+    return [settings.encoder for settings in ros.live_settings_calls]
+
+
+def test_the_encoder_of_the_section_overrides_the_parameter_and_returns_to_it():
+    ros = FakeRos()
+    ros.live_params_value = {"max_packet_bytes": 1200, "encoder": "nvenc"}
+
+    async def script(session, client, box):
+        await _config(session, 1)
+        await _config(session, 2, live={"encoder": "auto"})
+        await _config(session, 3, live={"encoder": "auto"})  # the same again: no lever
+        await _config(session, 4)
+
+    with _client_log() as records:
+        box = _session(ros, script)
+    assert _encoders(ros) == ["nvenc", "auto", "nvenc"]
+    assert box["client"]._live_settings == LiveSettings(max_packet_bytes=1200, encoder="nvenc")
+    said = [r.getMessage() for r in records if r.levelno == logging.INFO and "live." in r.getMessage()]
+    # One line per change, about the key that changed and when it holds.
+    assert said == [
+        "live.encoder is {}: it encodes live video from the next live start on; "
+        "a running stream keeps the encoder it has".format(name)
+        for name in ("nvenc", "auto", "nvenc")
+    ]
+
+
+def test_each_setting_that_moved_gets_its_own_line_and_the_other_gets_none():
+    ros = FakeRos()
+
+    async def script(session, client, box):
+        await _config(session, 1, live={"max_packet_bytes": 900})
+        await _config(session, 2, live={"max_packet_bytes": 900, "encoder": "vaapi"})
+        await _config(session, 3, live={"max_packet_bytes": 1000, "encoder": "v4l2"})
+
+    with _client_log() as records:
+        _session(ros, script)
+    assert [(s.max_packet_bytes, s.encoder) for s in ros.live_settings_calls] == [
+        (900, "software"), (900, "vaapi"), (1000, "v4l2"),
+    ]
+    said = [r.getMessage() for r in records if r.levelno == logging.INFO and "live." in r.getMessage()]
+    assert [line.split(":")[0] for line in said] == [
+        "live.max_packet_bytes is 900",
+        "live.encoder is vaapi",
+        "live.max_packet_bytes is 1000",
+        "live.encoder is v4l2",
+    ]
+
+
+def test_an_accepted_encoder_parameter_is_applied_and_waits_under_a_yaml_key():
+    ros = FakeRos()
+
+    async def script(session, client, box):
+        await _config(session, 1)
+        ros.live_callback({"max_packet_bytes": 1200, "encoder": "nvenc"})
+        await _config(session, 2, live={"encoder": "software"})
+        ros.live_callback({"max_packet_bytes": 1200, "encoder": "vaapi"})  # overridden
+        box["under_the_key"] = list(_encoders(ros))
+        await _config(session, 3)
+
+    box = _session(ros, script)
+    assert box["under_the_key"] == ["nvenc", "software"]
+    assert _encoders(ros) == ["nvenc", "software", "vaapi"]
+
+
+def test_an_encoder_this_bridge_does_not_know_keeps_the_one_in_force_and_says_so():
+    """A newer cloud, or a frame no conforming cloud sends. The ack says
+    nothing, the error names the rule and what stays in force."""
+    ros = FakeRos()
+
+    async def script(session, client, box):
+        await _config(session, 1, live={"encoder": "nvenc", "max_packet_bytes": 900})
+        for version, value in ((2, "rkmpp"), (3, "NVENC"), (4, 7)):
+            await session.send_raw(json.dumps({
+                "type": "config",
+                "version": version,
+                "doc": {"fleetless": 1, "live": {"encoder": value, "max_packet_bytes": 1000}},
+            }))
+            box[version] = await session.recv_config_applied()
+
+    with _client_log() as records:
+        box = _session(ros, script)
+    for version in (2, 3, 4):
+        assert box[version]["ok"] is True and box[version]["errors"] == []
+    # The whole section is refused, the good key with it: a section is one
+    # statement, and half of one is not what anybody published.
+    assert [(s.max_packet_bytes, s.encoder) for s in ros.live_settings_calls] == [(900, "nvenc")]
+    assert box["client"]._live_settings == LiveSettings(max_packet_bytes=900, encoder="nvenc")
+    errors = [r.getMessage() for r in records if r.levelno == logging.ERROR]
+    assert len(errors) == 3
+    for line in errors:
+        assert line == (
+            "live.encoder must be one of software, auto, nvenc, vaapi, v4l2. The bridge "
+            "keeps sending RTP packets of at most 900 bytes, encoded by nvenc."
+        )

@@ -7,11 +7,13 @@ parameter on the bridge node, then the key of the same name in
 and set for good from the console.
 
 Nothing here touches ROS, asyncio or aiortc. `ros_runtime.py` declares the
-parameter and asks `resolve` whether a proposed value is one; `client.py`
-holds the two layers and resolves them; `live.py` applies the result.
+parameters and asks `resolve` whether a proposed value is one; `client.py`
+holds the two layers and resolves them; `live.py` applies the packet size,
+and `ros_runtime.py` builds the encoder of the next live start from
+`encoder`.
 """
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Tuple
 
 from fleetless_bridge.protocol import LIVE_BOUNDS, LIVE_DEFAULTS
 
@@ -24,12 +26,22 @@ from fleetless_bridge.protocol import LIVE_BOUNDS, LIVE_DEFAULTS
 MAX_PACKET_BYTES_MIN: int = LIVE_BOUNDS["max_packet_bytes"]["min"]
 MAX_PACKET_BYTES_MAX: int = LIVE_BOUNDS["max_packet_bytes"]["max"]
 
+#: What `encoder` may be: `software`, `auto`, `nvenc`, `vaapi`, `v4l2`. The
+#: list of the vendored contracts constants, in its order, so a ROS parameter
+#: is refused by the same list the cloud refuses a published document by.
+ENCODERS: Tuple[str, ...] = tuple(LIVE_BOUNDS["encoder"]["values"])
+
 
 @dataclass(frozen=True)
 class LiveSettings:
     #: The largest RTP packet the bridge sends, before SRTP: fixed header,
     #: header extensions and payload, retransmissions included.
     max_packet_bytes: int
+    #: What encodes live video: `software` is aiortc's own encoder, VP8 or
+    #: H.264 as negotiated; every other value is a hardware encoder reached
+    #: through GStreamer, with H.264 as the only codec. Read when a live
+    #: stream starts; a running one keeps the encoder it started with.
+    encoder: str = LIVE_DEFAULTS["encoder"]
 
     @classmethod
     def resolve(cls, params: Mapping[str, Any], yaml: Mapping[str, Any]) -> "LiveSettings":
@@ -52,7 +64,10 @@ class LiveSettings:
         merged: Dict[str, Any] = dict(LIVE_DEFAULTS)
         merged.update({k: v for k, v in params.items() if v is not None})
         merged.update({k: v for k, v in yaml.items() if v is not None})
-        return cls(max_packet_bytes=check_max_packet_bytes(merged["max_packet_bytes"]))
+        return cls(
+            max_packet_bytes=check_max_packet_bytes(merged["max_packet_bytes"]),
+            encoder=check_encoder(merged["encoder"]),
+        )
 
 
 def check_max_packet_bytes(value: Any) -> int:
@@ -74,3 +89,15 @@ def check_max_packet_bytes(value: Any) -> int:
             MAX_PACKET_BYTES_MIN, MAX_PACKET_BYTES_MAX
         )
     )
+
+
+def check_encoder(value: Any) -> str:
+    """`value` if it is an encoder the bridge knows, `ValueError` with the
+    sentence naming the key and the values if not.
+
+    Exact strings: `NVENC` and `nvenc ` are not `nvenc`, here as in the
+    schema. A name from a newer cloud that this bridge does not know is
+    refused like a typo, and the encoder in force stays."""
+    if isinstance(value, str) and value in ENCODERS:
+        return value
+    raise ValueError("live.encoder must be one of {}".format(", ".join(ENCODERS)))

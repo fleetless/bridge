@@ -224,6 +224,65 @@ Lower it when a viewer sits behind a tunnel inside a tunnel: take the smallest
 MTU on the path and subtract 80. Smaller packets mean more of them, so go as
 low as the path needs and no lower.
 
+## 🎛️ Live video encoder
+
+By default the bridge encodes live video on the CPU. A robot with an encoder
+chip can use that instead:
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `live.encoder` | `software` | What encodes live video. `software` is the bridge's own encoder on the CPU, VP8 or H.264 as the media server picks. Every other value is H.264 from a hardware encoder. |
+
+| Value | Encoder | GStreamer element, tried in this order |
+|---|---|---|
+| `software` | the CPU | none |
+| `nvenc` | NVIDIA: a Jetson, then a desktop card | `nvv4l2h264enc`, then `nvh264enc` |
+| `vaapi` | Intel and AMD graphics | `vah264enc`, then `vaapih264enc` |
+| `v4l2` | a V4L2 encoder, as on a Raspberry Pi 4 | `v4l2h264enc` |
+| `auto` | the first of `nvenc`, `vaapi`, `v4l2` that starts | as above |
+
+```sh
+ros2 param set /fleetless_bridge live.encoder nvenc
+```
+
+It holds for every camera of the robot and applies at the next live start; a
+running stream keeps the encoder it has. The `live` section of the published
+`fleetless.yaml` overrides the parameter for as long as it names the key:
+
+```yaml
+live:
+  encoder: nvenc
+```
+
+**The hardware chains are written from the documentation of their elements,
+and tested here through a software stand-in.** Which of them have been proven
+on hardware is listed in the
+[Live Video reference](https://docs.fleetless.dev/reference/fleetless-yaml/live/#which-encoders-are-proven).
+Before relying on one, run `tools/encoder-proof/` on the machine: it runs the
+chain with a moving pattern and says whether it delivers what the bridge
+needs.
+
+The hardware encoders are reached through GStreamer, which the package does
+not depend on. Everything but `software` needs `python3-gi`,
+`gir1.2-gstreamer-1.0`, `gir1.2-gst-plugins-base-1.0`,
+`gstreamer1.0-plugins-base` and `gstreamer1.0-plugins-bad` on the robot, and
+the plugin with the encoder element: on a Jetson it comes with L4T,
+`gstreamer1.0-plugins-bad` has `nvh264enc` and `vah264enc`,
+`gstreamer1.0-vaapi` has `vaapih264enc`, and `gstreamer1.0-plugins-good` has
+`v4l2h264enc`.
+
+**A hardware encoder that does not start costs no stream.** If GStreamer is
+missing, no chain can be built, or a chain returns nothing within a second
+for a frame, that session is encoded in software H.264 instead and the bridge
+logs one warning with the backend, the chain and the reason. A chain that
+failed is not tried again until `live.encoder` changes or the bridge
+restarts. The fallback catches an encoder that fails. It does not catch one
+that draws a wrong picture, so look at the stream once after choosing one.
+
+With a hardware encoder the bitrate follows `bitrate_kbps` over its whole
+range. The software encoders clamp it: VP8 to 250 to 1500 kbps, H.264 to 500
+to 3000 kbps.
+
 ## 📄 What the robot exposes
 
 Nothing, on its own. What a robot exposes is a document, `fleetless.yaml`,

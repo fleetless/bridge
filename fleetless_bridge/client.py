@@ -1405,8 +1405,8 @@ class BridgeClient:
 
     def _on_live_params(self, values: Dict[str, Any]) -> None:
         """A `ros2 param set` of a `live.*` parameter the runtime already
-        validated and accepted. Needs no session: the packet size is the
-        robot's own."""
+        validated and accepted. Needs no session: the packet size and the
+        encoder are the robot's own."""
         previous = self._param_live
         self._param_live = dict(values)
         if not self._apply_live_settings():
@@ -1433,30 +1433,42 @@ class BridgeClient:
         caller puts its layer back. The runtime is told only on a change:
         every reconnect brings the same config again, and a stream is not
         re-capped at the number it already has."""
+        in_force = self._live_settings
         try:
             settings = LiveSettings.resolve(self._param_live, self._yaml_live)
         except ValueError as exc:
             log.error(
-                "%s. The bridge keeps sending RTP packets of at most %d bytes.",
-                exc, self._live_settings.max_packet_bytes,
+                "%s. The bridge keeps sending RTP packets of at most %d bytes, "
+                "encoded by %s.",
+                exc, in_force.max_packet_bytes, in_force.encoder,
             )
             return False
-        if settings == self._live_settings:
+        if settings == in_force:
             return True
         if self._ros is not None:
             try:
-                in_force = self._ros.set_live_settings(settings)
-            except Exception:  # noqa: BLE001 - a packet size must not cost the session
+                packet_bytes = self._ros.set_live_settings(settings)
+            except Exception:  # noqa: BLE001 - a live setting must not cost the session
                 log.exception(
-                    "Unexpected error applying live.max_packet_bytes=%d; the bridge "
-                    "keeps sending RTP packets of at most %d bytes",
-                    settings.max_packet_bytes, self._live_settings.max_packet_bytes,
+                    "Unexpected error applying live.max_packet_bytes=%d and "
+                    "live.encoder=%s; the bridge keeps sending RTP packets of at most "
+                    "%d bytes, encoded by %s",
+                    settings.max_packet_bytes, settings.encoder,
+                    in_force.max_packet_bytes, in_force.encoder,
                 )
                 return False
-            log.info(
-                "live.max_packet_bytes is %d: RTP packets are at most %d bytes from "
-                "the next frame on", settings.max_packet_bytes, in_force,
-            )
+            # One line per setting that moved, each saying from when it holds.
+            if settings.max_packet_bytes != in_force.max_packet_bytes:
+                log.info(
+                    "live.max_packet_bytes is %d: RTP packets are at most %d bytes from "
+                    "the next frame on", settings.max_packet_bytes, packet_bytes,
+                )
+            if settings.encoder != in_force.encoder:
+                log.info(
+                    "live.encoder is %s: it encodes live video from the next live "
+                    "start on; a running stream keeps the encoder it has",
+                    settings.encoder,
+                )
         self._live_settings = settings
         return True
 

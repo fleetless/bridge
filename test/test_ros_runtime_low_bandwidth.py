@@ -81,7 +81,7 @@ class _LivePublisher:
     paused = False
 
     def __init__(self, *, holder, width, height, fps, bitrate_kbps, on_lost=None,
-                 slug=None, received_s=None, on_resume=None):
+                 slug=None, received_s=None, on_resume=None, encoder=None):
         self.bitrate_kbps = bitrate_kbps
         self.on_lost = on_lost
         self.start_calls = []

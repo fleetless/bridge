@@ -110,6 +110,7 @@ from aiortc.sdp import candidate_from_sdp
 from av import VideoFrame
 
 from fleetless_bridge.camera import LatestFrameHolder
+from fleetless_bridge.live_encoder import MAX_BITRATE_BPS, MIN_BITRATE_BPS
 from fleetless_bridge.live_settings import check_max_packet_bytes
 from fleetless_bridge.livekit_signal import IceServer, SignalClient
 from fleetless_bridge.protocol import LIVE_DEFAULTS
@@ -156,6 +157,10 @@ SENDER_ENCODER_ATTR = "_RTCRtpSender__encoder"
 ENCODER_CLAMP_BPS = {
     "Vp8Encoder": (250_000, 1_500_000),
     "H264Encoder": (500_000, 3_000_000),
+    # The bridge's own encoder takes what the configuration allows for
+    # `bitrate_kbps`, so no configured budget is outside it and the line
+    # below has nothing to say for it.
+    "HardwareH264Encoder": (MIN_BITRATE_BPS, MAX_BITRATE_BPS),
 }
 
 #: How long a teardown waits for an encoder's `close()`. Closing can wait for
@@ -549,6 +554,9 @@ class LivePublisher:
         self._signal_factory = signal_factory or _default_signal_factory
         # Ours to close from this line on; `_teardown` takes it exactly once.
         self._encoder = encoder
+        # Stays true after the encoder is closed and gone: a publisher that
+        # was built around an encoder never publishes without one.
+        self._encoder_given = encoder is not None
         self._bitrate_interval_s = bitrate_interval_s
         # Called at most once, with a human-readable reason, when publishing
         # stops on its own — a transport loss (server restart, media
@@ -786,6 +794,16 @@ class LivePublisher:
         """
         sender = pc.addTrack(track)
         encoder = self._encoder
+        if encoder is None and self._encoder_given:
+            # A start after the teardown has closed the encoder: a second
+            # `start()` on a stopped publisher, or a loss that overtook a
+            # start in flight. Without this aiortc would build an encoder of
+            # its own and offer VP8 for a session that was to have neither.
+            log.error(
+                "The encoder of this session is already closed; live is not started "
+                "with another one in its place"
+            )
+            raise EncoderNotInstalled()
         if encoder is None:
             return sender
         if not hasattr(sender, SENDER_ENCODER_ATTR):

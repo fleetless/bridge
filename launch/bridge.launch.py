@@ -70,6 +70,10 @@ def generate_launch_description() -> LaunchDescription:
                 # 576 to 1350. At its default too, and overridden by the
                 # `live` section of the published `fleetless.yaml`.
                 "live.max_packet_bytes": 1200,
+                # What encodes live video: software, auto, nvenc, vaapi or
+                # v4l2. Everything but software needs GStreamer on the robot
+                # and falls back to software when the encoder does not start.
+                "live.encoder": "software",
             }],
         ),
     ])
