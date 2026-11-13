@@ -55,15 +55,26 @@ that is handed an `encoder` uses that object instead:
   the packet cap do too. aiortc calls it in a worker thread, one frame at a
   time, with the `av.VideoFrame` the track produced; `force_keyframe` is a
   viewer's keyframe request. Yielding nothing sends nothing for that frame.
+- **What it must never do: raise.** aiortc catches whatever `encode()`
+  raises, logs the traceback with its message at WARNING, stops the track
+  and ends its sending loop for good. The connection stays up, `on_lost` is
+  not called, and the viewer keeps a frozen picture that the cloud still
+  believes is live. An exception's message can carry a camera URL, and that
+  log line is not this package's to redact. So an encoder catches everything
+  inside `_encode_frame`, logs by type name only, and either yields nothing
+  for that frame or falls back to another way of encoding it.
+- **`force_keyframe` arrives once.** aiortc clears its flag before the call.
+  An encoder that cannot make the keyframe on that very frame has to
+  remember that it owes one.
 - **How it gets in.** `LivePublisher(encoder=...)`, one encoder per
   publisher. It is set on the sender right after `addTrack`, on the
   connection made after a TURN failure as well, and the offer is restricted
   to H.264: the codec is the encoder's, so it cannot be left to the answer.
 - **Who closes it.** The publisher, once, in every teardown: `stop()`, a
   failed start, a lost session. aiortc never closes an encoder. `close()`
-  runs in a worker thread after the peer connection is closed. An `encode()`
-  that was already running may still be running then, so an encoder that
-  holds something keeps the two apart itself.
+  runs in a thread of its own after the peer connection is closed. An
+  `encode()` that was already running may still be running then, so an
+  encoder that holds something keeps the two apart itself.
 """
 from __future__ import annotations
 
@@ -71,6 +82,7 @@ import asyncio
 import importlib
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
@@ -148,6 +160,8 @@ ENCODER_CLAMP_BPS = {
 #: How long a teardown waits for an encoder's `close()`. Closing can wait for
 #: a frame that is still being encoded; it cannot be allowed to hold a camera's
 #: stop for good, because the next start of that camera waits for the stop.
+#: A close that takes longer is left behind in its own thread, which nothing
+#: waits for, the end of the process included.
 ENCODER_CLOSE_TIMEOUT_S = 5.0
 
 
@@ -850,7 +864,7 @@ class LivePublisher:
                 log.error("Error closing a live signalling socket: %s", type(exc).__name__)
 
     async def _close_encoder(self, encoder) -> None:
-        """`encoder.close()`, in a worker thread, waited for at most
+        """`encoder.close()`, in a thread of its own, waited for at most
         `ENCODER_CLOSE_TIMEOUT_S`.
 
         A thread, because closing may wait for a frame that is still being
@@ -859,24 +873,55 @@ class LivePublisher:
         `stop()`. Whatever goes wrong is logged by type name and goes no
         further: an encoder can hold a camera URL, and nothing on this path
         may print one. An encoder without a `close` has nothing to release.
+
+        **Its own daemon thread, not one of the loop's.** The loop's worker
+        threads are waited for when the loop ends: `asyncio.run()` does not
+        return, and the interpreter does not exit, while one of them is
+        still inside a call. A close that never returns would then hold
+        every stop of the bridge, the ones it decides on itself included,
+        and until then it would occupy one of the workers every camera's
+        `encode()` shares. A daemon thread is waited for by nobody. If it is
+        still inside `close()` when the process ends, the process ends.
         """
         close = getattr(encoder, "close", None)
         if not callable(close):
             return
-        closing = asyncio.get_running_loop().run_in_executor(None, close)
-        # Looked at even if nobody waits any longer, so a late failure is not
-        # reported by the garbage collector with its message.
-        closing.add_done_callback(lambda done: done.cancelled() or done.exception())
-        finished, _ = await asyncio.wait({closing}, timeout=ENCODER_CLOSE_TIMEOUT_S)
+        loop = asyncio.get_running_loop()
+        closed: "asyncio.Future[Optional[BaseException]]" = loop.create_future()
+
+        def settle(error: Optional[BaseException]) -> None:
+            # A result, never an exception: a failure that arrives after
+            # nobody waits any longer must not be reported by the garbage
+            # collector, with its message.
+            if not closed.done():
+                closed.set_result(error)
+
+        def run() -> None:
+            error: Optional[BaseException] = None
+            try:
+                close()
+            except BaseException as exc:  # noqa: BLE001 - reported on the loop, by type name
+                error = exc
+            try:
+                loop.call_soon_threadsafe(settle, error)
+            except RuntimeError:
+                pass  # the loop is closed: the wait below ended long ago
+
+        try:
+            threading.Thread(target=run, name="live-encoder-close", daemon=True).start()
+        except Exception as exc:  # noqa: BLE001 - no thread to be had; the teardown goes on
+            log.error("Error closing a live encoder: %s", type(exc).__name__)
+            return
+        finished, _ = await asyncio.wait({closed}, timeout=ENCODER_CLOSE_TIMEOUT_S)
         if not finished:
             log.error(
                 "A live encoder did not finish closing within %g s; it is left behind",
                 ENCODER_CLOSE_TIMEOUT_S,
             )
             return
-        exc = closing.exception()
-        if exc is not None:
-            log.error("Error closing a live encoder: %s", type(exc).__name__)
+        error = closed.result()
+        if error is not None:
+            log.error("Error closing a live encoder: %s", type(error).__name__)
 
     async def _cancel_feed(self) -> None:
         task, self._feed_task = self._feed_task, None

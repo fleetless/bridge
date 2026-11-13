@@ -14,7 +14,11 @@ question it answers is whether aiortc 1.3.0, 1.6.0 and 1.14.0 really call
 No GStreamer here and no setting: the encoder is whatever the test hands over.
 """
 import asyncio
+import pathlib
+import subprocess
+import sys
 import threading
+import time
 from fractions import Fraction
 
 import av
@@ -280,9 +284,9 @@ def test_stop_closes_the_encoder_once_after_the_connection_and_off_the_loop():
     # signalling socket, which is the last thing with anything to say.
     closing = [e for e in events if e in ("pc.close", "encoder.close", "signal.close")]
     assert closing == ["pc.close", "encoder.close", "signal.close"]
-    # In a worker thread: closing a pipeline can wait for a frame in flight,
-    # and the loop has other cameras to serve.
-    assert encoder.close_threads != [loop_thread]
+    # In a thread of its own: closing a pipeline can wait for a frame in
+    # flight, and the loop has other cameras to serve.
+    assert len(encoder.close_threads) == 1 and encoder.close_threads != [loop_thread]
 
 
 def test_a_failed_join_closes_the_encoder():
@@ -415,6 +419,100 @@ def test_a_close_that_does_not_return_is_left_behind_after_the_wait(monkeypatch)
     assert took < 5.0
     assert signal.close_calls == 1
     assert any("did not finish closing" in line for line in logged)
+
+
+def test_a_close_that_never_returns_does_not_hold_the_process_at_exit():
+    """The bridge runs inside `asyncio.run()`, and `asyncio.run()` waits for
+    the loop's own worker threads when it ends. A close that is stuck there
+    would hold every stop of the bridge until something killed it. So the
+    close has a thread of its own that nothing waits for.
+
+    A fresh interpreter with a time limit, because the thing under test is
+    how the process ends: the close below blocks for a minute, and the whole
+    run has to be over in a fraction of that."""
+    script = """
+import asyncio, sys, threading, time
+sys.path.insert(0, "test")
+from fleetless_bridge import live
+from test_live import _FakeSignal, _FakeTrack, _publisher
+from test_live_encoder_seam import _SeamConnection
+
+live.ENCODER_CLOSE_TIMEOUT_S = 0.2
+entered = threading.Event()
+
+class Stuck:
+    target_bitrate = 1_000_000
+    def close(self):
+        entered.set()
+        time.sleep(60)
+
+async def scenario():
+    pub = _publisher(_FakeSignal(), _SeamConnection(), _FakeTrack(), encoder=Stuck())
+    await pub.start("wss://media.example", "room-1", "test-token")
+    await pub.stop()
+
+began = time.monotonic()
+asyncio.run(scenario())
+print("returned", entered.is_set(), round(time.monotonic() - began, 1), flush=True)
+"""
+    began = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=30,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    took = time.monotonic() - began
+    assert done.returncode == 0, done.stderr[-2000:]
+    said = done.stdout.split()
+    # `close()` was really entered and is still inside its minute...
+    assert said[:2] == ["returned", "True"], done.stdout
+    # ...and neither `asyncio.run()` nor the interpreter waited for it.
+    assert float(said[2]) < 10.0
+    assert took < 20.0
+
+
+def test_a_close_that_finishes_after_the_wait_is_over_is_not_reported_twice(monkeypatch):
+    """Left behind, and then it returns after all, or fails after all: that
+    late end goes to nobody, and above all not to a log with its message."""
+    monkeypatch.setattr(live, "ENCODER_CLOSE_TIMEOUT_S", 0.05)
+
+    class _Late(_Encoder):
+        def __init__(self):
+            super().__init__()
+            self.release = threading.Event()
+            self.left = threading.Event()
+
+        def close(self):
+            super().close()
+            self.release.wait(10.0)
+            try:
+                raise RuntimeError("rtsp://user:secret@camera/ went away")
+            finally:
+                self.left.set()
+
+    async def scenario():
+        encoder = _Late()
+        handler, watched = _capturing()
+        try:
+            pub = _publisher(_FakeSignal(), _SeamConnection(), _FakeTrack(), encoder=encoder)
+            await pub.start("wss://media.example", "room-1", "test-token")
+            await pub.stop()
+            encoder.release.set()
+            for _ in range(200):
+                if encoder.left.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)  # the loop gets to hear about it
+            return encoder.left.is_set(), handler.messages[:]
+        finally:
+            encoder.release.set()
+            watched.removeHandler(handler)
+
+    left, logged = asyncio.run(scenario())
+    assert left
+    about_the_encoder = [line for line in logged if "encoder" in line.lower()]
+    assert len(about_the_encoder) == 1 and "did not finish closing" in about_the_encoder[0]
+    assert not any("secret" in line for line in logged)
 
 
 def test_an_encoder_without_a_close_is_not_an_error():
