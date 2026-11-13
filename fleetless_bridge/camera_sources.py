@@ -60,10 +60,12 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
+import av
 import cv2
 import numpy as np
 
 from fleetless_bridge import sampling
+from fleetless_bridge.passthrough import PassthroughRefused
 
 log = logging.getLogger(__name__)
 
@@ -1327,3 +1329,214 @@ class V4l2SourceAdapter(_ThreadedSourceAdapter):
             worker = self._worker
         if worker is not None:
             worker.stop()
+
+
+# --- RTSP passthrough ------------------------------------------------------------
+
+
+# One bound for the open and for every read after it, in seconds: the value
+# the decoding adapter gives ffmpeg as `stimeout`. Here it goes to PyAV's own
+# `timeout`, which interrupts a blocking call from inside libavformat and so
+# does not depend on a demuxer option -- `stimeout` exists in ffmpeg 4 only,
+# and its successor has another name and another unit.
+_RTSP_DEMUX_TIMEOUT_S = _RTSP_SOCKET_TIMEOUT_US / 1_000_000
+
+# How long libavformat may read ahead to describe the stream before `open`
+# returns, in microseconds. The bridge needs the codec, which the session
+# description names; everything else it reads from the SPS itself. Left at
+# ffmpeg's default the open takes about a second on a live stream, and five
+# on one that stalls.
+_RTSP_ANALYZE_DURATION_US = 200_000
+
+# What ffmpeg calls the codecs a camera is likely to send instead.
+_CODEC_DISPLAY_NAMES = {"hevc": "H.265", "mjpeg": "MJPEG", "mpeg4": "MPEG-4", "vp8": "VP8", "vp9": "VP9", "av1": "AV1"}
+
+
+def _default_rtsp_demux_factory(url: str, transport: str, timeout_s: float = _RTSP_DEMUX_TIMEOUT_S):
+    """Opens `url` with PyAV for demuxing. Nothing is decoded here or by the
+    caller: the container hands out packets.
+
+    `fflags=nobuffer` keeps libavformat from queueing what it read while
+    describing the stream and handing it over afterwards in one burst; those
+    first packets are dropped instead, and forwarding starts at a keyframe
+    anyway.
+
+    Native diagnostics are suppressed around the open for the same reason as
+    in `_default_rtsp_capture_factory`: the URL carries the credentials."""
+    with _suppress_native_stderr():
+        return av.open(
+            url,
+            mode="r",
+            format="rtsp",
+            options={
+                "rtsp_transport": transport,
+                "fflags": "nobuffer",
+                "analyzeduration": str(_RTSP_ANALYZE_DURATION_US),
+            },
+            timeout=(timeout_s, timeout_s),
+        )
+
+
+class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
+    """`kind: 'rtsp'` with `passthrough: true`: the camera's H.264 is read
+    packet by packet and handed on as it is. Nothing is decoded.
+
+    Around the stream it does what `RtspSourceAdapter` does, with the same
+    functions: the scheme is validated at construction, the preflight
+    classifies a failure before ffmpeg tries, the credentials reach the URL at
+    connect time and no log line, and the shared loop reconnects with backoff.
+
+    **It feeds a stream, not a frame callback.** `stream` is the camera's
+    `passthrough.PassthroughStream`; this adapter's thread calls `reset()` at
+    every connect, `set_parameter_sets()` with what the session description
+    carried, and `push()` for every access unit. The units therefore never
+    cross the ROS executor on their way to the sender. `on_healthy(timestamp_ms)`
+    is called once per connection, when the stream has accepted its first
+    keyframe; `on_error` as for every adapter.
+
+    **A refused stream stays connected.** A wrong size, B-frames or a missing
+    keyframe are reported once (`source_error`, with the stream's sentence)
+    and the adapter keeps reading: the stream decides when the cause is gone,
+    and reconnecting would fetch the same stream again. A codec other than
+    H.264 is known at connect and goes through the reconnect loop instead,
+    since there is nothing to read.
+
+    PyAV's exceptions carry the URL they were opened with, credentials
+    included. None is chained, quoted or logged: type names only."""
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        transport: str,
+        credentials: Optional[Credentials],
+        stream,
+        on_healthy: Callable[[int], None],
+        on_error: OnError,
+        demux_factory: Optional[Callable[[str, str], object]] = None,
+        socket_factory: Callable[[str, int, float], "socket.socket"] = _default_socket_factory,
+        backoff: Optional[Backoff] = None,
+    ) -> None:
+        validate_source_scheme(url, ("rtsp", "rtsps"))  # see its own docstring
+        super().__init__(on_frame=_no_frames, on_error=on_error, backoff=backoff)
+        self._url = url
+        self._transport = transport
+        self._credentials = credentials
+        self._stream = stream
+        self._on_healthy = on_healthy
+        self._demux_factory = demux_factory or _default_rtsp_demux_factory
+        self._socket_factory = socket_factory
+        self._healthy = False
+        self._refusal_reported: Optional[str] = None
+
+    def _connect_and_read(self) -> None:
+        preflight = _rtsp_preflight(self._url, self._credentials, socket_factory=self._socket_factory)
+        if not preflight.ok:
+            raise preflight.error
+
+        try:
+            container = self._demux_factory(
+                _credentialed_url(self._url, self._credentials), self._transport
+            )
+        except Exception as exc:  # noqa: BLE001 - PyAV's message quotes the URL
+            if preflight.scheme:
+                raise _SourceError(
+                    "source_auth_unclassified",
+                    "authentication required, scheme not classified ({})".format(preflight.scheme),
+                ) from None
+            raise _SourceError(
+                "source_unavailable",
+                "could not open the RTSP stream ({})".format(type(exc).__name__),
+            ) from None
+
+        try:
+            self._read(container)
+        except _SourceError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - same rule: the type, never the text
+            raise _SourceError(
+                "source_unavailable",
+                "the camera stopped delivering packets ({})".format(type(exc).__name__),
+            ) from None
+        finally:
+            try:
+                container.close()  # always from this thread, as for a capture
+            except Exception as exc:  # noqa: BLE001 - already leaving; nothing to report to
+                log.debug("Error closing an RTSP container: %s", type(exc).__name__)
+
+    def _read(self, container) -> None:
+        videos = list(container.streams.video)
+        if not videos:
+            raise _SourceError("source_error", "the RTSP stream carries no video")
+        video = videos[0]
+        codec = video.codec_context.name
+        if codec != "h264":
+            raise _SourceError(
+                "source_error",
+                "the stream is {} and not H.264; passthrough forwards H.264 only".format(
+                    _CODEC_DISPLAY_NAMES.get(codec, codec)
+                ),
+            )
+
+        self._healthy = False
+        if self._last_reported_code != "source_error":
+            # Whatever was reported last was about reaching the camera. A
+            # refusal that still stands is said again, so the camera's state
+            # is the stream's and not the outage's.
+            self._refusal_reported = None
+        self._stream.reset()
+        extradata = video.codec_context.extradata
+        if extradata:
+            try:
+                self._stream.set_parameter_sets(bytes(extradata))
+            except PassthroughRefused as refused:
+                self._report_refusal(str(refused))
+            except ValueError:
+                pass  # sets that do not parse; the stream may carry its own
+
+        for packet in container.demux(video):
+            if self._stop_event.is_set():
+                return
+            timestamp_ms = sampling.capture_timestamp_ms()
+            data = bytes(packet)
+            if not data:
+                continue  # the empty packet some PyAV versions end a stream with
+            try:
+                accepted = self._stream.push(data, timestamp_ms)
+            except PassthroughRefused as refused:
+                self._healthy = False
+                self._report_refusal(str(refused))
+                continue
+            if accepted and not self._healthy:
+                self._note_healthy(timestamp_ms)
+        if self._stop_event.is_set():
+            return
+        # The iteration ended: the camera closed the session, or (PyAV 8) a
+        # read ran into the timeout, which that version reports as an end.
+        raise _SourceError("source_unavailable", "the camera stopped delivering packets")
+
+    def _report_refusal(self, message: str) -> None:
+        if message == self._refusal_reported:
+            return
+        self._refusal_reported = message
+        self._last_reported_code = None  # same code, new sentence: say it
+        self._report_once("source_error", message)
+
+    def _note_healthy(self, timestamp_ms: int) -> None:
+        """The first accepted keyframe of this connection: the camera works.
+        The backoff and the error memory start over here, not when the loop
+        returns -- a camera that ran for a day and then fails must be reported
+        again, and must be retried soon."""
+        self._healthy = True
+        self._refusal_reported = None
+        self._last_reported_code = None
+        self._backoff.reset()
+        try:
+            self._on_healthy(timestamp_ms)
+        except Exception as exc:  # noqa: BLE001 - same module-wide rule as `_report_once`
+            log.error("Error reporting a healthy camera source: %s (message redacted)", type(exc).__name__)
+
+
+def _no_frames(bgr: "np.ndarray", timestamp_ms: int) -> None:
+    """A passthrough adapter decodes nothing and so has no frame to hand
+    over; `_ThreadedSourceAdapter` wants a callback all the same."""
