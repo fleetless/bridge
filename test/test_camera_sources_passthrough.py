@@ -404,6 +404,40 @@ def test_a_refused_stream_is_reported_once_and_stays_connected(units):
     assert stream.newest_keyframe() is None
 
 
+def test_a_refusal_is_said_again_after_an_rtsp_status_came_in_between(units, monkeypatch):
+    """A camera of the wrong size that somebody power-cycles: refused, gone,
+    "503" while it boots, and then the same stream as before. The refusal
+    is what is true again, and it is reported in that session -- the
+    camera's state must not stay at the answer it gave while booting."""
+    real_preflight = camera_sources._rtsp_preflight
+    connections = []
+
+    def preflight(url, credentials, **kwargs):
+        connections.append(None)
+        if len(connections) == 2:
+            return camera_sources._PreflightResult(
+                False, None,
+                camera_sources._SourceError("source_error", "the camera answered RTSP 503"),
+            )
+        return real_preflight(url, credentials, **kwargs)
+
+    monkeypatch.setattr(camera_sources, "_rtsp_preflight", preflight)
+    stream = passthrough.PassthroughStream(width=640, height=480, slug="yard")
+    reports = _Reports()
+    # Thirty units a session, then the camera hangs up.
+    with RtspTestServer(units, fps=120.0) as server, _running(server, stream, reports):
+        wait_until(lambda: len(reports.errors) >= 4, timeout=20.0)
+        seen = list(reports.errors[:4])
+    assert [code for code, _ in seen] == [
+        "source_error", "source_unavailable", "source_error", "source_error",
+    ]
+    size_refusal = seen[0][1]
+    assert "320x240" in size_refusal and "640x480" in size_refusal
+    assert "503" in seen[2][1]
+    # The session after the 503 says what is wrong with the stream, again.
+    assert seen[3][1] == size_refusal
+
+
 def test_a_size_only_the_session_description_names_is_checked_too(units):
     """No unit of this stream carries an SPS; the size is in the SDP and
     nowhere else. The refusal naming it shows the adapter handed the sets

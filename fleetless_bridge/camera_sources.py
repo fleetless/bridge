@@ -1493,11 +1493,14 @@ class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
 
         self._healthy = False
         self._healthy_since = None
-        if self._last_reported_code != "source_error":
-            # Whatever was reported last was about reaching the camera. A
-            # refusal that still stands is said again, so the camera's state
-            # is the stream's and not the outage's.
-            self._refusal_reported = None
+        # A new session: whatever was reported since the last one was about
+        # reaching the camera -- the session that ended, an RTSP status, a
+        # closed port. A refusal that still stands is said again, so the
+        # camera's state is the stream's and not the outage's. Without a
+        # condition: a camera that answers 503 while it boots and then sends
+        # the stream it was refused for would otherwise stay "answered RTSP
+        # 503" for as long as it runs.
+        self._refusal_reported = None
         self._stream.reset()
         extradata = video.codec_context.extradata
         if extradata:
