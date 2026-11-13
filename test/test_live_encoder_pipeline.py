@@ -457,6 +457,43 @@ def test_a_chain_that_reports_an_error_while_running_fails_with_what_the_element
     assert pipeline.final_state == "null"
 
 
+def _post(pipeline, kind, text):
+    """Put a message on the pipeline's bus, as its encoder element would."""
+    Gst = pipeline._Gst
+    error = pipeline._GLib.Error.new_literal(Gst.StreamError.quark(), text, Gst.StreamError.FAILED)
+    make = Gst.Message.new_error if kind == "error" else Gst.Message.new_warning
+    assert pipeline._bus.post(make(pipeline._enc, error, "posted by the test"))
+
+
+def test_an_error_reported_while_units_still_come_is_believed_with_that_frame():
+    """Not at the next stall: an element that says it failed has failed,
+    whatever still comes out of the pipeline behind it."""
+    pipeline = _pipeline()
+    try:
+        assert pipeline.encode(moving_frame(0), False)
+        _post(pipeline, "error", "the device went away")
+        with pytest.raises(ChainFailed) as failed:
+            pipeline.encode(moving_frame(1), False)
+        assert failed.value.reason == "enc: the device went away"
+    finally:
+        pipeline.close()
+
+
+def test_the_bus_is_emptied_with_every_frame():
+    """A talkative element does not fill it for the length of a session,
+    and what it says that is not an error fails nothing."""
+    pipeline = _pipeline()
+    try:
+        for index in range(5):
+            for _ in range(20):
+                _post(pipeline, "warning", "a remark about frame {}".format(index))
+            assert pipeline.encode(moving_frame(index), False)
+            assert not pipeline._bus.have_pending()
+    finally:
+        pipeline.close()
+    assert pipeline.final_state == "null"
+
+
 def test_a_chain_that_delivers_nothing_fails_after_the_time_limit():
     silent = _variant(
         convert="videoconvert ! identity drop-probability=1.0",
