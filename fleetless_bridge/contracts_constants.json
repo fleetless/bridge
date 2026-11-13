@@ -47,12 +47,22 @@
     "camera_bitrate_kbps": 300
   },
   "LIVE_DEFAULTS": {
-    "max_packet_bytes": 1200
+    "max_packet_bytes": 1200,
+    "encoder": "software"
   },
   "LIVE_BOUNDS": {
     "max_packet_bytes": {
       "min": 576,
       "max": 1350
+    },
+    "encoder": {
+      "values": [
+        "software",
+        "auto",
+        "nvenc",
+        "vaapi",
+        "v4l2"
+      ]
     }
   }
 }

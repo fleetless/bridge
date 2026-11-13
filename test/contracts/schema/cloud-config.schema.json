@@ -1444,7 +1444,7 @@
                         "type": "string",
                         "maxLength": 255,
                         "pattern": "^[a-z][a-z0-9_]*\\/(?:msg|srv|action)\\/[A-Za-z][A-Za-z0-9]*$",
-                        "description": "The message type of `topic`: `sensor_msgs/msg/Image` for raw frames, `sensor_msgs/msg/CompressedImage` for a camera that already encodes. Declared here rather than introspected, so a camera can be configured for a robot that has never connected.",
+                        "description": "The message type of `topic`: `sensor_msgs/msg/Image` for raw frames, `sensor_msgs/msg/CompressedImage` for a camera that already encodes, `foxglove_msgs/msg/CompressedVideo` for a topic that carries H.264. H.264 is passed through to live viewers without the bridge decoding or encoding it: always for `CompressedVideo`, and for a `CompressedImage` whose `format` contains `h264`, in any case. A `CompressedImage` that carries JPEG stays a picture source. A camera that is passed through follows what `passthrough` says on an RTSP source: `width` and `height` must equal the stream's size, B-frames are refused, a new viewer waits for the next keyframe, and low-bandwidth mode ends its stream. The bridge does not depend on `foxglove_msgs`; a robot without the package reports `unknown type` for that one camera. Declared here rather than introspected, so a camera can be configured for a robot that has never connected.",
                         "patternErrorMessage": "A ROS 2 type name has three segments: the package, then `msg`, `srv` or `action`, then the type — `sensor_msgs/msg/BatteryState`, `std_srvs/srv/Trigger`, `nav2_msgs/action/NavigateToPose`. The middle segment is the one usually left out. The package is lower-case with underscores; the type itself is letters and digits, conventionally CamelCase.",
                         "examples": [
                           "sensor_msgs/msg/Image"
@@ -1465,7 +1465,7 @@
                         "body": {
                           "kind": "ros",
                           "topic": "${1:/camera/image_raw}",
-                          "type": "${2|sensor_msgs/msg/Image,sensor_msgs/msg/CompressedImage|}"
+                          "type": "${2|sensor_msgs/msg/Image,sensor_msgs/msg/CompressedImage,foxglove_msgs/msg/CompressedVideo|}"
                         }
                       }
                     ]
@@ -1476,7 +1476,7 @@
                       "kind": {
                         "type": "string",
                         "const": "rtsp",
-                        "description": "Selects the RTSP source: this camera then carries `url`, and optionally `transport` and `credentials`."
+                        "description": "Selects the RTSP source: this camera then carries `url`, and optionally `transport`, `passthrough` and `credentials`."
                       },
                       "url": {
                         "type": "string",
@@ -1500,6 +1500,10 @@
                           "tcp",
                           "udp"
                         ]
+                      },
+                      "passthrough": {
+                        "description": "Passes the camera's own H.264 through to live viewers: the bridge forwards the access units it receives and neither decodes nor encodes the live video. A snapshot is decoded from the newest keyframe, so it is at most one keyframe interval old. Omitted means `false`: the stream is decoded and encoded again, and `fps` and `bitrate_kbps` are enforced. With `true`, `width` and `height` must equal the stream's own size, or the camera reports an error naming both and publishes nothing. `fps` and `bitrate_kbps` are not enforced then: the bridge cannot drop or shrink frames it does not encode, so both are set at the camera. The stream must be H.264 without B-frames; anything else is refused with a camera error. A new viewer waits for the camera's next keyframe, so set its keyframe interval to one to two seconds. Low-bandwidth mode ends such a stream, under `camera: reduce` as under `stop`: there is no bitrate to lower.",
+                        "type": "boolean"
                       },
                       "credentials": {
                         "type": "object",
@@ -1664,7 +1668,7 @@
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 7680,
-                "description": "The width the bridge scales frames to before sending, in pixels — what the bridge produces, not what the sensor captures; a snapshot can arrive narrower, since the bridge reduces both dimensions together to fit its JPEG byte ceiling. It stands in the configuration and never in a viewer's request, so no client can make the robot encode a larger frame than the developer allowed.",
+                "description": "The width the bridge scales frames to before sending, in pixels — what the bridge produces, not what the sensor captures; a snapshot can arrive narrower, since the bridge reduces both dimensions together to fit its JPEG byte ceiling. It stands in the configuration and never in a viewer's request, so no client can make the robot encode a larger frame than the developer allowed. A passthrough camera is the exception for live video: the bridge does not scale what it does not encode, so `width` and `height` must equal the stream's own size.",
                 "examples": [
                   1280
                 ]
@@ -1673,7 +1677,7 @@
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 4320,
-                "description": "The height the bridge scales every frame to, in pixels; with `width` it is the size the live stream carries. A snapshot can arrive **smaller** than this — its JPEG has a byte ceiling, and the bridge gives up quality first and then resolution to fit, reporting the size it actually encoded.",
+                "description": "The height the bridge scales every frame to, in pixels; with `width` it is the size the live stream carries. A snapshot can arrive **smaller** than this — its JPEG has a byte ceiling, and the bridge gives up quality first and then resolution to fit, reporting the size it actually encoded. The live video of a passthrough camera is not scaled: `height` and `width` must equal the stream's own size.",
                 "examples": [
                   720
                 ]
@@ -1682,7 +1686,7 @@
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 60,
-                "description": "How many frames a second the bridge forwards, at most. It is a ceiling, not a clock: a camera that delivers ten frames a second stays at ten. Both modes read the same throttled pipeline, so this also bounds how fresh a snapshot can be.",
+                "description": "How many frames a second the bridge forwards, at most. It is a ceiling, not a clock: a camera that delivers ten frames a second stays at ten. Both modes read the same throttled pipeline, so this also bounds how fresh a snapshot can be. A passthrough camera is the exception: the bridge forwards its H.264 at the rate the source sends it, and `fps` only bounds how often a snapshot is taken.",
                 "examples": [
                   15
                 ]
@@ -1691,7 +1695,7 @@
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 50000,
-                "description": "The ceiling for the **live** encoding, in kilobits per second — this is what bounds a watched camera against the robot's uplink. Snapshots are not covered by it: they are JPEGs under their own byte ceiling. Raising `width`, `height` or `fps` against a fixed bitrate buys blur, not detail.",
+                "description": "The ceiling for the **live** encoding, in kilobits per second — this is what bounds a watched camera against the robot's uplink. Snapshots are not covered by it: they are JPEGs under their own byte ceiling. Raising `width`, `height` or `fps` against a fixed bitrate buys blur, not detail. A passthrough camera is not encoded by the bridge, so nothing enforces this number there: the bitrate is set at the source, and this value is only what the track declares to the media server.",
                 "examples": [
                   2000
                 ]
@@ -2041,7 +2045,7 @@
             "camera": {
               "description": "What happens to a running stream in the mode. New streams are refused either way.",
               "enumDescriptions": [
-                "A running stream is re-encoded at `camera_bitrate_kbps` and keeps running. A viewer sees a worse picture rather than none.",
+                "A running stream is re-encoded at `camera_bitrate_kbps` and keeps running. A viewer sees a worse picture rather than none. A passthrough camera is the exception: the bridge does not encode it, so its stream ends as under `stop`.",
                 "A running stream ends and the viewer is told why. The uplink is then free for datapoints, which is the right trade where video is the nice-to-have."
               ],
               "type": "string",
@@ -2051,7 +2055,7 @@
               ]
             },
             "camera_bitrate_kbps": {
-              "description": "Bitrate applied to running streams under `reduce`.",
+              "description": "Bitrate applied to running streams under `reduce`. A passthrough stream is not encoded by the bridge, so there is no bitrate to reduce and the stream ends.",
               "type": "integer",
               "minimum": 50,
               "maximum": 20000
@@ -2080,6 +2084,24 @@
               "type": "integer",
               "minimum": 576,
               "maximum": 1350
+            },
+            "encoder": {
+              "description": "What encodes live video on the robot. `software` is the bridge's own encoder on the CPU. Every other value sends H.264 from a hardware encoder, reached through GStreamer, which the robot has to have installed. An encoder that does not start, or stops delivering, is replaced by software H.264 for the rest of that session, with one warning in the bridge's log; one that did not start is not tried again until this setting changes or the bridge restarts. The fallback catches an encoder that fails, not one that draws a wrong picture, so look at the stream once after choosing one. The hardware encoders are written from the documentation of their GStreamer elements and tested through a software stand-in; the reference page of this section says which have been proven on hardware. It is one setting for the robot, not one per camera: the chip is part of the computer. It does not apply to a camera whose source already delivers H.264 and is passed through: that video is forwarded, not encoded. Overrides the bridge's ROS parameter `live.encoder`; without either, the bridge uses `software`. A change holds from the next live start; a running stream keeps its encoder.",
+              "enumDescriptions": [
+                "The bridge encodes on the CPU: VP8 or H.264, whichever the media server picks, as every robot did before the setting existed.",
+                "Tries `nvenc`, then `vaapi`, then `v4l2`, and uses the first that starts. With none of them, software H.264.",
+                "NVIDIA. On a Jetson the board's encoder (`nvv4l2h264enc`); a Jetson Orin Nano has none and ends on software. On a desktop card `nvh264enc`.",
+                "Intel and AMD graphics through VA-API: `vah264enc` where the installed GStreamer has it, else `vaapih264enc`.",
+                "A V4L2 encoder (`v4l2h264enc`), as on a Raspberry Pi 4. A Raspberry Pi 5 has no hardware encoder and ends on software."
+              ],
+              "type": "string",
+              "enum": [
+                "software",
+                "auto",
+                "nvenc",
+                "vaapi",
+                "v4l2"
+              ]
             }
           },
           "additionalProperties": false
