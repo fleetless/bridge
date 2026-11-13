@@ -26,6 +26,7 @@ from aiortc.mediastreams import MediaStreamError
 
 from fleetless_bridge.camera import LatestFrameHolder
 from fleetless_bridge.live import (
+    EARLY_FRAME_MIN_INTERVAL_S,
     SENDER_ENCODER_ATTR,
     CameraTrack,
     LivePublisher,
@@ -196,7 +197,11 @@ class _FakeTrack:
         self.id = "fake-track-id"
         self.pushed = []
         self.stop_calls = 0
+        self.early_frame_requests = 0
         self._fail_first_n = fail_first_n
+
+    def request_early_frame(self):
+        self.early_frame_requests += 1
 
     def push(self, rgb):
         if self._fail_first_n > 0:
@@ -1461,6 +1466,165 @@ def test_subscribed_codecs_are_read_as_well_as_subscribed_qualities():
     assert sender.replaced == [None]
 
 
+# --- a keyframe request -------------------------------------------------------
+
+
+def test_the_publisher_makes_a_keyframe_request_wake_the_track():
+    """A viewer that lost a keyframe asks for another (PLI), and aiortc's
+    sender answers by flagging the next frame it encodes. That frame is the
+    track's to produce, and the track was asleep until its next tick. The
+    publisher makes the same request wake it."""
+
+    async def scenario():
+        pub, _, connection, track = _started()
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        before = (connection.sender.keyframes, track.early_frame_requests)
+        connection.sender._send_keyframe()  # what aiortc calls on a PLI
+        connection.sender._send_keyframe()
+        after = (connection.sender.keyframes, track.early_frame_requests)
+        await pub.stop()
+        return before, after
+
+    before, after = asyncio.run(scenario())
+    assert before == (0, 0)
+    # aiortc's own flag is still set every time; the track decides for itself
+    # how often it lets itself be woken.
+    assert after == (2, 2)
+
+
+def test_a_keyframe_request_reaches_a_real_track_through_the_publisher():
+    """Both halves together, with the real track: 2 fps, a request 100 ms
+    into the interval, and the frame is there long before the tick."""
+
+    async def scenario():
+        holder = LatestFrameHolder()
+        holder.set(_solid_frame(), timestamp_ms=100)
+        track = CameraTrack(6, 4, 2)
+        pub, _, connection, _ = _started(holder=holder, fps=2, track=track)
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.wait_for(track.recv(), 1.0)
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.1)
+        waiting = not pending.done()
+        asked = time.monotonic()
+        connection.sender._send_keyframe()
+        await asyncio.wait_for(pending, 1.0)
+        answered_in = time.monotonic() - asked
+        await pub.stop()
+        return waiting, answered_in
+
+    waiting, answered_in = asyncio.run(scenario())
+    assert waiting is True
+    assert answered_in < 0.2  # the tick was 400 ms away
+
+
+def test_a_resume_also_wakes_the_track():
+    """A resume asks for a keyframe through the same method, so the viewer
+    that came back gets its first frame without the tick as well."""
+
+    async def scenario():
+        pub, signal, connection, track = _started()
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        signal.fire("on_quality_update", _quality(False, False, False))
+        signal.fire("on_quality_update", _quality(False, False, True))
+        await pub.stop()
+        return connection.sender.keyframes, track.early_frame_requests
+
+    assert asyncio.run(scenario()) == (1, 1)
+
+
+def test_the_turn_fallback_hooks_the_sender_that_is_finally_used():
+    async def scenario():
+        signal = _FakeSignal(join=_turn_join())
+        first = _FakeConnection(fail_local=_turn_failure())
+        second = _FakeConnection()
+        track = _FakeTrack()
+        pub = _publisher(signal, [first, second], track)
+        await pub.start("wss://media.example", "room-1", "test-token")
+        first.sender._send_keyframe()
+        abandoned = track.early_frame_requests
+        second.sender._send_keyframe()
+        await pub.stop()
+        return abandoned, track.early_frame_requests
+
+    assert asyncio.run(scenario()) == (0, 1)
+
+
+class _SenderWithoutKeyframeRequest:
+    """An aiortc that has renamed the method a PLI ends in."""
+
+    def __init__(self):
+        self.replaced = []
+        setattr(self, SENDER_ENCODER_ATTR, None)
+
+    def replaceTrack(self, track):
+        self.replaced.append(track)
+
+
+class _TrackThatCannotBeWoken:
+    def __init__(self):
+        self.id = "fake-track-id"
+        self.pushed = []
+
+    def push(self, rgb):
+        self.pushed.append(rgb)
+
+    def stop(self):
+        pass
+
+
+@pytest.mark.parametrize("sender, track", [
+    (_SenderWithoutKeyframeRequest, _FakeTrack),
+    (_FakeSender, _TrackThatCannotBeWoken),
+])
+def test_a_sender_or_track_that_cannot_be_hooked_says_so_once_and_the_session_runs(sender, track):
+    """The hook reaches into aiortc's sender by a private name. A version
+    without it must cost the early keyframe and nothing else: one line, and a
+    session that starts, feeds, pauses, resumes and stops as before."""
+
+    async def scenario():
+        holder = LatestFrameHolder()
+        holder.set(_solid_frame(), timestamp_ms=100)
+        pub, signal, connection, used_track = _started(
+            holder=holder, fps=50, connection=_FakeConnection(sender=sender()), track=track(),
+        )
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.05)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        signal.fire("on_quality_update", _quality(False, False, True))
+        await pub.stop()
+        return connection.sender, used_track
+
+    handler, watched = _capturing()
+    try:
+        used_sender, used_track = asyncio.run(scenario())
+    finally:
+        watched.removeHandler(handler)
+    lines = [m for m in handler.messages if "keyframe request" in m]
+    assert len(lines) == 1, handler.messages
+    assert "waits for the next frame" in lines[0]
+    assert len(used_track.pushed) == 1
+    assert used_sender.replaced == [None, used_track]
+    assert not any("Could not" in m for m in handler.messages)
+
+
+def test_a_sender_and_track_that_can_be_hooked_say_nothing():
+    """The control: a line that is logged on the ordinary case is a line
+    nobody reads."""
+
+    async def scenario():
+        pub, _, _, _ = _started()
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await pub.stop()
+
+    handler, watched = _capturing()
+    try:
+        asyncio.run(scenario())
+    finally:
+        watched.removeHandler(handler)
+    assert [m for m in handler.messages if "keyframe request" in m] == []
+
+
 # --- the bitrate budget --------------------------------------------------------
 
 
@@ -1819,3 +1983,172 @@ def test_a_stopped_track_refuses_to_produce_more_frames():
             await track.recv()
 
     asyncio.run(scenario())
+
+
+# --- CameraTrack: a frame ahead of the tick --------------------------------------
+
+
+def _paced_track(fps=2):
+    track = CameraTrack(2, 2, fps)
+    track.push(np.zeros((2, 2, 3), dtype=np.uint8))
+    return track
+
+
+def test_a_keyframe_request_makes_the_track_produce_a_frame_before_the_tick():
+    """At 2 fps the next frame is up to 500 ms away, and a keyframe request
+    used to wait for it. Every lost keyframe cost a viewer that again."""
+
+    async def scenario():
+        track = _paced_track()
+        first = await track.recv()
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.1)  # mid-interval
+        waiting = not pending.done()
+        asked = time.monotonic()
+        track.request_early_frame()
+        second = await asyncio.wait_for(pending, 1.0)
+        return waiting, time.monotonic() - asked, second.pts - first.pts
+
+    waiting, answered_in, pts_step = asyncio.run(scenario())
+    assert waiting is True
+    assert answered_in < 0.2  # the tick was 400 ms away
+    # The timestamp is the time the frame was really produced: about 100 ms
+    # after the first, not the 500 ms of the tick it did not wait for.
+    assert 0.08 * 90000 < pts_step < 0.3 * 90000
+
+
+def test_the_frame_after_an_early_one_is_a_whole_interval_later():
+    """An early frame moves the pacing with it. The old tick, 400 ms after
+    the early frame, would make two frames of one interval: the rate the
+    camera is configured for is a ceiling, apart from the early frame itself."""
+
+    async def scenario():
+        track = _paced_track()
+        await track.recv()
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.1)
+        track.request_early_frame()
+        await asyncio.wait_for(pending, 1.0)
+        started = time.monotonic()
+        await track.recv()
+        return time.monotonic() - started
+
+    assert asyncio.run(scenario()) >= 0.45
+
+
+def test_a_second_request_within_a_second_waits_for_the_tick():
+    """One early frame a second. A viewer on a bad link asks again and again,
+    and each answer is a keyframe: without the limit the stream would turn
+    into keyframes at whatever rate the requests arrive."""
+
+    async def scenario():
+        track = _paced_track()
+        await track.recv()
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.05)
+        track.request_early_frame()
+        await asyncio.wait_for(pending, 1.0)  # the one early frame
+
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.1)
+        asked = time.monotonic()
+        track.request_early_frame()  # 100 ms after the early frame
+        await asyncio.wait_for(pending, 1.0)
+        return time.monotonic() - asked
+
+    # The tick is 500 ms after the early frame, so 400 ms after the request.
+    assert asyncio.run(scenario()) >= 0.35
+
+
+def test_a_request_after_the_second_has_passed_is_answered_early_again():
+    async def scenario():
+        track = _paced_track()
+        await track.recv()
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.05)
+        track.request_early_frame()
+        await asyncio.wait_for(pending, 1.0)
+        early_at = time.monotonic()
+
+        await track.recv()  # 500 ms
+        await track.recv()  # 1000 ms
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.1)  # 1100 ms after the early frame
+        since_early = time.monotonic() - early_at
+        asked = time.monotonic()
+        track.request_early_frame()
+        await asyncio.wait_for(pending, 1.0)
+        return since_early, time.monotonic() - asked
+
+    since_early, answered_in = asyncio.run(scenario())
+    assert since_early >= EARLY_FRAME_MIN_INTERVAL_S
+    assert answered_in < 0.2
+
+
+def test_a_request_answered_by_a_frame_that_was_due_anyway_uses_nothing_up():
+    """The limit counts early frames, not requests. A request that arrives
+    while nothing is waiting is answered by the next frame, on time, and the
+    one after it can still be answered early."""
+
+    async def scenario():
+        track = _paced_track(fps=20)
+        await track.recv()
+        await asyncio.sleep(0.1)  # the encoder was not pulling; a frame is overdue
+        track.request_early_frame()
+        await track.recv()  # due anyway: returns at once, and is not an early frame
+
+        pending = asyncio.ensure_future(track.recv())
+        asked = time.monotonic()
+        track.request_early_frame()
+        await asyncio.wait_for(pending, 1.0)
+        first_answer = time.monotonic() - asked
+
+        # And a request left over from before a frame does not shorten the
+        # wait for the frame after it.
+        started = time.monotonic()
+        await track.recv()
+        return first_answer, time.monotonic() - started
+
+    first_answer, paced = asyncio.run(scenario())
+    assert first_answer < 0.03  # the tick was 50 ms away
+    assert paced >= 0.04
+
+
+def test_a_request_before_the_camera_has_produced_anything_is_harmless():
+    async def scenario():
+        track = CameraTrack(2, 2, 20)
+        pending = asyncio.ensure_future(track.recv())
+        await asyncio.sleep(0.01)
+        track.request_early_frame()
+        await asyncio.sleep(0.02)
+        still_waiting = not pending.done()
+        track.push(np.zeros((2, 2, 3), dtype=np.uint8))
+        await asyncio.wait_for(pending, 1.0)
+        started = time.monotonic()
+        await track.recv()
+        return still_waiting, time.monotonic() - started
+
+    still_waiting, paced = asyncio.run(scenario())
+    assert still_waiting is True  # no frame is invented to answer it
+    assert paced >= 0.04  # and the second frame is paced as ever
+
+
+def test_without_requests_the_pacing_and_the_timestamps_are_what_they_were():
+    """Five frames at 20 fps: each a tick after the one before, each stamped
+    with that tick. This is the behaviour the early frame must not touch."""
+
+    async def scenario():
+        track = _paced_track(fps=20)
+        started = time.monotonic()
+        frames = [await track.recv() for _ in range(5)]
+        return time.monotonic() - started, [frame.pts for frame in frames]
+
+    elapsed, pts = asyncio.run(scenario())
+    assert 0.19 <= elapsed < 0.4
+    assert pts[0] == 0
+    # One interval per frame, in the 90 kHz clock: the timestamp is the tick
+    # the frame was due at, not the moment the loop got round to it, which is
+    # later by tens of clock units at the least. The one unit of slack is the
+    # float arithmetic's, truncated to an integer.
+    gaps = [b - a for a, b in zip(pts, pts[1:])]
+    assert all(abs(gap - 4500) <= 1 for gap in gaps), gaps
