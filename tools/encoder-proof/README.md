@@ -44,6 +44,10 @@ For each chain:
   when it is restored. Each of the three stretches is two seconds of frames
   and never fewer than thirty, so the check means the same at a camera's two
   frames a second as at thirty;
+- the bitrate measured at the target is within a factor of eight of it. That
+  is no measure of the rate control. It catches a chain that is told kilobits
+  where its encoder takes bits, which is a thousand off and can still shrink
+  and grow in step;
 - the pipeline goes back to NULL.
 
 Then it runs the encoder class the bridge installs into a live session and
@@ -52,8 +56,8 @@ software and why.
 
 ## What it prints
 
-Timings for the build and per frame, the measured bitrates, one line per
-check, and a verdict:
+Timings for the build and per frame, the stream's profile and level, how it
+names its colours, the measured bitrates, one line per check, and a verdict:
 
 - `VERDICT: PASS (<chain>)`, exit code 0: the chain the bridge would use does
   everything above.
@@ -65,6 +69,16 @@ check, and a verdict:
   are above the verdict.
 
 The whole output is what to send with a report about a chain.
+
+## What a pass leaves open
+
+- The tool runs without a ROS node. That GStreamer and ROS get along in one
+  process is the suite's subject, and the first live session's with
+  `live.encoder` set.
+- It compares numbers. Look at the stream once in a browser all the same.
+- A profile other than baseline is printed with a note and fails nothing:
+  browsers usually decode it, and the session's offer does not promise it.
+- It proves the size and the frame rate it was run with. Use the cameras'.
 
 ## Which chains are proven
 

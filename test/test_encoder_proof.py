@@ -62,12 +62,19 @@ def test_the_stand_in_passes_every_check():
         "the stream names its colours: matrix 6 (BT.601), primaries 6, transfer 6, limited range",
         "ok   the colours are right when shown the way the stream says",
         "ok   the bitrate follows the target",
+        "ok   the bitrate is in the target's unit",
         "ok   the pipeline goes back to NULL",
         "encodes with stand-in/x264",
     ]:
         assert line in said, line
-    # Timings and measured bitrates are in the report.
+    # Timings and measured bitrates are in the report, and what the stream
+    # says it is.
     assert "built and started in" in said and "per frame: median" in said and "measured:" in said
+    assert (
+        "the stream is H.264 constrained baseline (profile_idc 66, constraint flags 0xc0), "
+        "level 2.0"
+    ) in said
+    assert "note:" not in said
 
 
 def test_a_backend_whose_hardware_is_missing_is_exit_2_and_says_what_is_missing():
@@ -269,6 +276,37 @@ def test_a_stretch_of_the_bitrate_check_is_thirty_frames_at_least(monkeypatch):
     result, said = _prove(STAND_IN, fps=20, frames=6, keyframe_every=3, bitrate_kbps=400)
     assert result == "pass", said
     assert pushed == [400_000] * (6 + 4 + 40) + [100_000] * 40 + [400_000] * 40
+
+
+def test_a_chain_that_takes_the_bitrate_in_another_unit_fails_the_proof():
+    """It shrinks and grows in step with the target, a hundred times too
+    large: the check that the bitrate follows cannot see that."""
+    wrong_unit = _variant(name="stand-in/wrong-unit", bitrate=("bitrate", "{kbps}00"))
+    result, said = _prove(wrong_unit, bitrate_kbps=30)
+    assert result == "fail"
+    assert "ok   the bitrate follows the target" in said
+    assert "FAIL the bitrate is in the target's unit" in said
+    assert "at a target of 30 kbps is more than a factor of 8 off" in said
+
+
+def test_a_profile_the_offer_does_not_promise_is_said_and_fails_nothing():
+    """The stand-in allowed the high profile and given a preset that uses
+    what only that profile has."""
+    assert proof.profile_of({"profile_idc": 66, "constraints": 0xC0}) == ("constrained baseline", True)
+    assert proof.profile_of({"profile_idc": 66, "constraints": 0x00}) == ("baseline", True)
+    assert proof.profile_of({"profile_idc": 77, "constraints": 0x80}) == ("main", True)
+    assert proof.profile_of({"profile_idc": 100, "constraints": 0x00}) == ("high", False)
+    assert proof.profile_of({"profile_idc": 244, "constraints": 0x00}) == ("profile 244", False)
+
+    higher = _variant(
+        name="stand-in/high",
+        caps="video/x-h264,profile=(string)high",
+        settings=(("tune", "zerolatency"), ("speed-preset", "veryfast"), ("key-int-max", "{gop}")),
+    )
+    result, said = _prove(higher)
+    assert result == "pass", said
+    assert "the stream is H.264 high (profile_idc 100, " in said
+    assert "note: a live session is offered as baseline." in said
 
 
 def test_a_failing_chain_makes_the_verdict_fail_whatever_else_passes(monkeypatch):

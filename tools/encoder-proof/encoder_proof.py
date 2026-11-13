@@ -95,6 +95,16 @@ MATRICES = {
 #: therefore in.
 PUSHED_MATRIX = 6
 
+#: `profile_idc` of the stream, to its name.
+PROFILES = {66: "baseline", 77: "main", 88: "extended", 100: "high"}
+
+#: How far the stream's bitrate may be from the target it was encoded for,
+#: as a factor either way. No measure of the rate control: at two frames a
+#: second a good one lands at a third of its target. A chain that is told
+#: kilobits where its encoder takes bits, or the other way round, is a
+#: thousand off, and can still shrink and grow in step with the target.
+BITRATE_UNIT_FACTOR = 8
+
 _PROFILES_WITH_CHROMA_INFO = {100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135}
 
 
@@ -223,6 +233,16 @@ def read_sps(unit):
             if bits.u(1):
                 said["colours"] = (bits.u(8), bits.u(8), bits.u(8))
     return said
+
+
+def profile_of(sps):
+    """`(name, fits the offer)`: what the stream calls its profile, and
+    whether a decoder made for baseline can decode it. Every live session
+    is offered as baseline."""
+    name = PROFILES.get(sps["profile_idc"], "profile {}".format(sps["profile_idc"]))
+    if sps["profile_idc"] == 66 and sps["constraints"] & 0x40:
+        name = "constrained baseline"
+    return name, sps["profile_idc"] == 66 or bool(sps["constraints"] & 0x80)
 
 
 def sps_of(data):
@@ -367,9 +387,18 @@ def prove(chain, args, out):
             report.check(not unasked, "no keyframe nobody asked for",
                          "at {}".format(sorted(unasked)) if unasked else "")
 
+        sps = sps_of(first_unit)
+        if sps is not None:
+            name, fits = profile_of(sps)
+            report.say("  the stream is H.264 {} (profile_idc {}, constraint flags 0x{:02x}), "
+                       "level {}.{}".format(name, sps["profile_idc"], sps["constraints"],
+                                            sps["level_idc"] // 10, sps["level_idc"] % 10))
+            if not fits:
+                report.say("  note: a live session is offered as baseline. A viewer that holds "
+                           "the stream to its offer may not show this one; say so in a report")
         index = args.frames
         if len(sizes) == args.frames and not report.failed:
-            index = _prove_colours(pipeline, decoder, sps_of(first_unit), args, report, index)
+            index = _prove_colours(pipeline, decoder, sps, args, report, index)
         if len(sizes) == args.frames and not report.failed:
             _prove_bitrate(pipeline, args, report, index)
     finally:
@@ -488,6 +517,13 @@ def _prove_bitrate(pipeline, args, report, index):
         high / 1000, target // 1000, low / 1000, target // 4000, back / 1000, target // 1000))
     report.check(low < 0.6 * high and low < 0.6 * back, "the bitrate follows the target",
                  "a quarter of the target should be well under it")
+    report.check(
+        target / BITRATE_UNIT_FACTOR <= high <= target * BITRATE_UNIT_FACTOR,
+        "the bitrate is in the target's unit",
+        "{:.0f} kbps at a target of {} kbps is more than a factor of {} off; a chain that "
+        "takes bits for kilobits is a thousand off".format(
+            high / 1000, target // 1000, BITRATE_UNIT_FACTOR),
+    )
 
 
 def what_the_bridge_would_do(backend, chains, args, out):
