@@ -49,6 +49,7 @@ from fleetless_bridge.live_encoder import (
 from test_live import _FakeSignal, _FakeTrack, _publisher, _turn_failure, _turn_join
 from test_live_encoder_pipeline import (
     FPS,
+    Patient,
     HEIGHT,
     NAL_IDR,
     NAL_PPS,
@@ -458,6 +459,66 @@ def test_a_picture_a_chain_does_not_take_is_that_picture_size_s_problem_and_no_o
     # And the one that works still does, and is still tried first.
     assert session(WIDTH, HEIGHT) == (True, chain, False)
     assert _soon(lambda: [pipeline.final_state for pipeline in built] == ["null"] * 3)
+
+
+def test_a_size_refused_while_the_pipeline_starts_is_that_size_s_problem_too(logged):
+    """The same refusal, seen a moment earlier: by the constructor and not
+    by the first frame. It used to be recorded as a chain that cannot be
+    built, which is for every camera."""
+    memory = ChainMemory()
+    refused = _stand_in(memory=memory, pipeline_factory=Patient)
+    try:
+        payloads, _ = refused.encode(moving_frame(0, width=641, height=480), False)
+    finally:
+        refused.close()
+    assert refused.software
+    warnings = logged.at(logging.WARNING)
+    assert len(warnings) == 1
+    assert "stand-in/x264 did not encode a 641x480 picture: enc: " in warnings[0]
+    assert "cannot be built" not in warnings[0].split("). ")[0]
+    # Known for that size, and for no other.
+    assert memory.candidates((STAND_IN,), (641, 480))[0] == []
+    assert memory.candidates((STAND_IN,), (WIDTH, HEIGHT)) == ([STAND_IN], {})
+    beside = _stand_in(memory=memory)
+    try:
+        assert beside.encode(moving_frame(0), False)[0]
+        assert beside.chain is STAND_IN and not beside.software
+    finally:
+        beside.close()
+    assert len(logged.at(logging.WARNING)) == 1
+
+
+def test_the_first_camera_of_a_process_cannot_switch_the_chain_off_for_the_others():
+    """A fresh interpreter, because the first pipeline of a process is the
+    one whose streaming thread wins the race against its constructor: the
+    libraries are cold. A camera of a size the chain refuses starts first,
+    and the camera beside it, at 1024x768, still gets the chain."""
+    script = (
+        "import fractions\n"
+        "import av, numpy\n"
+        "from fleetless_bridge.live_encoder import STAND_IN, ChainMemory, HardwareH264Encoder\n"
+        "def frame(width, height):\n"
+        "    made = av.VideoFrame.from_ndarray(numpy.full((height, width, 3), 90, numpy.uint8), format='rgb24')\n"
+        "    made.pts, made.time_base = 0, fractions.Fraction(1, 90000)\n"
+        "    return made\n"
+        "memory = ChainMemory()\n"
+        "odd = HardwareH264Encoder('nvenc', (STAND_IN,), fps=15, memory=memory, frame_timeout_s=0.5)\n"
+        "odd.encode(frame(641, 480), False)\n"
+        "odd.close()\n"
+        "print('ODD', sorted(memory.candidates((STAND_IN,), (641, 480))[1].values()))\n"
+        "even = HardwareH264Encoder('nvenc', (STAND_IN,), fps=15, memory=memory)\n"
+        "payloads, _ = even.encode(frame(1024, 768), False)\n"
+        "print('EVEN', bool(payloads), even.chain.name if even.chain else None, even.software)\n"
+        "even.close()\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    odd, even = [line for line in done.stdout.splitlines() if line.startswith(("ODD", "EVEN"))]
+    assert "did not encode a 641x480 picture" in odd and "cannot be built" not in odd, odd
+    assert even == "EVEN True stand-in/x264 False"
 
 
 @pytest.mark.parametrize("first, second", [((900, 600), (1024, 768)), ((854, 480), (642, 480))])
