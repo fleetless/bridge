@@ -566,6 +566,44 @@ def test_a_chain_that_fails_mid_session_is_followed_by_a_software_keyframe(logge
     assert [pipeline.final_state for pipeline in built] == ["null"]
 
 
+def test_an_error_on_the_bus_mid_session_ends_the_chain_with_the_frame_it_came_with(logged):
+    """The same for a session: the frame whose pipeline reported the error
+    is already software, and a keyframe."""
+    built = []
+
+    def factory(chain, **kwargs):
+        built.append(Pipeline(chain, **kwargs))
+        return built[-1]
+
+    memory = ChainMemory()
+    encoder = _stand_in(pipeline_factory=factory, memory=memory)
+    try:
+        for index in range(3):
+            assert encoder.encode(moving_frame(index), False)[0]
+        pipeline = built[0]
+        Gst = pipeline._Gst
+        pipeline._bus.post(Gst.Message.new_error(
+            pipeline._enc,
+            pipeline._GLib.Error.new_literal(
+                Gst.StreamError.quark(), "the device went away", Gst.StreamError.FAILED
+            ),
+            "posted by the test",
+        ))
+        for index in range(3, 6):
+            assert encoder.encode(moving_frame(index), False)[0]
+    finally:
+        encoder.close()
+    assert encoder.software and [pipeline.final_state for pipeline in built] == ["null"]
+    assert {NAL_SPS, NAL_PPS, NAL_IDR} <= set(encoder.calls[3][1])
+    assert _decodes(encoder.units[3:]) == [1, 1, 1]
+    assert logged.at(logging.WARNING) == [
+        "live.encoder=nvenc: stand-in/x264 stopped working (enc: the device went away). "
+        "The rest of this session is encoded in software H.264."
+    ]
+    # A chain that had worked: probed again at the next start.
+    assert memory.candidates((STAND_IN,), (WIDTH, HEIGHT)) == ([STAND_IN], {})
+
+
 def _no_gi(monkeypatch):
     # `None` in `sys.modules` makes `import gi` raise ImportError.
     monkeypatch.setitem(sys.modules, "gi", None)

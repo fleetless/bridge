@@ -580,7 +580,15 @@ class Pipeline:
                 or "no access unit within {:g} s of a frame".format(self._frame_timeout_s)
             )
         encoded = sample.get_buffer()
-        return encoded.extract_dup(0, encoded.get_size())
+        data = encoded.extract_dup(0, encoded.get_size())
+        # Once a frame, also when the frame went well. An element that
+        # reports an error while units still come is giving up, and is
+        # believed now and not at the next stall; and reading the bus is
+        # what empties it.
+        error = self._bus_error()
+        if error is not None:
+            raise ChainFailed(error)
+        return data
 
     def _pts_ns(self, frame: "av.VideoFrame") -> int:
         """The frame's own time, in nanoseconds, and never backwards."""
@@ -591,7 +599,12 @@ class Pipeline:
         return pts_ns
 
     def _bus_error(self) -> Optional[str]:
-        """What an element reported, if one did: `element: message`."""
+        """What an element reported, if one did: `element: message`.
+
+        Reading it throws away everything else that was posted before:
+        state changes, warnings, whatever an element has to say. Nobody
+        else reads this bus, so without that a talkative encoder element
+        would fill it for as long as the session lasts."""
         message = self._bus.pop_filtered(self._Gst.MessageType.ERROR)
         if message is None:
             return None
