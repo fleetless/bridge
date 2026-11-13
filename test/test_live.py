@@ -2137,21 +2137,28 @@ def test_a_request_before_the_camera_has_produced_anything_is_harmless():
 
 
 def test_without_requests_the_pacing_and_the_timestamps_are_what_they_were():
-    """Five frames at 20 fps: each a tick after the one before, each stamped
-    with that tick. This is the behaviour the early frame must not touch."""
+    """Five frames at 5 fps: each a tick after the one before, each stamped
+    with that tick. This is the behaviour the early frame must not touch.
+
+    At 5 fps and not faster: a frame is stamped with its tick only while the
+    loop gets back to `recv()` before that tick is due. A loop that comes a
+    whole interval late stamps the time it really is, and the gaps below are
+    then off by whatever it was late -- rightly so, and nothing this test is
+    about. 200 ms is an interval a busy machine does not sleep through; the
+    50 ms of 20 fps was one it sometimes did."""
 
     async def scenario():
-        track = _paced_track(fps=20)
+        track = _paced_track(fps=5)
         started = time.monotonic()
         frames = [await track.recv() for _ in range(5)]
         return time.monotonic() - started, [frame.pts for frame in frames]
 
     elapsed, pts = asyncio.run(scenario())
-    assert elapsed >= 0.19  # four intervals of 50 ms
+    assert elapsed >= 0.79  # four intervals of 200 ms
     assert pts[0] == 0
     # One interval per frame, in the 90 kHz clock: the timestamp is the tick
     # the frame was due at, not the moment the loop got round to it, which is
     # later by tens of clock units at the least. The one unit of slack is the
     # float arithmetic's, truncated to an integer.
     gaps = [b - a for a, b in zip(pts, pts[1:])]
-    assert all(abs(gap - 4500) <= 1 for gap in gaps), gaps
+    assert all(abs(gap - 18000) <= 1 for gap in gaps), gaps
