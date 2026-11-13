@@ -290,6 +290,68 @@ def test_the_planes_are_copied_row_by_row_to_where_the_layout_puts_them():
     assert not packed[32:48].reshape(4, 4)[:, 3:].any()
 
 
+# --- the colours and their label -----------------------------------------------------
+#
+# A viewer converts by the matrix the stream names. Caps that name none are
+# read as BT.709 above 576 lines, the encoder writes that into the stream,
+# and every colour is then shown a little wrong with nothing failing.
+
+
+def _what_the_stream_says(data):
+    """The caps `h264parse` makes of one access unit on its own: what a
+    receiver reads out of the stream, and nothing the sender told it."""
+    Gst, _ = live_encoder._load_gst()
+    reader = Gst.parse_launch(
+        "appsrc name=src caps=video/x-h264,stream-format=byte-stream,alignment=au ! "
+        "h264parse ! appsink name=sink sync=false"
+    )
+    try:
+        reader.set_state(Gst.State.PLAYING)
+        source = reader.get_by_name("src")
+        source.emit("push-buffer", Gst.Buffer.new_wrapped(data))
+        source.emit("end-of-stream")
+        sample = reader.get_by_name("sink").emit("try-pull-sample", 5 * Gst.SECOND)
+        assert sample is not None
+        return sample.get_caps().get_structure(0)
+    finally:
+        reader.set_state(Gst.State.NULL)
+
+
+@pytest.mark.parametrize("width, height", [(320, 240), (1024, 768), (1280, 720)])
+def test_the_stream_names_the_colours_that_are_in_it(width, height):
+    """Below 576 lines and above: the samples are BT.601 at every size, so
+    the label has to be too."""
+    red = np.zeros((height, width, 3), dtype=np.uint8)
+    red[:] = (200, 30, 30)
+    pipeline = _pipeline(width=width, height=height, bitrate_bps=2_000_000)
+    decoder = av.CodecContext.create("h264", "r")
+    try:
+        declared = pipeline._src.get_property("caps").get_structure(0).get_string("colorimetry")
+        units = []
+        for index in range(3):
+            frame = av.VideoFrame.from_ndarray(red, format="rgb24")
+            frame.pts, frame.time_base = index * 6000, Fraction(1, 90000)
+            units.append(pipeline.encode(frame, False))
+            (picture,) = decoder.decode(av.Packet(units[-1]))
+    finally:
+        pipeline.close()
+    # What arrives, as the decoder left it: that red in BT.601, limited
+    # range. In BT.709 it would be 63, 109, 212.
+    assert picture.format.name == "yuv420p"
+    luma, blue, red_difference = (
+        float(
+            np.frombuffer(plane, np.uint8)
+            .reshape(-1, abs(plane.line_size))[:plane.height, :plane.width]
+            .mean()
+        )
+        for plane in picture.planes
+    )
+    assert (round(luma), round(blue), round(red_difference)) == (85, 103, 203)
+    # What the pipeline is told, and what the stream then says of itself.
+    assert declared == live_encoder.PICTURE_COLORIMETRY == "bt601"
+    assert _what_the_stream_says(units[0]).get_string("colorimetry") == "bt601"
+
+
 def test_a_bitrate_change_takes_effect_while_running():
     pipeline = _pipeline(bitrate_bps=2_000_000)
     try:

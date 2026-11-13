@@ -34,6 +34,12 @@ For each chain:
 - a decoder makes exactly one picture of each access unit, and it is the
   picture that went in. That rules out B-frames and lookahead, and it rules
   out the wrong picture: swapped colour planes pass every other check;
+- flat colour bars come out in their colours when each is converted by the
+  matrix and the range the stream names. A viewer converts by that label, so
+  a stream that names BT.709 over BT.601 samples decodes without a fault and
+  shows every colour a little wrong. A stream that names nothing leaves the
+  viewer to assume, as the software encoder's does; the output says which it
+  is;
 - the stream shrinks when the target bitrate is cut to a quarter and grows
   when it is restored;
 - the pipeline goes back to NULL.

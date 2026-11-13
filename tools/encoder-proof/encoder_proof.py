@@ -13,6 +13,9 @@ checks what every chain has to deliver:
   with SPS and PPS, and no other frame is one;
 - a decoder shows each access unit as one picture, the picture that went in,
   in the order it went in;
+- the colours are right when the picture is shown the way the stream says to
+  show it: a viewer converts by the matrix the stream names, so a stream
+  that names the wrong one decodes without a fault and looks wrong;
 - the bitrate follows the target while running;
 - the pipeline goes back to NULL.
 
@@ -64,6 +67,36 @@ NAL_SLICE, NAL_IDR, NAL_SPS, NAL_PPS = 1, 5, 7, 8
 #: far below it; a picture with swapped channels or planes is far above.
 PICTURE_TOLERANCE = 20.0
 
+#: The flat colours of the bars the colour check sends: the three primaries,
+#: their mixes, and a light and a dark grey, which is where a wrong range
+#: shows.
+BARS = (
+    (200, 30, 30), (30, 200, 30), (30, 30, 200), (200, 200, 30),
+    (30, 200, 200), (200, 30, 200), (235, 235, 235), (20, 20, 20),
+)
+
+#: How far a bar's colour may be from the one that went in, per channel on a
+#: scale of 255, once it is converted the way the stream says. Rounding and
+#: the encoder cost two; a chain that converts to another matrix and says so
+#: costs six. BT.601 samples under a BT.709 label put the worst bar 27 off,
+#: and limited-range samples under a full-range label 17.
+COLOUR_TOLERANCE = 10.0
+
+#: `matrix_coefficients` of the stream, to the name and the two luma weights
+#: (red, blue) a viewer converts with. 5 and 6 are the same matrix.
+MATRICES = {
+    1: ("BT.709", 0.2126, 0.0722),
+    5: ("BT.601", 0.299, 0.114),
+    6: ("BT.601", 0.299, 0.114),
+    7: ("SMPTE 240M", 0.212, 0.087),
+}
+
+#: What the bridge pushes into every chain, and what an unlabelled stream is
+#: therefore in.
+PUSHED_MATRIX = 6
+
+_PROFILES_WITH_CHROMA_INFO = {100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135}
+
 
 def pattern(width, height, index):
     """A picture with gradients that shift and a bar that travels, as RGB.
@@ -88,6 +121,156 @@ def frame_of(picture, index, fps):
 
 def nal_types(data):
     return [unit[0] & 0x1F for unit in HardwareH264Encoder._split_bitstream(data) if unit]
+
+
+# --- what the stream says about itself -------------------------------------------
+
+
+class _Bits:
+    """The bits of a parameter set, read the way the H.264 syntax writes
+    them. Reading past the end raises IndexError."""
+
+    def __init__(self, data):
+        self._data = data
+        self._at = 0
+
+    def u(self, count):
+        value = 0
+        for _ in range(count):
+            value = (value << 1) | ((self._data[self._at >> 3] >> (7 - (self._at & 7))) & 1)
+            self._at += 1
+        return value
+
+    def ue(self):
+        zeros = 0
+        while self.u(1) == 0:
+            zeros += 1
+            if zeros > 32:
+                raise ValueError("not an Exp-Golomb code")
+        return (1 << zeros) - 1 + (self.u(zeros) if zeros else 0)
+
+    def se(self):
+        code = self.ue()
+        return (code + 1) // 2 if code % 2 else -(code // 2)
+
+
+def _payload(unit):
+    """A NAL unit without its header byte and without the bytes that keep
+    start codes out of it."""
+    payload = bytearray()
+    zeros = 0
+    for byte in unit[1:]:
+        if zeros >= 2 and byte == 3:
+            zeros = 0
+            continue
+        payload.append(byte)
+        zeros = zeros + 1 if byte == 0 else 0
+    return bytes(payload)
+
+
+def read_sps(unit):
+    """What a sequence parameter set says that a viewer acts on: profile,
+    constraint flags and level, and how the colours are to be converted.
+    `colours` is `(primaries, transfer, matrix)` or `None` when the stream
+    does not say. Raises IndexError or ValueError for one it cannot read."""
+    bits = _Bits(_payload(unit))
+    said = {"profile_idc": bits.u(8), "constraints": bits.u(8), "level_idc": bits.u(8),
+            "colours": None, "full_range": False}
+    bits.ue()  # seq_parameter_set_id
+    if said["profile_idc"] in _PROFILES_WITH_CHROMA_INFO:
+        chroma_format_idc = bits.ue()
+        if chroma_format_idc == 3:
+            bits.u(1)
+        bits.ue()
+        bits.ue()
+        bits.u(1)
+        if bits.u(1):  # scaling lists
+            for index in range(8 if chroma_format_idc != 3 else 12):
+                if bits.u(1):
+                    last = following = 8
+                    for _ in range(16 if index < 6 else 64):
+                        if following:
+                            following = (last + bits.se() + 256) % 256
+                        last = following or last
+    bits.ue()  # log2_max_frame_num_minus4
+    order = bits.ue()
+    if order == 0:
+        bits.ue()
+    elif order == 1:
+        bits.u(1)
+        bits.se()
+        bits.se()
+        for _ in range(bits.ue()):
+            bits.se()
+    bits.ue()  # max_num_ref_frames
+    bits.u(1)
+    bits.ue()  # width and height, in macroblocks
+    bits.ue()
+    if not bits.u(1):  # frame_mbs_only_flag
+        bits.u(1)
+    bits.u(1)
+    if bits.u(1):  # cropping
+        for _ in range(4):
+            bits.ue()
+    if bits.u(1):  # the VUI
+        if bits.u(1) and bits.u(8) == 255:  # aspect ratio, spelled out
+            bits.u(32)
+        if bits.u(1):  # overscan
+            bits.u(1)
+        if bits.u(1):  # video signal type
+            bits.u(3)
+            said["full_range"] = bool(bits.u(1))
+            if bits.u(1):
+                said["colours"] = (bits.u(8), bits.u(8), bits.u(8))
+    return said
+
+
+def sps_of(data):
+    """The sequence parameter set of an access unit, read; `None` if it has
+    none or it cannot be read."""
+    for unit in HardwareH264Encoder._split_bitstream(data):
+        if unit and unit[0] & 0x1F == NAL_SPS:
+            try:
+                return read_sps(unit)
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+# --- the colours ---------------------------------------------------------------------
+
+
+def bars(width, height):
+    """`(picture, edges)`: vertical bars of `BARS`, as RGB, and where each
+    begins and the last ends."""
+    picture = np.zeros((height, width, 3), dtype=np.uint8)
+    edges = [width * index // len(BARS) for index in range(len(BARS) + 1)]
+    for colour, left, right in zip(BARS, edges, edges[1:]):
+        picture[:, left:right] = colour
+    return picture, edges
+
+
+def samples_of(frame):
+    """The three planes of a decoded picture as the decoder left them:
+    luma, and the two chroma planes at their own size."""
+    return [
+        np.frombuffer(plane, np.uint8).reshape(-1, abs(plane.line_size))[:plane.height, :plane.width]
+        for plane in frame.planes[:3]
+    ]
+
+
+def as_a_viewer_shows_it(luma, blue, red, matrix, full_range):
+    """One colour, from its three samples to RGB, by the weights of
+    `matrix` and the range the stream names."""
+    _, weight_red, weight_blue = MATRICES[matrix]
+    if full_range:
+        y, cb, cr = luma / 255.0, (blue - 128.0) / 255.0, (red - 128.0) / 255.0
+    else:
+        y, cb, cr = (luma - 16.0) / 219.0, (blue - 128.0) / 224.0, (red - 128.0) / 224.0
+    r = y + 2 * (1 - weight_red) * cr
+    b = y + 2 * (1 - weight_blue) * cb
+    g = (y - weight_red * r - weight_blue * b) / (1 - weight_red - weight_blue)
+    return tuple(255.0 * channel for channel in (r, g, b))
 
 
 class Report:
@@ -130,6 +313,7 @@ def prove(chain, args, out):
     decoder = av.CodecContext.create("h264", "r")
     forced = set(range(args.keyframe_every, args.frames, args.keyframe_every))
     sizes, times, keyframes = [], [], set()
+    first_unit = b""
     try:
         try:
             for index in range(args.frames):
@@ -138,6 +322,7 @@ def prove(chain, args, out):
                 data = pipeline.encode(frame_of(picture, index, args.fps), index in forced)
                 times.append(time.monotonic() - began)
                 sizes.append(len(data))
+                first_unit = first_unit or data
                 types = nal_types(data)
                 if NAL_IDR in types:
                     keyframes.add(index)
@@ -182,8 +367,11 @@ def prove(chain, args, out):
             report.check(not unasked, "no keyframe nobody asked for",
                          "at {}".format(sorted(unasked)) if unasked else "")
 
+        index = args.frames
         if len(sizes) == args.frames and not report.failed:
-            _prove_bitrate(pipeline, args, report)
+            index = _prove_colours(pipeline, decoder, sps_of(first_unit), args, report, index)
+        if len(sizes) == args.frames and not report.failed:
+            _prove_bitrate(pipeline, args, report, index)
     finally:
         try:
             pipeline.close()
@@ -196,11 +384,75 @@ def prove(chain, args, out):
     return "fail" if report.failed else "pass"
 
 
-def _prove_bitrate(pipeline, args, report):
+def _prove_colours(pipeline, decoder, sps, args, report, index):
+    """Flat bars in, and each bar's colour out again when it is converted
+    the way the stream says. Returns the index of the next frame.
+
+    The picture check before this one converts with the decoder library's
+    default, which is not what a viewer does: a browser reads the matrix
+    from the stream. So here the samples are taken as they were decoded and
+    converted by what the stream names."""
+    what = "the colours are right when shown the way the stream says"
+    if sps is None:
+        report.check(False, what, "the first frame's parameter set could not be read")
+        return index
+    matrix = sps["colours"][2] if sps["colours"] is not None else 2
+    if matrix == 2:  # unspecified, said or implied
+        report.say("  the stream does not name its colours; a viewer assumes, as it does "
+                   "for the software encoder. Converted here as what was pushed, BT.601")
+        matrix = PUSHED_MATRIX
+    elif matrix in MATRICES:
+        report.say("  the stream names its colours: matrix {} ({}), primaries {}, transfer {}, "
+                   "{} range".format(matrix, MATRICES[matrix][0], sps["colours"][0],
+                                     sps["colours"][1], "full" if sps["full_range"] else "limited"))
+    else:
+        report.check(False, what, "the stream names matrix {}, which this tool cannot convert "
+                                  "by".format(matrix))
+        return index
+
+    picture, edges = bars(args.width, args.height)
+    shown = None
+    try:
+        for step in range(4):
+            data = pipeline.encode(frame_of(picture, index, args.fps), step == 0)
+            index += 1
+            decoded = decoder.decode(av.Packet(data))
+            shown = decoded[0] if len(decoded) == 1 else None
+    except ChainFailed as failed:
+        report.check(False, what, failed.reason)
+        return index
+    if shown is None or shown.format.name not in ("yuv420p", "yuvj420p"):
+        report.check(False, what, "the decoder made {} of the bars".format(
+            "no picture" if shown is None else shown.format.name))
+        return index
+
+    luma, blue, red = samples_of(shown)
+    rows = slice(args.height // 4, max(args.height // 4 + 1, args.height * 3 // 4))
+    half_rows = slice(rows.start // 2, max(rows.start // 2 + 1, rows.stop // 2))
+    worst, worst_bar = 0.0, None
+    for colour, left, right in zip(BARS, edges, edges[1:]):
+        inset = (right - left) // 4
+        columns = slice(left + inset, max(left + inset + 1, right - inset))
+        half_columns = slice(columns.start // 2, max(columns.start // 2 + 1, columns.stop // 2))
+        seen = as_a_viewer_shows_it(
+            float(luma[rows, columns].mean()), float(blue[half_rows, half_columns].mean()),
+            float(red[half_rows, half_columns].mean()), matrix, sps["full_range"],
+        )
+        off = max(abs(was - now) for was, now in zip(colour, seen))
+        if off > worst:
+            worst, worst_bar = off, (colour, tuple(int(round(channel)) for channel in seen))
+    report.check(
+        worst <= COLOUR_TOLERANCE, what,
+        "the bar that went in as {} is shown as {}".format(*worst_bar) if worst > COLOUR_TOLERANCE
+        else "worst channel of a bar {:.1f} of 255 off".format(worst),
+    )
+    return index
+
+
+def _prove_bitrate(pipeline, args, report, index):
     """Two seconds at the target, two at a quarter of it, two back: the
     stream has to shrink and grow with it."""
     settle = args.fps * 2
-    index = args.frames
 
     def stretch(bitrate_bps):
         nonlocal index
