@@ -129,6 +129,15 @@ def _stand_in(cls=_Recording, chains=(STAND_IN,), backend="nvenc", **kwargs):
     return cls(backend, chains, **kwargs)
 
 
+def _soon(condition, seconds=10.0):
+    """A pipeline that is given up is closed in a thread of its own. Waits
+    for what that thread does, and says whether it happened."""
+    deadline = time.monotonic() + seconds
+    while not condition() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    return condition()
+
+
 def _decodes(units_per_frame):
     """How many pictures aiortc's own decoder library makes of each frame's
     NAL units, as one stream."""
@@ -258,7 +267,7 @@ def test_a_chain_that_builds_and_returns_nothing_is_a_failed_probe_and_the_next_
     encoder = _stand_in(chains=CHAINS["nvenc"], pipeline_factory=factory)
     encoder.encode(moving_frame(0), False)
     assert factory.asked == ["nvenc/jetson", "nvenc/desktop"]
-    assert factory.built[0].close_calls == 1  # the one that failed is not left running
+    assert _soon(lambda: factory.built[0].close_calls == 1)  # the one that failed is not left running
     assert encoder.chain.name == "nvenc/desktop"
     encoder.close()
 
@@ -355,7 +364,7 @@ def test_a_chain_that_stops_after_its_probe_is_probed_again_at_the_next_start(lo
         payloads, _ = encoder.encode(moving_frame(index), False)
         assert payloads
     encoder.close()
-    assert encoder.software and factory.built[0].close_calls == 1
+    assert encoder.software and _soon(lambda: factory.built[0].close_calls == 1)
     warnings = logged.at(logging.WARNING)
     assert warnings == [
         "live.encoder=nvenc: nvenc/jetson stopped working (the chip gave up). "
@@ -448,7 +457,7 @@ def test_a_picture_a_chain_does_not_take_is_that_picture_size_s_problem_and_no_o
     assert "(known from an earlier start)" in warnings[1]
     # And the one that works still does, and is still tried first.
     assert session(WIDTH, HEIGHT) == (True, chain, False)
-    assert [pipeline.final_state for pipeline in built] == ["null"] * 3
+    assert _soon(lambda: [pipeline.final_state for pipeline in built] == ["null"] * 3)
 
 
 @pytest.mark.parametrize("first, second", [((900, 600), (1024, 768)), ((854, 480), (642, 480))])
@@ -563,7 +572,7 @@ def test_a_chain_that_fails_mid_session_is_followed_by_a_software_keyframe(logge
     assert len(warnings) == 1
     assert warnings[0].startswith("live.encoder=nvenc: stand-in/errors stopped working (breaks: ")
     # The pipeline that was given up is not left holding the device.
-    assert [pipeline.final_state for pipeline in built] == ["null"]
+    assert _soon(lambda: [pipeline.final_state for pipeline in built] == ["null"])
 
 
 def test_an_error_on_the_bus_mid_session_ends_the_chain_with_the_frame_it_came_with(logged):
@@ -593,7 +602,8 @@ def test_an_error_on_the_bus_mid_session_ends_the_chain_with_the_frame_it_came_w
             assert encoder.encode(moving_frame(index), False)[0]
     finally:
         encoder.close()
-    assert encoder.software and [pipeline.final_state for pipeline in built] == ["null"]
+    assert encoder.software
+    assert _soon(lambda: [pipeline.final_state for pipeline in built] == ["null"])
     assert {NAL_SPS, NAL_PPS, NAL_IDR} <= set(encoder.calls[3][1])
     assert _decodes(encoder.units[3:]) == [1, 1, 1]
     assert logged.at(logging.WARNING) == [
@@ -697,7 +707,7 @@ def test_an_exception_nobody_foresaw_is_a_chain_that_failed_and_its_message_is_n
         encoder.close()
     # Every call returned, and with a frame: software took over at once.
     assert all(payloads) and encoder.software
-    assert built[0].close_calls == 1
+    assert _soon(lambda: built[0].close_calls == 1)
     assert NAL_IDR in encoder.calls[explode_after][1]
     warnings = logged.at(logging.WARNING)
     assert len(warnings) == 1
@@ -706,6 +716,222 @@ def test_an_exception_nobody_foresaw_is_a_chain_that_failed_and_its_message_is_n
     # In the probe it is a failed chain like any other and is remembered; a
     # chain that had worked is probed again next time.
     assert (memory.candidates((JETSON,), (WIDTH, HEIGHT))[0] == []) == (explode_after == 0)
+
+
+# --- an element that does not return ------------------------------------------------
+#
+# A driver call that hangs. The frame's time limit catches it; what must not
+# happen afterwards is that the thread which encodes hangs with it, in the
+# close: that thread is one of the event loop's few shared workers.
+
+
+class _Wedge:
+    """A pipeline factory whose pipelines stop returning: from the buffer
+    after `good` on, the streaming thread is held inside the encoder
+    element's sink pad until `release` is set. Stopping such a pipeline
+    does not return either. It can be let go, so the suite's own process is
+    left as it was found."""
+
+    def __init__(self, good):
+        self.good = good
+        self.seen = 0
+        self.release = threading.Event()
+        self.built = []
+
+    def __call__(self, chain, **kwargs):
+        pipeline = Pipeline(chain, **kwargs)
+        self._go_on = pipeline._Gst.PadProbeReturn.OK
+        pipeline._enc.get_static_pad("sink").add_probe(
+            pipeline._Gst.PadProbeType.BUFFER, self._hold
+        )
+        self.built.append(pipeline)
+        return pipeline
+
+    def _hold(self, pad, info):
+        self.seen += 1
+        if self.seen > self.good:
+            self.release.wait(300)
+        return self._go_on
+
+
+@pytest.fixture
+def short_bounds(monkeypatch):
+    monkeypatch.setattr(live_encoder, "START_TIMEOUT_S", 0.4)
+    monkeypatch.setattr(live_encoder, "STOP_TIMEOUT_S", 0.4)
+
+
+def test_an_element_that_stops_returning_mid_session_costs_one_late_frame(short_bounds, logged):
+    wedge = _Wedge(good=4)
+    memory = ChainMemory()
+    encoder = _stand_in(pipeline_factory=wedge, memory=memory, frame_timeout_s=0.3)
+    try:
+        for index in range(4):
+            assert encoder.encode(moving_frame(index), False)[0]
+        began = time.monotonic()
+        payloads, _ = encoder.encode(moving_frame(4), False)
+        took = time.monotonic() - began
+        # The frame is back, in software, after the frame's time limit and
+        # not after the element: nobody waited for the pipeline to stop.
+        assert payloads and encoder.software
+        assert 0.3 <= took < 2.0
+        assert {NAL_SPS, NAL_PPS, NAL_IDR} <= set(encoder.calls[4][1])
+        assert wedge.built[0].final_state is None  # still stopping, somewhere else
+        # And the stream goes on.
+        for index in range(5, 8):
+            assert encoder.encode(moving_frame(index), False)[0]
+        assert _decodes(encoder.units[4:]) == [1] * 4
+
+        # A pipeline that does not stop: its chain is not built again, though
+        # it had passed its probe.
+        said = "stand-in/x264 did not shut down within 0.4 s"
+        assert _soon(lambda: memory.candidates((STAND_IN,), (WIDTH, HEIGHT)) == ([], {STAND_IN.name: said}))
+        assert memory.candidates((STAND_IN,), (1024, 768))[0] == []
+        warnings = logged.at(logging.WARNING)
+        assert warnings == [
+            "live.encoder=nvenc: stand-in/x264 stopped working (no access unit within 0.3 s "
+            "of a frame). The rest of this session is encoded in software H.264.",
+            "live.encoder=nvenc: " + said + ". A thread of its pipeline is left behind, and "
+            "the chain is not built again until live.encoder changes or the bridge restarts.",
+        ]
+
+        again = _Factory({STAND_IN.name: "works"})
+        second = _stand_in(pipeline_factory=again, memory=memory)
+        assert second.encode(moving_frame(0), False)[0] and second.software
+        second.close()
+        assert again.asked == []
+        assert said + " (known from an earlier start)" in logged.at(logging.WARNING)[-1]
+    finally:
+        wedge.release.set()
+        encoder.close()
+    # Let go, the pipeline stops after all.
+    assert _soon(lambda: wedge.built[0].final_state == "null")
+
+
+def test_an_element_that_never_returns_the_first_frame_is_a_failed_probe_and_no_more(
+    short_bounds, logged
+):
+    wedge = _Wedge(good=0)
+    memory = ChainMemory()
+    encoder = _stand_in(pipeline_factory=wedge, memory=memory, frame_timeout_s=0.3)
+    try:
+        began = time.monotonic()
+        payloads, _ = encoder.encode(moving_frame(0), False)
+        assert payloads and encoder.software and time.monotonic() - began < 2.0
+        # Known at once, before anybody tried to stop the pipeline: the next
+        # start of this camera does not build the chain.
+        assert memory.candidates((STAND_IN,), (WIDTH, HEIGHT)) == (
+            [],
+            {STAND_IN.name: "stand-in/x264 did not encode a 320x240 picture: "
+                            "no access unit within 0.3 s of a frame"},
+        )
+        # And once it has not stopped, no camera's start does.
+        assert _soon(lambda: memory.candidates((STAND_IN,), (1024, 768))[0] == [])
+    finally:
+        wedge.release.set()
+        encoder.close()
+    assert _soon(lambda: wedge.built[0].final_state == "null")
+
+
+def test_a_pipeline_that_does_not_start_is_given_up_after_its_bound(short_bounds, logged):
+    """A device that does not open. The build is waited for, for so long."""
+    release = threading.Event()
+    built = []
+
+    def factory(chain, **kwargs):
+        release.wait(300)
+        built.append(Pipeline(chain, **kwargs))
+        return built[-1]
+
+    memory = ChainMemory()
+    encoder = _stand_in(pipeline_factory=factory, memory=memory)
+    try:
+        began = time.monotonic()
+        payloads, _ = encoder.encode(moving_frame(0), False)
+        took = time.monotonic() - began
+        assert payloads and encoder.software
+        assert 0.4 <= took < 2.0
+        said = "stand-in/x264 cannot be built: the pipeline did not start within 0.4 s"
+        assert said in logged.at(logging.WARNING)[0]
+        assert memory.candidates((STAND_IN,), (1024, 768)) == ([], {STAND_IN.name: said})
+    finally:
+        release.set()
+        encoder.close()
+    # A pipeline that starts after nobody waits for it is put away by the
+    # thread that built it, not left running.
+    assert _soon(lambda: [pipeline.final_state for pipeline in built] == ["null"])
+
+
+def test_a_close_of_a_pipeline_that_does_not_stop_returns_after_its_bound(short_bounds, logged):
+    """The publisher's close, at the end of a session whose encoder element
+    hangs in its teardown."""
+    wedge = _Wedge(good=2)
+    memory = ChainMemory()
+    encoder = _stand_in(pipeline_factory=wedge, memory=memory, frame_timeout_s=5.0)
+    try:
+        assert encoder.encode(moving_frame(0), False)[0]
+        assert encoder.encode(moving_frame(1), False)[0]
+        # The third buffer is held inside the element, and nobody waits for it.
+        wedge.built[0]._src.emit("push-buffer", wedge.built[0]._Gst.Buffer.new_wrapped(b"\0" * 115200))
+        assert _soon(lambda: wedge.seen == 3)
+        began = time.monotonic()
+        encoder.close()
+        assert 0.4 <= time.monotonic() - began < 2.0
+        assert encoder.encode(moving_frame(2), False)[0] == []
+        assert _soon(lambda: memory.candidates((STAND_IN,), (WIDTH, HEIGHT))[0] == [])
+    finally:
+        wedge.release.set()
+    assert _soon(lambda: wedge.built[0].final_state == "null")
+
+
+def test_wedged_encoders_do_not_use_up_the_executor_or_hold_the_process_at_exit():
+    """What the bridge does with it: aiortc encodes on the event loop's
+    default executor, which name resolution and the ROS calls share. Twenty
+    sessions whose element never returns, each on a memory of its own so
+    that each one builds the chain; then the executor still answers,
+    `asyncio.run()` returns, and the process ends. A fresh interpreter: the
+    threads left behind are the subject, and they stay."""
+    script = (
+        "import asyncio, fractions, sys, time\n"
+        "import av, numpy\n"
+        "from fleetless_bridge.live_encoder import STAND_IN, Chain, ChainMemory, HardwareH264Encoder\n"
+        "fields = {name: getattr(STAND_IN, name) for name in STAND_IN.__dataclass_fields__}\n"
+        "fields.update(name='stand-in/wedged', elements=('videoconvert', 'identity', 'x264enc'),\n"
+        "              convert='videoconvert ! identity sleep-time=3000000000')\n"
+        "wedged = Chain(**fields)\n"
+        "def frame(index):\n"
+        "    made = av.VideoFrame.from_ndarray(numpy.zeros((48, 64, 3), numpy.uint8), format='rgb24')\n"
+        "    made.pts, made.time_base = index * 6000, fractions.Fraction(1, 90000)\n"
+        "    return made\n"
+        "async def main():\n"
+        "    loop = asyncio.get_running_loop()\n"
+        "    workers = loop.run_in_executor(None, lambda: None)\n"
+        "    await workers\n"
+        "    for start in range(20):\n"
+        "        encoder = HardwareH264Encoder('nvenc', (wedged,), fps=15, memory=ChainMemory(),\n"
+        "                                      frame_timeout_s=0.1)\n"
+        "        payloads, _ = await loop.run_in_executor(None, encoder.encode, frame(0), False)\n"
+        "        assert payloads and encoder.software, start\n"
+        "        payloads, _ = await loop.run_in_executor(None, encoder.encode, frame(1), False)\n"
+        "        assert payloads, start\n"
+        "        await loop.run_in_executor(None, encoder.close)\n"
+        "    await asyncio.wait_for(loop.getaddrinfo('localhost', 80), 5.0)\n"
+        "    await asyncio.wait_for(loop.run_in_executor(None, time.sleep, 0.01), 5.0)\n"
+        "    print('ANSWERED', flush=True)\n"
+        "began = time.monotonic()\n"
+        "asyncio.run(main())\n"
+        "print('RETURNED', round(time.monotonic() - began), flush=True)\n"
+    )
+    began = time.monotonic()
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120,
+        cwd=str(pathlib.Path(__file__).resolve().parents[1]),
+    )
+    took = time.monotonic() - began
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.split()[:2] == ["ANSWERED", "RETURNED"], done.stdout
+    # Twenty probes of a tenth of a second each, and no waiting for threads
+    # that will not come back.
+    assert took < 60.0
 
 
 def test_when_software_cannot_encode_either_the_frame_is_dropped_and_the_next_one_is_a_keyframe(

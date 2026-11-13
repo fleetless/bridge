@@ -74,6 +74,15 @@ BITRATE_CHANGE_SHARE = 0.1
 #: needs longer is not a low-latency encoder, or is not encoding at all.
 FRAME_TIMEOUT_S = 1.0
 
+#: How long a pipeline may take to start. Starting one opens the encoder
+#: device, and a driver call that does not return must not keep the thread
+#: that asked.
+START_TIMEOUT_S = 5.0
+
+#: How long a pipeline may take to stop. One that takes longer has a thread
+#: inside an element that does not return; its chain is not built again.
+STOP_TIMEOUT_S = 2.0
+
 #: Frames between two keyframes nobody asked for. Viewers ask when they need
 #: one, so this is the backstop, at libx264's own default.
 KEYFRAME_INTERVAL_FRAMES = 250
@@ -661,11 +670,14 @@ class ChainMemory:
     So the outcome of a probe is kept until `clear()`, which the runtime
     calls when `live.encoder` changes. A restart clears it by itself.
 
-    Two findings are kept apart, because they are about different things:
+    Three findings are kept apart, because they are about different things:
 
     - A chain that **cannot be built**, or does not start: an element or a
       typelib is missing, the pipeline does not parse, the device does not
       open. That is about the machine, and holds for every camera.
+    - A chain whose pipeline **did not shut down** when it was closed. A
+      thread of it is still inside an element, and building the chain again
+      would leave another there. Kept for every camera too.
     - A chain that was built and **did not encode the first picture** it
       was given. That may be the chip and it may be the picture, and one
       failure cannot tell which. It is kept for pictures of that size: the
@@ -677,7 +689,8 @@ class ChainMemory:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._unbuildable: Dict[str, str] = {}
+        # What the log says about a chain that is bad for the process.
+        self._unusable: Dict[str, str] = {}
         self._refused: Dict[Tuple[str, Tuple[int, int]], str] = {}
         self._working: Optional[str] = None
 
@@ -686,14 +699,13 @@ class ChainMemory:
     ) -> Tuple[List[Chain], Dict[str, str]]:
         """`(to try, known bad)` for a picture of `size`: the chains worth
         building, the one that worked before first, and for each of the
-        others what failed, as `cannot_be_built` and `did_not_encode` say
-        it."""
+        others what failed, in the words the log uses for it."""
         with self._lock:
             to_try: List[Chain] = []
             known_bad: Dict[str, str] = {}
             for chain in chains:
-                if chain.name in self._unbuildable:
-                    known_bad[chain.name] = cannot_be_built(chain, self._unbuildable[chain.name])
+                if chain.name in self._unusable:
+                    known_bad[chain.name] = self._unusable[chain.name]
                 elif (chain.name, size) in self._refused:
                     known_bad[chain.name] = did_not_encode(
                         chain, size, self._refused[(chain.name, size)]
@@ -705,8 +717,15 @@ class ChainMemory:
 
     def cannot_be_built(self, chain: Chain, reason: str) -> None:
         """The chain is known bad for the process."""
+        self._unusable_because(chain, cannot_be_built(chain, reason))
+
+    def did_not_shut_down(self, chain: Chain, seconds: float) -> None:
+        """The chain is known bad for the process, whatever it did before."""
+        self._unusable_because(chain, did_not_shut_down(chain, seconds))
+
+    def _unusable_because(self, chain: Chain, said: str) -> None:
         with self._lock:
-            self._unbuildable[chain.name] = reason
+            self._unusable[chain.name] = said
             if self._working == chain.name:
                 self._working = None
 
@@ -730,7 +749,7 @@ class ChainMemory:
 
     def clear(self) -> None:
         with self._lock:
-            self._unbuildable.clear()
+            self._unusable.clear()
             self._refused.clear()
             self._working = None
 
@@ -743,6 +762,12 @@ class ChainMemory:
 def cannot_be_built(chain: Chain, reason: str) -> str:
     """What the log says about a chain that could not be built or started."""
     return "{} cannot be built: {}".format(chain.name, reason)
+
+
+def did_not_shut_down(chain: Chain, seconds: float) -> str:
+    """What the log says about a chain whose pipeline was closed and did not
+    reach NULL in time."""
+    return "{} did not shut down within {:g} s".format(chain.name, seconds)
 
 
 def did_not_encode(chain: Chain, size: Tuple[int, int], reason: str) -> str:
@@ -782,6 +807,18 @@ class HardwareH264Encoder(H264Encoder):
     one that cannot be built is not built again in this process, one that
     did not encode the picture is not tried again for pictures of that
     size.
+
+    **A pipeline is started and stopped in threads of its own.** Both are
+    calls into the encoder element's driver, and one that does not return is
+    the failure the time limit of a frame exists for. aiortc calls this
+    class on a worker of the event loop's default executor, which the name
+    resolution of every reconnect, the bridge's ROS calls and every other
+    camera's encoder share: a worker lost at every live start is a bridge
+    that stops answering. So a start is waited for `START_TIMEOUT_S` and a
+    stop is not waited for at all where a frame is due; whatever does not
+    come back is left behind in a daemon thread, and its chain is not built
+    again. What failed is recorded before the pipeline is closed, never
+    after.
 
     **The fallback is the same object.** The offer said H.264 and the
     sender holds this encoder; when no chain works, or the one in use
@@ -882,8 +919,8 @@ class HardwareH264Encoder(H264Encoder):
         # A libx264 that failed inside a frame is not carried on with.
         self.codec = None
         if pipeline is not None:
-            self._close_pipeline(pipeline)
             self._memory.stopped_working(pipeline.chain)
+            self._shut_down(pipeline)
         if not was_software:
             log.warning(
                 "live.encoder=%s: the encoder failed unexpectedly (%s). The rest of this "
@@ -913,9 +950,11 @@ class HardwareH264Encoder(H264Encoder):
         pipeline = self._pipeline
         if pipeline is not None and pipeline.size != (frame.width, frame.height):
             # A picture of another size is another stream: built anew, as
-            # aiortc builds a new codec for one.
-            self._close_pipeline(pipeline)
-            pipeline = self._pipeline = None
+            # aiortc builds a new codec for one. The old one gets its time
+            # to let go of the device before the new one opens it.
+            self._pipeline = None
+            self._shut_down(pipeline).wait(STOP_TIMEOUT_S)
+            pipeline = None
         if pipeline is None:
             data = self._probe(frame)
             if data is None:
@@ -928,10 +967,13 @@ class HardwareH264Encoder(H264Encoder):
                 pipeline.set_bitrate(wanted)
             data = pipeline.encode(frame, force_keyframe)
         except Exception as exc:  # noqa: BLE001 - a chain's failure, whatever it raised
+            # What happened first, the pipeline after, and not on this
+            # thread: an element that did not return a frame may not return
+            # from being stopped either.
             self._pipeline = None
-            self._close_pipeline(pipeline)
-            self._memory.stopped_working(pipeline.chain)
             self._software = True
+            self._memory.stopped_working(pipeline.chain)
+            self._shut_down(pipeline)
             log.warning(
                 "live.encoder=%s: %s stopped working (%s). The rest of this session "
                 "is encoded in software H.264.",
@@ -948,14 +990,11 @@ class HardwareH264Encoder(H264Encoder):
         failures = ["{} (known from an earlier start)".format(said) for said in known_bad.values()]
         for index, chain in enumerate(to_try):
             try:
-                pipeline = self._pipeline_factory(
-                    chain,
-                    width=frame.width,
-                    height=frame.height,
-                    fps=self._fps,
-                    bitrate_bps=self._bitrate_bps,
-                    frame_timeout_s=self._frame_timeout_s,
-                )
+                # On this thread and without a bound: the first time, this
+                # is GStreamer scanning its plugins, which takes what it
+                # takes and is no device. The bound is for the pipeline.
+                _load_gst()
+                pipeline = self._start(chain, frame)
             except GstUnavailable as unavailable:
                 # Not this chain's failure: none of them can be built.
                 for other in to_try[index:]:
@@ -970,9 +1009,10 @@ class HardwareH264Encoder(H264Encoder):
                 # The first frame of a stream is a keyframe.
                 data = pipeline.encode(frame, True)
             except Exception as exc:  # noqa: BLE001 - a chain's failure, whatever it raised
-                self._close_pipeline(pipeline)
+                # Recorded first, closed after and elsewhere: see `_shut_down`.
                 self._memory.did_not_encode(chain, size, _reason(exc))
                 failures.append(did_not_encode(chain, size, _reason(exc)))
+                self._shut_down(pipeline)
                 continue
             self._memory.worked(chain)
             self._pipeline = pipeline
@@ -1020,27 +1060,102 @@ class HardwareH264Encoder(H264Encoder):
 
     # -- the end ---------------------------------------------------------------------
 
-    @staticmethod
-    def _close_pipeline(pipeline: Pipeline) -> None:
-        """Close a pipeline that is being given up mid-session. What goes
-        wrong is logged by type name and goes no further: the frame that is
-        being encoded matters more than the pipeline that is gone."""
-        try:
-            pipeline.close()
-        except Exception as exc:  # noqa: BLE001 - already giving it up
-            log.error("Error closing an encoder pipeline: %s", type(exc).__name__)
+    def _start(self, chain: Chain, frame: "av.VideoFrame") -> Pipeline:
+        """Build and start a pipeline for `frame` in a thread of its own,
+        and wait `START_TIMEOUT_S` for it. Raises what the build raised, or
+        `ChainFailed` when it did not come back in time. A pipeline that
+        starts after nobody waits for it any more is shut down by the thread
+        that built it."""
+        started = threading.Event()
+        guard = threading.Lock()
+        outcome: Dict[str, Any] = {}
+
+        def build() -> None:
+            try:
+                pipeline = self._pipeline_factory(
+                    chain,
+                    width=frame.width,
+                    height=frame.height,
+                    fps=self._fps,
+                    bitrate_bps=self._bitrate_bps,
+                    frame_timeout_s=self._frame_timeout_s,
+                )
+            except BaseException as exc:  # noqa: BLE001 - raised again by the thread that waits
+                outcome["error"] = exc
+                started.set()
+                return
+            with guard:
+                if "given up" not in outcome:
+                    outcome["pipeline"] = pipeline
+                    started.set()
+                    return
+            self._shut_down(pipeline)
+
+        threading.Thread(target=build, name="live-pipeline-start", daemon=True).start()
+        if not started.wait(START_TIMEOUT_S):
+            with guard:
+                if not outcome:
+                    outcome["given up"] = True
+        if "given up" in outcome:
+            raise ChainFailed("the pipeline did not start within {:g} s".format(START_TIMEOUT_S))
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["pipeline"]
+
+    def _shut_down(self, pipeline: Pipeline) -> threading.Event:
+        """Close a pipeline in a thread of its own. Returns at once; the
+        event is set when the pipeline is closed.
+
+        Stopping a pipeline waits for its streaming thread, and that thread
+        can be inside an encoder element that does not return. Whoever
+        closes it then does not return either, so nobody who has anything
+        else to do closes one: not the thread that encodes, which has a
+        frame to deliver, and not a caller that holds the lock.
+
+        A pipeline that has not stopped after `STOP_TIMEOUT_S` is left where
+        it is, in a daemon thread that holds the process up for nothing. Its
+        chain is not built again in this process, also when it had passed
+        its probe: every further start would leave another thread there.
+        That is said once, at WARNING. What goes wrong in a close that does
+        return is logged by type name and goes no further.
+        """
+        closed = threading.Event()
+        chain, memory, backend = pipeline.chain, self._memory, self._backend
+
+        def close() -> None:
+            try:
+                pipeline.close()
+            except Exception as exc:  # noqa: BLE001 - it is being given up either way
+                log.error("Error closing an encoder pipeline: %s", type(exc).__name__)
+            finally:
+                closed.set()
+
+        def watch() -> None:
+            threading.Thread(target=close, name="live-pipeline-stop", daemon=True).start()
+            if closed.wait(STOP_TIMEOUT_S):
+                return
+            memory.did_not_shut_down(chain, STOP_TIMEOUT_S)
+            log.warning(
+                "live.encoder=%s: %s. A thread of its pipeline is left behind, and the "
+                "chain is not built again until live.encoder changes or the bridge restarts.",
+                backend, did_not_shut_down(chain, STOP_TIMEOUT_S),
+            )
+
+        threading.Thread(target=watch, name="live-pipeline-watch", daemon=True).start()
+        return closed
 
     def close(self) -> None:
         """Release the pipeline and the codec. Called once by the publisher,
         in a thread of its own; waits for a frame that is still being
-        encoded, which is at most `frame_timeout_s` for each chain a probe
-        still has to try. After it, `encode()` returns nothing."""
+        encoded, which is at most `START_TIMEOUT_S` and `frame_timeout_s`
+        for each chain a probe still has to try, and then `STOP_TIMEOUT_S`
+        for the pipeline to stop. After it, `encode()` returns nothing."""
         with self._lock:
             self._closed = True
             pipeline, self._pipeline = self._pipeline, None
             self.codec = None
         if pipeline is not None:
-            pipeline.close()
+            self._shut_down(pipeline).wait(STOP_TIMEOUT_S)
 
 
 def build_encoder(setting: str, *, fps: int) -> Optional[HardwareH264Encoder]:
