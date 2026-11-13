@@ -14,6 +14,8 @@ pictures those units decode to. Bit for bit: nothing was encoded on the way.
 """
 import asyncio
 import logging
+import threading
+import time
 
 import numpy as np
 import pytest
@@ -501,6 +503,78 @@ def test_a_start_does_not_warn_about_a_keyframe_hook_it_has_no_use_for():
         logger.removeHandler(handler)
     assert untouched
     assert not [line for line in handler.messages if "keyframe" in line.lower()]
+
+
+class _ForeignEncoder:
+    """An encoder somebody built for this camera from the robot's
+    `live.encoder` setting -- a hardware pipeline, say -- before it was
+    known that the camera needs none."""
+
+    def __init__(self):
+        self.closed = threading.Event()
+        self.close_calls = 0
+        self.encode_calls = 0
+
+    def encode(self, frame, force_keyframe=False):
+        self.encode_calls += 1
+        return [], 0
+
+    def close(self):
+        self.close_calls += 1
+        self.closed.set()
+
+
+@pytest.mark.parametrize("handed", ["none", "an encoder"])
+def test_the_publisher_takes_no_other_encoder_and_closes_one_it_is_handed(handed):
+    """`live.encoder` does not apply to a passthrough camera: there is
+    nothing to encode. Whoever starts a publisher may still hand one over,
+    because that keyword goes to every publisher. It must not collide with
+    the publisher's own, must never be installed, and must be closed, since
+    the publisher is the only one who could."""
+    foreign = _ForeignEncoder() if handed == "an encoder" else None
+
+    async def scenario():
+        stream = _StreamSpy()
+        publisher, connection, signal, events = _passthrough_publisher(stream, encoder=foreign)
+        await publisher.start("wss://media.example", "room-1", "tok-1")
+        installed = getattr(connection.sender, SENDER_ENCODER_ATTR)
+        await publisher.stop()
+        return installed
+
+    installed = asyncio.run(scenario())
+    assert isinstance(installed, PassthroughEncoder)
+    if foreign is not None:
+        assert installed is not foreign
+        assert foreign.closed.wait(timeout=5.0)
+        assert foreign.close_calls == 1 and foreign.encode_calls == 0
+
+
+def test_a_handed_encoder_whose_close_raises_is_logged_by_type_name_only():
+    class Broken(_ForeignEncoder):
+        def close(self):
+            self.close_calls += 1
+            try:
+                raise RuntimeError("could not stop rtsp://camuser:not-a-real-secret@cam.local/stream")
+            finally:
+                self.closed.set()
+
+    handler = _Lines()
+    logger = logging.getLogger("fleetless_bridge.live_passthrough")
+    logger.addHandler(handler)
+    foreign = Broken()
+    try:
+        PassthroughPublisher(
+            passthrough=_StreamSpy(), holder=LatestFrameHolder(), encoder=foreign,
+            width=WIDTH, height=HEIGHT, fps=30, bitrate_kbps=1500,
+        )
+        assert foreign.closed.wait(timeout=5.0)
+        deadline = time.monotonic() + 5.0
+        while not handler.messages and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        logger.removeHandler(handler)
+    assert len(handler.messages) == 1 and "RuntimeError" in handler.messages[0]
+    assert "not-a-real-secret" not in handler.messages[0]
 
 
 def test_the_publisher_feeds_no_picture_from_any_holder():

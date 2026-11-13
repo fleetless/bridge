@@ -43,7 +43,7 @@ from test_ros_runtime import (
     run,
 )
 
-from fleetless_bridge import camera, camera_sources, passthrough, ros_runtime
+from fleetless_bridge import camera, camera_sources, live, live_passthrough, passthrough, ros_runtime
 from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.protocol import (
     CAMERA_STATE_CAUSE_COMMAND,
@@ -776,6 +776,100 @@ def test_a_picture_camera_gets_exactly_the_publisher_arguments_it_always_got():
 
     run(body, live_publisher_factory=factory)
     assert "passthrough" not in seen
+
+
+def _publishing_without_a_network(monkeypatch):
+    """The real publisher classes, started for real, with the two things
+    that would reach a LiveKit server replaced: the signalling client and the
+    peer connection. Everything between `start_live` and a started publisher
+    is then the shipped code -- the default factory, the publisher's own
+    constructor, the encoder seam."""
+    from test_live_encoder_seam import _SeamConnection, _SeamSignal
+
+    made = {"connections": [], "signals": []}
+
+    def connection_factory(ice_servers):
+        connection = _SeamConnection()
+        made["connections"].append(connection)
+        return connection
+
+    def signal_factory(url, token, **callbacks):
+        signal = _SeamSignal()
+        signal.callbacks = callbacks
+        made["signals"].append(signal)
+        return signal
+
+    monkeypatch.setattr(live, "_default_connection_factory", connection_factory)
+    monkeypatch.setattr(live, "_default_signal_factory", signal_factory)
+    return made
+
+
+def test_start_live_starts_the_real_passthrough_publisher_through_the_default_factory(units, monkeypatch):
+    """No fake factory here, on purpose. Every other runtime test hands
+    `RosRuntime` a fake publisher, so a keyword the real constructors cannot
+    take together would leave the whole suite green while every passthrough
+    start on a robot answered `TypeError`. This goes from `camera_start` to
+    a started `PassthroughPublisher`."""
+    made = _publishing_without_a_network(monkeypatch)
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("video"), _camera_cfg("front")]))
+        await _feed(rt, "video", units)
+        await rt.start_live("video", "wss://media.example", "room-1", "tok-1", "req-1")
+        await rt.start_live("front", "wss://media.example", "room-2", "tok-2", "req-2")
+        states = await _drain_camera_states(rt)
+        video, front = rt._live_publishers["video"], rt._live_publishers["front"]
+        stream = rt._cameras["video"].h264_stream
+        installed = [
+            getattr(connection.sender, live.SENDER_ENCODER_ATTR, None)
+            for connection in made["connections"]
+        ]
+        await rt.stop_all_live()
+        return states, video, front, stream, installed
+
+    states, video, front, stream, installed = run(body)
+    assert [(state.slug, state.publishing, state.error) for state in states] == [
+        ("video", True, None), ("front", True, None),
+    ]
+    assert type(video) is live_passthrough.PassthroughPublisher and video.passthrough is stream
+    assert type(front) is live.LivePublisher
+    # The passthrough camera's sender carries the encoder that forwards, and
+    # the picture camera's none of ours: aiortc builds its own there.
+    assert isinstance(installed[0], live_passthrough.PassthroughEncoder)
+    assert installed[1] is None
+
+
+@pytest.mark.parametrize("handed", ["none", "an encoder"])
+def test_the_default_factory_gives_a_passthrough_camera_its_own_encoder_whatever_it_is_handed(handed):
+    """How `encoder=` and `passthrough=` combine: a passthrough camera never
+    takes the robot's `live.encoder`. The factory may be called with both
+    keywords -- one call serves every camera -- and for a passthrough camera
+    the handed encoder is closed unused."""
+    closed = threading.Event()
+
+    class Foreign:
+        def close(self):
+            closed.set()
+
+    foreign = Foreign() if handed == "an encoder" else None
+    stream = passthrough.PassthroughStream(width=WIDTH, height=HEIGHT, slug="video")
+    publisher = ros_runtime._default_live_publisher_factory(
+        holder=camera.LatestFrameHolder(), width=WIDTH, height=HEIGHT, fps=10, bitrate_kbps=500,
+        on_lost=lambda reason: None, slug="video", received_s=None,
+        encoder=foreign, passthrough=stream,
+    )
+    assert type(publisher) is live_passthrough.PassthroughPublisher
+    assert isinstance(publisher._encoder, live_passthrough.PassthroughEncoder)
+    if foreign is not None:
+        assert closed.wait(timeout=5.0)
+
+    # And a picture camera keeps the encoder it is handed, as the seam says.
+    kept = Foreign()
+    picture = ros_runtime._default_live_publisher_factory(
+        holder=camera.LatestFrameHolder(), width=WIDTH, height=HEIGHT, fps=10, bitrate_kbps=500,
+        on_lost=lambda reason: None, slug="front", received_s=None, encoder=kept,
+    )
+    assert type(picture) is live.LivePublisher and picture._encoder is kept
 
 
 # --- snapshots (spec test 8) ---------------------------------------------------
