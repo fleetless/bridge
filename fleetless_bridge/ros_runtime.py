@@ -5278,6 +5278,9 @@ class RosRuntime:
         if entry is not expected_entry or entry.h264_stream is None:
             return
         if codec != "h264":
+            # Whatever the stream still holds is the H.264 the topic carried
+            # before: of a camera that is refused, nothing is published.
+            entry.h264_stream.reset()
             self._on_passthrough_refused(
                 slug, entry,
                 "the topic carries {} and not H.264; passthrough forwards H.264 "
@@ -5364,23 +5367,39 @@ class RosRuntime:
         decoded nowhere else at all.
 
         One keyframe is decoded once: a snapshot that comes due before the
-        next keyframe sends the picture `entry.latest` already holds. The
-        picture goes through `_on_source_frame` like every other, so `fps`
-        bounds how often one is taken and the header carries the keyframe's
-        capture time."""
+        next keyframe sends the picture `entry.latest` already holds. `fps`
+        bounds how often one is taken, and the header carries the keyframe's
+        capture time.
+
+        **A still is not a frame arriving.** The picture goes into
+        `entry.latest` here, and not through `_on_source_frame`, whose last
+        step clears the camera's source error: the keyframe may have been
+        kept for a while, and a camera is reported healthy by a unit that
+        arrived (`_on_camera_video`, the RTSP adapter's `on_healthy`), never
+        by somebody looking at what it sent earlier. For the same reason
+        nothing is decoded while an error stands: what the stream still
+        holds then is from before the error."""
         stream = entry.h264_stream
         if stream is None or not entry.passes_through:
+            return
+        if entry.last_source_error is not None:
             return
         keyframe = stream.newest_keyframe()
         if keyframe is None or keyframe.timestamp_ms == entry.keyframe_decoded_ms:
             return
+        if not entry.rate.should_send(None, time.monotonic()):
+            return  # too soon by `fps`; this keyframe, or a newer one, at the next pull
         entry.keyframe_decoded_ms = keyframe.timestamp_ms
         try:
             bgr = passthrough.decode_keyframe(keyframe.data)
+            frame = camera.resize_if_needed(bgr, width=entry.width, height=entry.height)
         except passthrough.KeyframeDecodeError as exc:
             log.error("Could not decode a keyframe for a snapshot of camera slug %r: %s", slug, exc)
             return
-        self._on_source_frame(slug, entry, bgr, keyframe.timestamp_ms)
+        except Exception:  # noqa: BLE001 - one bad picture must not end the snapshot walk
+            log.exception("Could not resize a keyframe's picture for slug %r", slug)
+            return
+        entry.latest.set(frame, keyframe.timestamp_ms)
 
     # --- the shared watchdog: one timer, runs on the executor ---------------
 

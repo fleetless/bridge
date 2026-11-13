@@ -877,6 +877,105 @@ def test_a_keyframe_that_does_not_decode_is_logged_and_tried_once(units, monkeyp
     assert len(attempts) == 1  # not once per pull
 
 
+# --- a still is not a frame arriving -------------------------------------------
+
+
+class _InertPassthroughAdapter(_RecordingAdapter):
+    built = []
+
+
+async def _rtsp_passthrough_camera(rt, slug="yard"):
+    """An RTSP passthrough camera whose adapter does nothing by itself: the
+    test plays the adapter's thread, which pushes into the camera's stream
+    and reports through `_on_source_error`."""
+    with mock.patch.object(camera_sources, "RtspPassthroughSourceAdapter", _InertPassthroughAdapter):
+        await rt.apply_cameras(by_slug([_rtsp_camera(slug, True)]))
+    return rt._cameras[slug]
+
+
+def test_a_still_from_a_keyframe_kept_across_an_outage_does_not_report_the_camera_recovered(units):
+    """The camera delivered keyframes and then dropped. The stream still
+    holds the last one. A snapshot that falls due must not decode it as if a
+    frame had arrived: the error stands, nothing says "recovered", and no
+    picture of the stream that is gone goes out as the camera's snapshot."""
+    async def body(rt):
+        entry = await _rtsp_passthrough_camera(rt)
+        for index, unit in enumerate(units[:6]):
+            assert entry.h264_stream.push(unit, 1_000_000 + index * 33) is True
+        await rt._submit_async(lambda: rt._on_source_error(
+            "yard", entry, "source_unavailable", "the camera stopped delivering packets",
+        ))
+        reported = await _drain_camera_states(rt)
+        snapshot = await rt.next_snapshot(10_000_000)
+        after_the_snapshot = await _drain_camera_states(rt)
+        return reported, snapshot, after_the_snapshot, entry.last_source_error
+
+    reported, snapshot, after_the_snapshot, standing = run(body)
+    assert [(state.cause, state.error[0]) for state in reported] == [
+        (CAMERA_STATE_CAUSE_SOURCE, "source_unavailable")
+    ]
+    assert snapshot is None
+    assert after_the_snapshot == []  # in particular: no `cause: source, error: null`
+    assert standing is not None and standing[0] == "source_unavailable"
+
+
+def test_a_start_after_an_outage_is_answered_with_the_error_also_when_a_snapshot_was_due(units):
+    """The gate for a passthrough camera with a standing error only holds
+    if nothing lifts the error behind its back. Before, the due snapshot
+    did, and the next `camera_start` opened a publisher with nothing to
+    forward."""
+    async def body(rt):
+        entry = await _rtsp_passthrough_camera(rt)
+        for index, unit in enumerate(units[:6]):
+            entry.h264_stream.push(unit, 1_000_000 + index * 33)
+        await rt._submit_async(lambda: rt._on_source_error(
+            "yard", entry, "source_unavailable", "the camera stopped delivering packets",
+        ))
+        await rt.next_snapshot(10_000_000)
+        await _drain_camera_states(rt)
+        await rt.start_live("yard", "wss://media.example", "room-1", "tok-1", "req-1")
+        return await _drain_camera_states(rt), dict(rt._live_publishers)
+
+    states, live = run(body, live_publisher_factory=_factory())
+    (answer,) = states
+    assert answer.cause == CAMERA_STATE_CAUSE_COMMAND and answer.request_id == "req-1"
+    assert answer.publishing is False and answer.error[0] == "source_unavailable"
+    assert live == {} and _FakeLivePublisher.instances == []
+
+
+def test_a_still_taken_while_the_camera_works_changes_nothing_about_its_health(units, monkeypatch):
+    """The other half: with no error standing, a snapshot is decoded and
+    sent, and it queues no state. Health is reported by units that arrive."""
+    decoders = _counting(monkeypatch, passthrough, "_new_decoder")
+
+    async def body(rt):
+        entry = await _rtsp_passthrough_camera(rt)
+        for index, unit in enumerate(units[:6]):
+            entry.h264_stream.push(unit, 1_000_000 + index * 33)
+        wire = await _pull_snapshot(rt)
+        return wire, await _drain_camera_states(rt)
+
+    wire, states = run(body)
+    assert _split_snapshot_frame(wire)[0]["timestamp_ms"] == 1_000_000 + 5 * 33
+    assert states == [] and len(decoders) == 1
+
+
+def test_a_topic_that_turns_to_another_codec_takes_its_last_keyframe_with_it(units, compressed_video):
+    """`CompressedVideo` carried H.264 and now says `h265`. What the stream
+    still holds is the old stream's keyframe; of a camera that is refused,
+    nothing is published."""
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
+        entry = rt._cameras["front"]
+        await _feed(rt, "front", units[:6])
+        assert entry.h264_stream.newest_keyframe() is not None
+        message = compressed_video(data=b"\x00\x00\x00\x01\x40\x01", format="h265")
+        await rt._submit_async(lambda: entry.adapter._route_video(message))
+        return entry.h264_stream.newest_keyframe(), await rt.next_snapshot(10_000_000)
+
+    assert run(body) == (None, None)
+
+
 # --- low-bandwidth mode (spec test 10) -----------------------------------------
 
 

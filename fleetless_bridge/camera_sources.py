@@ -1387,9 +1387,9 @@ class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
     connect time and no log line, and the shared loop reconnects with backoff.
 
     **It feeds a stream, not a frame callback.** `stream` is the camera's
-    `passthrough.PassthroughStream`; this adapter's thread calls `reset()` at
-    every connect, `set_parameter_sets()` with what the session description
-    carried, and `push()` for every access unit. The units therefore never
+    `passthrough.PassthroughStream`; this adapter's thread calls `reset()`
+    when a session opens and again when it ends, `set_parameter_sets()` with
+    what the session description carried, and `push()` for every access unit. The units therefore never
     cross the ROS executor on their way to the sender. `on_healthy(timestamp_ms)`
     is called once per connection, when the stream has accepted its first
     keyframe; `on_error` as for every adapter.
@@ -1463,6 +1463,11 @@ class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
                 container.close()  # always from this thread, as for a capture
             except Exception as exc:  # noqa: BLE001 - already leaving; nothing to report to
                 log.debug("Error closing an RTSP container: %s", type(exc).__name__)
+            # The session is over, and the stream object outlives it. Its
+            # newest keyframe and its queue belong to a stream that ended: a
+            # snapshot must not be decoded from the one, nor a viewer handed
+            # the other.
+            self._stream.reset()
 
     def _read(self, container) -> None:
         videos = list(container.streams.video)
