@@ -66,6 +66,10 @@ def generate_launch_description() -> LaunchDescription:
                 "low_bandwidth.datapoint_max_hz": 1.0,
                 "low_bandwidth.camera": "reduce",
                 "low_bandwidth.camera_bitrate_kbps": 300,
+                # The largest RTP packet of live video, in bytes before SRTP;
+                # 576 to 1350. At its default too, and overridden by the
+                # `live` section of the published `fleetless.yaml`.
+                "live.max_packet_bytes": 1200,
             }],
         ),
     ])

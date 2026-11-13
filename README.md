@@ -189,6 +189,40 @@ link recovers. Without `retention` there is no buffer and the held-back
 samples are gone, and a stream ended under `stop` stays ended until somebody
 starts it again.
 
+## 📦 Live video packet size
+
+Live video leaves the robot as RTP packets, and the largest one is a setting.
+The default is what browsers send and fits a path with an MTU of 1280, which
+is what a VPN usually leaves. A packet that does not fit such a path is not
+trimmed on the way. It is dropped, and the viewer gets a track and no picture.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `live.max_packet_bytes` | `1200` | The largest RTP packet the bridge sends, before SRTP: header, header extensions and payload, retransmissions included. An integer from `576` to `1350`. |
+
+It holds for every camera of the robot, and it moves at runtime:
+
+```sh
+ros2 param set /fleetless_bridge live.max_packet_bytes 1000
+```
+
+The packets of the next frame obey the new value; no stream restarts. A value
+outside the bounds, or one that is not an integer, is refused by the set with
+the rule, and the parameter keeps what it had. The ceiling is not a taste: the
+SRTP library protects no packet above 1356 bytes.
+
+The published `fleetless.yaml` overrides the parameter for as long as it names
+the key:
+
+```yaml
+live:
+  max_packet_bytes: 1000
+```
+
+Lower it when a viewer sits behind a tunnel inside a tunnel: take the smallest
+MTU on the path and subtract 80. Smaller packets mean more of them, so go as
+low as the path needs and no lower.
+
 ## 📄 What the robot exposes
 
 Nothing, on its own. What a robot exposes is a document, `fleetless.yaml`,

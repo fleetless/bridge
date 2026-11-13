@@ -15,6 +15,7 @@ from fleetless_bridge.link_mode import LowBandwidthSettings
 from fleetless_bridge.protocol import (
     APPLY_ERROR_CODE_UNKNOWN,
     APPLY_ERROR_KIND_DATAPOINT,
+    LIVE_DEFAULTS,
     LOW_BANDWIDTH_DEFAULTS,
     ApplyError,
     CancelOutcome,
@@ -122,6 +123,12 @@ class FakeRos:
         self.low_bandwidth_section = {}
         self.low_bandwidth_calls = []
         self.low_bandwidth_callback = None
+        # The `live` settings, the same three handles: the parameter layer,
+        # the callback after a `ros2 param set`, and every lever pull.
+        self.live_params_value = dict(LIVE_DEFAULTS)
+        self.live_callback = None
+        self.live_settings_calls = []
+        self.set_live_settings_raises = None
         self._apply_errors = apply_errors or []
         self._apply_action_errors = apply_action_errors or []
         self._apply_service_errors = apply_service_errors or []
@@ -220,6 +227,18 @@ class FakeRos:
 
     def set_low_bandwidth_section(self, section):
         self.low_bandwidth_section = dict(section)
+
+    def live_params(self):
+        return dict(self.live_params_value)
+
+    def on_live_params(self, callback):
+        self.live_callback = callback
+
+    def set_live_settings(self, settings):
+        self.live_settings_calls.append(settings)
+        if self.set_live_settings_raises is not None:
+            raise self.set_live_settings_raises
+        return settings.max_packet_bytes
 
     def refuse_or_accept_param(self, key, value):
         """Stand in for the runtime's parameter callback: validate the whole
