@@ -883,6 +883,57 @@ def test_a_close_of_a_pipeline_that_does_not_stop_returns_after_its_bound(short_
     assert _soon(lambda: wedge.built[0].final_state == "null")
 
 
+def _left_behind(logged):
+    """The warnings about a pipeline that did not shut down, and only those:
+    a later session's fallback warning quotes the same words as its reason."""
+    return [text for text in logged.at(logging.WARNING) if "is left behind" in text]
+
+
+def test_a_picture_of_another_size_does_not_rebuild_a_chain_whose_pipeline_did_not_stop(
+    short_bounds, logged
+):
+    """A change of picture size closes the old pipeline, waits for it, and
+    probes. If the old one does not stop, the chain is known bad before that
+    probe reads the memory: not a moment after, when the thread that watches
+    the close gets round to saying so."""
+    for round_ in range(5):  # a race, so more than once
+        wedge = _Wedge(good=2)
+        memory = ChainMemory()
+        encoder = _stand_in(pipeline_factory=wedge, memory=memory, frame_timeout_s=5.0)
+        try:
+            assert encoder.encode(moving_frame(0), False)[0]
+            assert encoder.encode(moving_frame(1), False)[0]
+            # A third buffer is held inside the element, and nobody waits for it.
+            first = wedge.built[0]
+            first._src.emit("push-buffer", first._Gst.Buffer.new_wrapped(b"\0" * 115200))
+            assert _soon(lambda: wedge.seen == 3)
+
+            began = time.monotonic()
+            payloads, _ = encoder.encode(moving_frame(2, width=160, height=120), False)
+            took = time.monotonic() - began
+            assert payloads and encoder.software
+            assert 0.4 <= took < 2.0
+            # The chain was not built a second time, for the new size or any.
+            assert len(wedge.built) == 1
+            assert memory.candidates((STAND_IN,), (160, 120)) == (
+                [], {STAND_IN.name: "stand-in/x264 did not shut down within 0.4 s"}
+            )
+            assert {NAL_SPS, NAL_PPS, NAL_IDR} <= set(encoder.calls[2][1])
+            # Recorded and said in one step, by whoever waited in vain first:
+            # the line is in the log when the memory has it, and once.
+            assert len(_left_behind(logged)) == round_ + 1
+            # And the session's own warning names it as the reason for software.
+            assert "stand-in/x264 did not shut down within 0.4 s (known from an earlier start)" in (
+                logged.at(logging.WARNING)[-1]
+            )
+        finally:
+            wedge.release.set()
+            encoder.close()
+        assert _soon(lambda: wedge.built[0].final_state == "null")
+    time.sleep(0.6)  # past the watchers' own wait: none of them says it again
+    assert len(_left_behind(logged)) == 5
+
+
 def test_wedged_encoders_do_not_use_up_the_executor_or_hold_the_process_at_exit():
     """What the bridge does with it: aiortc encodes on the event loop's
     default executor, which name resolution and the ROS calls share. Twenty
