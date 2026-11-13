@@ -2017,3 +2017,220 @@ def test_a_healthy_rtsp_camera_can_wait_behind_several_broken_ones_at_the_full_t
             wait_7, wait_14
         )
     )
+
+
+# --- MJPEG: every part handed over as bytes, decoded only on demand -------------
+
+
+class _JpegRecorder(_Recorder):
+    """`_Recorder`, with the third callback and the thread each one ran on."""
+
+    def __init__(self):
+        super().__init__()
+        self.jpegs = []
+        self.jpeg_threads = set()
+        self.frame_threads = set()
+
+    def on_jpeg(self, data, timestamp_ms):
+        with self._lock:
+            self.jpegs.append((data, timestamp_ms))
+            self.jpeg_threads.add(threading.get_ident())
+
+    def on_frame(self, bgr, timestamp_ms):
+        with self._lock:
+            self.frame_threads.add(threading.get_ident())
+        super().on_frame(bgr, timestamp_ms)
+
+    def wait_for_jpegs(self, n, timeout_s=2.0):
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            with self._lock:
+                if len(self.jpegs) >= n:
+                    return
+            time.sleep(0.01)
+        raise AssertionError("timed out waiting for {} parts, got {}".format(n, len(self.jpegs)))
+
+
+class _FedMjpegResponse:
+    """A response the test feeds part by part; `read` blocks like a socket."""
+
+    def __init__(self):
+        self._chunks = queue.Queue()
+        self.closed = False
+
+    def send(self, part: bytes):
+        self._chunks.put(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + part + b"\r\n")
+
+    def read(self, _n):
+        while not self.closed:
+            try:
+                return self._chunks.get(timeout=0.02)
+            except queue.Empty:
+                continue
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+def _count_imdecode(monkeypatch):
+    calls = []
+    original = cv2.imdecode
+
+    def counted(*args, **kwargs):
+        calls.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cv2, "imdecode", counted)
+    return calls
+
+
+def _distinct_jpegs(count):
+    return [_jpeg_bytes(_solid_frame(color=(10 * index, 20, 30))) for index in range(1, count + 1)]
+
+
+def test_mjpeg_adapter_hands_over_every_part_as_bytes_with_its_capture_time():
+    parts = _distinct_jpegs(3)
+    response = _FedMjpegResponse()
+    rec = _JpegRecorder()
+    adapter = MjpegSourceAdapter(
+        url="http://192.0.2.1/video", credentials=None,
+        on_frame=rec.on_frame, on_error=rec.on_error, on_jpeg=rec.on_jpeg,
+        opener=lambda request: response,
+    )
+    before_ms = int(time.time() * 1000)
+    adapter.start()
+    try:
+        for part in parts:
+            response.send(part)
+        rec.wait_for_jpegs(3)
+        rec.wait_for_frames(3)
+    finally:
+        adapter.stop()
+    # The bytes of each part exactly: from its start marker to its end
+    # marker, without the multipart text around it.
+    assert [data for data, _ in rec.jpegs] == parts
+    assert all(type(data) is bytes for data, _ in rec.jpegs)
+    stamps = [timestamp_ms for _, timestamp_ms in rec.jpegs]
+    assert stamps == sorted(stamps) and before_ms <= stamps[0] <= int(time.time() * 1000)
+    # A part and the frame decoded from it carry the same capture time.
+    assert [timestamp_ms for _, timestamp_ms in rec.frames] == stamps
+
+
+def test_mjpeg_adapter_decodes_nothing_while_no_converted_frame_is_wanted(monkeypatch):
+    parts = _distinct_jpegs(4)
+    decodes = _count_imdecode(monkeypatch)
+    response = _FedMjpegResponse()
+    rec = _JpegRecorder()
+    adapter = MjpegSourceAdapter(
+        url="http://192.0.2.1/video", credentials=None,
+        on_frame=rec.on_frame, on_error=rec.on_error, on_jpeg=rec.on_jpeg,
+        conversion_wanted=lambda: False,
+        opener=lambda request: response,
+    )
+    adapter.start()
+    try:
+        for part in parts:
+            response.send(part)
+        rec.wait_for_jpegs(4)
+        # Read before the stop, which ends the stream and is reported as that.
+        errors_while_running = list(rec.errors)
+    finally:
+        adapter.stop()
+    # Four frames are known to have arrived, and none was decoded for it.
+    assert [data for data, _ in rec.jpegs] == parts
+    assert decodes == []
+    assert rec.frames == [] and errors_while_running == []
+
+
+def test_mjpeg_adapter_decodes_on_its_own_thread_once_a_frame_is_wanted(monkeypatch):
+    first, second, third = _distinct_jpegs(3)
+    decodes = _count_imdecode(monkeypatch)
+    wanted = threading.Event()
+    response = _FedMjpegResponse()
+    rec = _JpegRecorder()
+    adapter = MjpegSourceAdapter(
+        url="http://192.0.2.1/video", credentials=None,
+        on_frame=rec.on_frame, on_error=rec.on_error, on_jpeg=rec.on_jpeg,
+        conversion_wanted=wanted.is_set,
+        opener=lambda request: response,
+    )
+    adapter.start()
+    try:
+        response.send(first)
+        rec.wait_for_jpegs(1)
+        assert decodes == [] and rec.frames == []
+
+        wanted.set()
+        response.send(second)
+        rec.wait_for_frames(1)
+        assert len(decodes) == 1
+
+        wanted.clear()
+        response.send(third)
+        rec.wait_for_jpegs(3)
+    finally:
+        adapter.stop()
+    assert len(decodes) == 1 and len(rec.frames) == 1
+    assert rec.frames[0][1] == rec.jpegs[1][1]
+    # Decoded where the stream is read, not on whoever asked.
+    assert set(decodes) == rec.jpeg_threads == rec.frame_threads
+    assert threading.get_ident() not in rec.jpeg_threads
+
+
+def test_mjpeg_adapter_says_once_that_parts_do_not_decode_and_keeps_going(capfd):
+    good = _distinct_jpegs(2)
+    # Two markers and nothing an image decoder accepts in between.
+    bad = b"\xff\xd8" + bytes(64) + b"\xff\xd9"
+    response = _FedMjpegResponse()
+    rec = _JpegRecorder()
+    adapter = MjpegSourceAdapter(
+        url="http://user:campass@192.0.2.1/video", credentials=None,
+        on_frame=rec.on_frame, on_error=rec.on_error, on_jpeg=rec.on_jpeg,
+        opener=lambda request: response,
+    )
+    adapter.start()
+    try:
+        for part in (good[0], bad, bad, bad, good[1], bad):
+            response.send(part)
+        rec.wait_for_jpegs(6)
+        rec.wait_for_frames(2)
+        errors_while_running = list(rec.errors)
+    finally:
+        adapter.stop()
+    # Every part was handed over as bytes; the two that decode became frames.
+    assert [data for data, _ in rec.jpegs] == [good[0], bad, bad, bad, good[1], bad]
+    assert len(rec.frames) == 2
+    # A part that does not decode is not a camera error: the stream is there.
+    assert errors_while_running == []
+    # Once per run of bad parts: three in a row are one line, and the one
+    # after a good part is a second.
+    logged = capfd.readouterr().err
+    assert logged.count("did not decode as an image") == 2
+    assert "campass" not in logged and "192.0.2.1" not in logged
+
+
+def test_a_failing_on_jpeg_does_not_end_the_stream(capfd):
+    parts = _distinct_jpegs(2)
+    response = _FedMjpegResponse()
+    rec = _JpegRecorder()
+
+    def failing(data, timestamp_ms):
+        raise RuntimeError("http://user:campass@192.0.2.1/video")
+
+    adapter = MjpegSourceAdapter(
+        url="http://192.0.2.1/video", credentials=None,
+        on_frame=rec.on_frame, on_error=rec.on_error, on_jpeg=failing,
+        opener=lambda request: response,
+    )
+    adapter.start()
+    try:
+        for part in parts:
+            response.send(part)
+        rec.wait_for_frames(2)
+        errors_while_running = list(rec.errors)
+    finally:
+        adapter.stop()
+    assert errors_while_running == []
+    logged = capfd.readouterr().err
+    assert "RuntimeError" in logged and "campass" not in logged

@@ -10,11 +10,13 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import BatteryState, CompressedImage, Image
 
 from fleetless_bridge.camera import (
+    EncodedFrameHolder,
     LatestFrameHolder,
     RawFrameHolder,
     UnsupportedImageError,
     encode_jpeg,
     encode_snapshot_jpeg,
+    jpeg_size,
     resize_if_needed,
     to_bgr,
 )
@@ -216,3 +218,211 @@ def test_raw_frame_holder_remembers_when_the_message_arrived():
     assert frame.timestamp_ms == 123
     assert before <= frame.arrived_s <= after
     assert holder.take_frame() is None
+
+
+# --- to_bgr, from the bytes of a JPEG -----------------------------------------
+
+
+def test_to_bgr_decodes_the_bytes_of_a_jpeg():
+    """An MJPEG part is held as bytes, not as a message."""
+    frame = _solid_frame(height=20, width=30)
+    data = encode_jpeg(frame)
+    for held in (data, bytearray(data), memoryview(data)):
+        assert to_bgr(held).shape == frame.shape
+
+
+def test_to_bgr_rejects_bytes_that_are_not_an_image():
+    with pytest.raises(UnsupportedImageError):
+        to_bgr(b"--boundary\r\nContent-Type: image/jpeg\r\n\r\n")
+    with pytest.raises(UnsupportedImageError):
+        to_bgr(b"")
+
+
+# --- jpeg_size ----------------------------------------------------------------
+#
+# Read from the header, never decoded. Only what every browser shows gets a
+# size back: baseline or progressive, 8 bits, one or three components.
+
+
+def _jpeg(width=64, height=48, *, progressive=False, grey=False, quality=80):
+    import cv2
+
+    rng = np.random.default_rng(894)
+    shape = (height, width) if grey else (height, width, 3)
+    picture = rng.integers(0, 255, shape, dtype=np.uint8)
+    params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    if progressive:
+        params += [cv2.IMWRITE_JPEG_PROGRESSIVE, 1]
+    ok, buf = cv2.imencode(".jpg", picture, params)
+    assert ok
+    return buf.tobytes()
+
+
+def _segment(marker, payload):
+    import struct
+
+    return b"\xff" + bytes([marker]) + struct.pack(">H", len(payload) + 2) + payload
+
+
+def _headers_only(*, sof=0xC0, precision=8, components=3, width=64, height=48):
+    """The smallest thing with a JPEG's headers: a frame header, a scan
+    header, two bytes of scan and the end marker. No decoder would show it,
+    and the reader does not decode: what it says depends on the headers
+    alone, so each field can be varied by itself."""
+    import struct
+
+    frame_header = (
+        bytes([precision]) + struct.pack(">HH", height, width) + bytes([components])
+        + b"".join(bytes([index + 1, 0x11, 0]) for index in range(components))
+    )
+    scan_header = (
+        bytes([components]) + b"".join(bytes([index + 1, 0]) for index in range(components))
+        + bytes([0, 63, 0])
+    )
+    return (
+        b"\xff\xd8" + _segment(sof, frame_header) + _segment(0xDA, scan_header)
+        + b"\x12\x34" + b"\xff\xd9"
+    )
+
+
+@pytest.mark.parametrize("progressive", [False, True])
+@pytest.mark.parametrize("grey", [False, True])
+@pytest.mark.parametrize("size", [(64, 48), (1024, 768), (768, 1024), (33, 17), (1, 1)])
+def test_jpeg_size_reads_baseline_and_progressive_files(size, grey, progressive):
+    width, height = size
+    data = _jpeg(width, height, progressive=progressive, grey=grey)
+    # The file is what it is meant to be: the frame header says so.
+    assert (b"\xff\xc2" in data) == progressive
+    assert jpeg_size(data) == (width, height)
+
+
+def test_jpeg_size_reads_whatever_holds_the_bytes():
+    """A ROS message carries them as `array('B')`; an MJPEG part is `bytes`."""
+    import array
+
+    data = _jpeg(40, 30)
+    for held in (
+        data, bytearray(data), memoryview(data), array.array("B", data),
+        np.frombuffer(data, np.uint8),
+    ):
+        assert jpeg_size(held) == (40, 30)
+
+
+def test_jpeg_size_does_not_decode():
+    """A header chain with two bytes of scan: nothing could decode it."""
+    import cv2
+
+    data = _headers_only(width=640, height=480)
+    assert cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) is None
+    assert jpeg_size(data) == (640, 480)
+    assert jpeg_size(_headers_only(sof=0xC2, components=1, width=7, height=9)) == (7, 9)
+
+
+def test_jpeg_size_skips_a_thumbnail_inside_an_application_segment():
+    """An EXIF block may hold a whole small JPEG, with its own start, frame
+    header and end. It sits inside a segment and is skipped by its length."""
+    thumbnail = _jpeg(16, 12)
+    data = _jpeg(320, 240)
+    with_thumbnail = data[:2] + _segment(0xE1, b"Exif\x00\x00" + thumbnail) + data[2:]
+    assert jpeg_size(with_thumbnail) == (320, 240)
+
+
+def test_jpeg_size_accepts_fill_bytes_before_a_marker():
+    data = _jpeg(64, 48)
+    assert jpeg_size(data[:2] + b"\xff\xff\xff" + data[2:]) == (64, 48)
+
+
+@pytest.mark.parametrize(
+    "what, data",
+    [
+        ("four components, as in CMYK", _headers_only(components=4)),
+        ("two components", _headers_only(components=2)),
+        ("12 bits a sample", _headers_only(sof=0xC1, precision=12)),
+        ("12 bits claimed in a baseline header", _headers_only(precision=12)),
+        ("extended sequential", _headers_only(sof=0xC1)),
+        ("lossless", _headers_only(sof=0xC3)),
+        ("arithmetic coding", _headers_only(sof=0xC9)),
+        ("progressive with arithmetic coding", _headers_only(sof=0xCA)),
+        ("a width of zero", _headers_only(width=0)),
+        ("a height of zero", _headers_only(height=0)),
+    ],
+)
+def test_jpeg_size_refuses_what_not_every_browser_shows(what, data):
+    # The same bytes with the plain values are accepted, so the refusal is
+    # about the one field that differs.
+    assert jpeg_size(_headers_only()) == (64, 48)
+    assert jpeg_size(data) is None, what
+
+
+def test_jpeg_size_refuses_every_truncation_of_a_real_file():
+    data = _jpeg(64, 48, quality=30)
+    assert jpeg_size(data) == (64, 48)
+    for length in range(len(data)):
+        assert jpeg_size(data[:length]) is None, length
+
+
+def test_jpeg_size_refuses_a_file_that_does_not_end_where_a_jpeg_ends():
+    data = _jpeg(64, 48)
+    assert jpeg_size(data + b"\x00") is None
+    assert jpeg_size(data[:-2] + b"\xff\xd8") is None
+
+
+def test_jpeg_size_refuses_what_is_not_a_jpeg():
+    import cv2
+
+    ok, png = cv2.imencode(".png", _solid_frame(height=20, width=30))
+    assert ok
+    for data in (
+        png.tobytes(),
+        b"",
+        b"\xff",
+        b"\xff\xd8",
+        b"\xff\xd8\xff\xd9",
+        b"GIF89a" + bytes(40),
+        bytes(np.random.default_rng(1).integers(0, 255, 4096, dtype=np.uint8)),
+        b"\xff\xd8" + bytes(64) + b"\xff\xd9",
+    ):
+        assert jpeg_size(data) is None
+    for not_bytes in (
+        None, 12, "\xff\xd8", [0xFF, 0xD8], np.zeros((4, 4), np.uint8), np.zeros(8, np.uint16),
+    ):
+        assert jpeg_size(not_bytes) is None
+
+
+def test_jpeg_size_refuses_a_segment_that_runs_past_the_end():
+    data = _jpeg(64, 48)
+    # The first segment after the start marker, claiming to be longer than the file.
+    assert jpeg_size(data[:4] + b"\xff\xff" + data[6:]) is None
+    # And one whose length is smaller than its own two bytes.
+    assert jpeg_size(data[:4] + b"\x00\x01" + data[6:]) is None
+
+
+def test_jpeg_size_refuses_a_scan_without_a_frame_header_and_a_second_frame_header():
+    import struct
+
+    scan = _segment(0xDA, bytes([1, 1, 0, 0, 63, 0]))
+    assert jpeg_size(b"\xff\xd8" + scan + b"\x12\xff\xd9") is None
+    one = _headers_only()
+    frame_header = one[2:one.index(b"\xff\xda")]
+    assert jpeg_size(one[:2] + frame_header + one[2:]) is None
+    # A frame header shorter than its component count says.
+    short = bytes([8]) + struct.pack(">HH", 48, 64) + bytes([3]) + bytes([1, 0x11, 0])
+    assert jpeg_size(b"\xff\xd8" + _segment(0xC0, short) + scan + b"\x12\xff\xd9") is None
+
+
+# --- EncodedFrameHolder -------------------------------------------------------
+
+
+def test_encoded_frame_holder_starts_empty():
+    assert EncodedFrameHolder().get() is None
+
+
+def test_encoded_frame_holder_keeps_the_newest_frame_and_does_not_hand_it_out_only_once():
+    holder = EncodedFrameHolder()
+    first, second = _jpeg(8, 8), _jpeg(16, 8)
+    holder.set(first, 1_000)
+    holder.set(second, 2_000)
+    held = holder.get()
+    # The same object, not a copy: keeping a frame costs a reference.
+    assert held.data is second and held.timestamp_ms == 2_000
+    assert holder.get() is held
