@@ -32,12 +32,28 @@ signalling and the frame feed are `live.py`'s and `livekit_signal.py`'s.
 tools/live-proof/run-proof.sh humble vp8
 ```
 
-`run-proof.sh <distro> <vp8|h264|all> [--still]` starts the publisher inside
-`fleetless-bridge-dev-<distro>` on the host network, waits for it to report
-ICE connected, and then runs the browser viewer against the same room. Both
-logs land in `tools/live-proof/logs/<distro>-<codec>/`, and both matter: a
-viewer that saw nothing next to a publisher that never reached `connected` is
-a different finding from one next to a publisher that did.
+`run-proof.sh <distro> <vp8|h264|all|passthrough> [--still]` starts the
+publisher inside `fleetless-bridge-dev-<distro>` on the host network, waits
+for it to report ICE connected, and then runs the browser viewer against the
+same room. Both logs land in `tools/live-proof/logs/<distro>-<codec>/`, and
+both matter: a viewer that saw nothing next to a publisher that never reached
+`connected` is a different finding from one next to a publisher that did.
+
+`passthrough` is not a third codec but the other publisher,
+`live_passthrough.PassthroughPublisher`. The harness plays a camera that
+delivers H.264 (it encodes the pattern once with libx264, High profile, a
+keyframe a second, no B-frames) and pushes the access units into a
+`PassthroughStream`; the bridge's code forwards them. Its log ends with what
+this case is run for:
+
+```
+grep "ENCODER" tools/live-proof/logs/humble-passthrough/publisher.log
+... HARNESS ENCODER NEVER ASKED TO ENCODE (PassthroughEncoder, codec context: None)
+```
+
+The viewer needs a browser that decodes H.264. Google Chrome does; a
+Chromium built without proprietary codecs shows no picture, which is a fact
+about that browser and not about the stream (`CHROME_PATH` picks the browser).
 
 The publisher's log also says how long the start took, in the line the
 bridge logs on a robot:

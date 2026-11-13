@@ -23,6 +23,14 @@ software stand-in chain: the same class, the same GStreamer pipeline, with
 run fails if the encoder fell back to aiortc's libx264 on the way, because
 the proof is about the pipeline and a fallback would pass for it.
 
+`--codec passthrough` is the other publisher, `PassthroughPublisher`: the
+pattern is encoded once, here, with libx264 -- this harness playing a camera
+that delivers H.264 -- and its access units are pushed into a
+`PassthroughStream` at the frame rate. The bridge's side of that forwards
+them and encodes nothing; the run ends by saying whether the encoder the
+publisher installed ever opened a codec. `--encoder` does not apply to it:
+a passthrough camera takes no encoder.
+
 The token is minted with `hmac`/`hashlib` rather than a JWT library so that
 nothing in the proof can be mistaken for a dependency of the package. The
 publisher itself imports nothing this harness added.
@@ -30,6 +38,7 @@ publisher itself imports nothing this harness added.
 import argparse
 import asyncio
 import base64
+import fractions
 import hashlib
 import hmac
 import json
@@ -44,13 +53,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from aiortc import RTCPeerConnection, RTCRtpSender  # noqa: E402
 
-from fleetless_bridge import live  # noqa: E402
+from fleetless_bridge import live, live_passthrough  # noqa: E402
 from fleetless_bridge.camera import LatestFrameHolder  # noqa: E402
 from fleetless_bridge.live_encoder import (  # noqa: E402
     STAND_IN,
     ChainMemory,
     HardwareH264Encoder,
 )
+from fleetless_bridge.passthrough import PassthroughStream  # noqa: E402
 
 
 def log(*args):
@@ -99,6 +109,104 @@ def pattern(width, height, n):
     # above, so the channel swap the publisher performs is visible in the
     # result rather than cancelled out by building it backwards here.
     return frame[:, :, ::-1].copy()
+
+
+def h264_camera(width, height, fps, seconds, still):
+    """What an H.264 camera sends: `seconds` of the pattern as access units,
+    Annex B, a keyframe every second with SPS and PPS, no B-frames, High
+    profile. Encoded once and played in a loop; the loop closes on a
+    keyframe, so a decoder never notices the seam.
+
+    High profile on purpose. The publisher's offer names the profiles aiortc
+    can encode, which are baseline; a browser decodes what the SPS says, and
+    a real camera says Main or High."""
+    import av
+
+    context = av.CodecContext.create("libx264", "w")
+    context.width = width
+    context.height = height
+    context.pix_fmt = "yuv420p"
+    context.time_base = fractions.Fraction(1, fps)
+    context.options = {
+        "preset": "veryfast", "tune": "zerolatency", "profile": "high",
+        "x264-params": "keyint={g}:min-keyint={g}:scenecut=0:bframes=0:repeat-headers=1".format(g=fps),
+    }
+    units = []
+    for n in range(fps * seconds):
+        # `pattern` returns BGR, which is what the bridge works in.
+        frame = av.VideoFrame.from_ndarray(pattern(width, height, 0 if still else n), format="bgr24")
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = n
+        units.extend(bytes(packet) for packet in context.encode(frame))
+    units.extend(bytes(packet) for packet in context.encode(None))
+    return [unit for unit in units if unit]
+
+
+async def run_passthrough(args):
+    units = h264_camera(args.width, args.height, args.fps, 4, args.still)
+    log("the camera: %d access units of H.264, %d bytes, a keyframe every %d"
+        % (len(units), sum(len(unit) for unit in units), args.fps))
+    stream = PassthroughStream(width=args.width, height=args.height, slug="proof")
+    publisher = live_passthrough.PassthroughPublisher(
+        passthrough=stream,
+        holder=LatestFrameHolder(),
+        width=args.width,
+        height=args.height,
+        fps=args.fps,
+        bitrate_kbps=args.bitrate_kbps,
+        on_lost=lambda reason: log("LOST", reason),
+        slug="proof",
+    )
+    token = make_token(args.api_key, args.api_secret, args.room, args.identity)
+    log("publishing into", args.url, "room", args.room, "codec passthrough",
+        "still", args.still)
+    try:
+        await publisher.start(args.url, args.room, token)
+    except live.LiveStartError as exc:
+        log("FAILED to start:", exc)
+        return 2
+    log("started; track sid =", publisher._track_sid)
+    # Kept past `stop()`, which lets go of both.
+    track, encoder = publisher._track, publisher._encoder
+
+    connected_at = None
+    deadline = time.monotonic() + args.seconds
+    n = 0
+    interval = 1.0 / args.fps
+    while time.monotonic() < deadline:
+        stream.push(units[n % len(units)], int(time.time() * 1000))
+        n += 1
+        pc = publisher._pc
+        if pc is not None:
+            if connected_at is None and pc.connectionState == "connected":
+                connected_at = time.monotonic()
+                log("ICE/DTLS CONNECTED")
+            if pc.connectionState in ("failed", "closed"):
+                log("FAILED: peer connection state =", pc.connectionState)
+                break
+        else:
+            log("FAILED: the session was torn down")
+            break
+        if n % (args.fps * 5) == 0:
+            log("t+%ds state=%s units handed to the sender=%s forwarded=%s"
+                % (n // args.fps, pc.connectionState, track.frames_sent,
+                   encoder.units_forwarded))
+        await asyncio.sleep(interval)
+
+    log("units pushed:", n, "handed to the sender:", track.frames_sent,
+        "forwarded by the encoder:", encoder.units_forwarded)
+    # aiortc's H.264 encoder opens libx264 on its first frame and keeps the
+    # context in `codec`. The passthrough encoder replaces the one method
+    # that would; `None` here means nothing was encoded on the bridge's side.
+    if encoder.codec is None:
+        log("ENCODER NEVER ASKED TO ENCODE (%s, codec context: None)" % type(encoder).__name__)
+    else:
+        log("FAILED: the bridge's encoder opened a codec")
+    await publisher.stop()
+    if connected_at is None:
+        log("FAILED: never reached connected")
+        return 3
+    return 0 if encoder.codec is None else 4
 
 
 def codec_pinning_factory(codec):
@@ -224,7 +332,7 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--bitrate-kbps", type=int, default=800)
-    parser.add_argument("--codec", default="vp8", choices=["vp8", "h264", "all"])
+    parser.add_argument("--codec", default="vp8", choices=["vp8", "h264", "all", "passthrough"])
     parser.add_argument("--encoder", default="aiortc", choices=["aiortc", "stand-in"],
                         help="aiortc: its own software encoder for --codec (the default). "
                              "stand-in: the bridge's own encoder over the software "
@@ -237,6 +345,8 @@ def main():
     args = parser.parse_args()
     if args.encoder == "stand-in" and args.codec == "vp8":
         parser.error("--encoder stand-in is H.264; give --codec h264")
+    if args.encoder == "stand-in" and args.codec == "passthrough":
+        parser.error("--codec passthrough encodes nothing; it takes no --encoder")
     # Everything the bridge logs, at every level. A proof that hides the
     # publisher's own account of what it did can only report that the picture
     # was missing, never why.
@@ -245,7 +355,7 @@ def main():
         format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
-    code = asyncio.run(run(args))
+    code = asyncio.run(run_passthrough(args) if args.codec == "passthrough" else run(args))
     log("EXIT", code)
     sys.exit(code)
 
