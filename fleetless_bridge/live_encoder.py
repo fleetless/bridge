@@ -34,13 +34,15 @@ reports, GStreamer writes the registry itself, in this process, to the
 user's cache, `$XDG_CACHE_HOME/gstreamer-1.0/`. That is at the first
 hardware session, after an update of a GStreamer package, and at every start
 where that directory cannot be written. GStreamer's libraries may write
-short-lived files besides: in the scanner, liborc 0.4.42 creates `orcexec.*`
-in `$XDG_RUNTIME_DIR`, or in `$HOME` where that is not set, and deletes it
-at once. Nothing from a cloud message reaches the scanner's command line.
-`GST_REGISTRY_FORK=no` would spare the child by loading every installed
-plugin into the bridge's own process, where a plugin that crashes the
-scanner would crash the bridge, and is not set. `SECURITY.md` names all of
-it.
+short-lived files besides. liborc creates `orcexec.*` for code it compiles,
+maps it and deletes it at once: in this process, at the first session whose
+chain converts the picture in `videoconvert`, as both `vaapi` chains do,
+and with liborc 0.4.42 in the scanner too. It goes to `$XDG_RUNTIME_DIR`,
+else `$HOME`, else `$TMPDIR` or `/tmp`. Nothing from a cloud message reaches
+the scanner's command line. `GST_REGISTRY_FORK=no` would spare the child by
+loading every installed plugin into the bridge's own process, where a plugin
+that crashes the scanner would crash the bridge, and is not set.
+`SECURITY.md` names all of it.
 
 **No chain here is proven on its hardware by this package's own tests.**
 Each is written to the documentation of its elements. The machines this is
