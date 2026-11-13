@@ -493,9 +493,126 @@ def test_a_refusal_is_one_line_in_the_robots_own_log(units):
         run(body)
     finally:
         logger.removeHandler(handler)
-    refusals = [line for line in lines if "not passed through" in line]
+    refusals = [line for line in lines if "cannot be passed through" in line]
     assert len(refusals) == 1  # thirty refused units, one line
     assert "'front'" in refusals[0] and "64x48" in refusals[0] and "1280x720" in refusals[0]
+
+
+class _RuntimeLog:
+    """The lines the runtime's logger writes while the block runs. (`caplog`
+    sees nothing here: the package's loggers do not propagate in this suite.)"""
+
+    def __init__(self):
+        self.lines = []
+
+    def __enter__(self):
+        import logging
+
+        lines = self.lines
+
+        class Handler(logging.Handler):
+            def emit(self, record):
+                lines.append(record.getMessage())
+
+        self._handler = Handler(level=logging.DEBUG)
+        self._logger = logging.getLogger("fleetless_bridge.ros_runtime")
+        self._logger.addHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc):
+        self._logger.removeHandler(self._handler)
+
+    def refusals(self):
+        # With the colon: the line that says the reason keeps changing has
+        # the same words and names no reason.
+        return [line for line in self.lines if "cannot be passed through: " in line]
+
+
+def _refusing(rt, slug, clock):
+    """`refuse(codec, at_s)`: one `CompressedVideo` message of `codec` for
+    `slug`, with the runtime's monotonic clock at `at_s` seconds."""
+    entry = rt._cameras[slug]
+
+    async def refuse(codec, at_s):
+        clock[0] = 5000.0 + at_s
+        await rt._submit_async(lambda: rt._on_camera_video(slug, entry, codec, b"", 1_000_000))
+
+    return refuse
+
+
+def test_a_reason_that_changes_within_the_minute_is_logged_at_once(units, compressed_video, monkeypatch):
+    """The camera's state carries the sentence, and the console shows only
+    its kind: the robot's log is where the reason can be read. A limit of
+    one line a minute per camera held the second reason back, and nobody
+    offered it again -- the log said H.265 for as long as the topic carried
+    VP9."""
+    clock = [5000.0]
+    monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
+        refuse = _refusing(rt, "front", clock)
+        await refuse("h265", 0)
+        for at_s in range(20, 320, 20):  # VP9 from twenty seconds on, for five minutes
+            await refuse("vp9", at_s)
+        return await _drain_camera_states(rt)
+
+    with _RuntimeLog() as log_:
+        states = run(body)
+    first, second = log_.refusals()
+    assert "carries H.265 and not H.264" in first
+    assert "carries VP9 and not H.264" in second
+    assert states[-1].error[1].startswith("the topic carries VP9")
+
+
+def test_the_same_reason_is_logged_at_most_once_a_minute(units, compressed_video, monkeypatch):
+    """Two publishers on one topic that disagree about the codec make a new
+    sentence with every message. The camera's state follows them; the log
+    writes each of the two once a minute."""
+    clock = [5000.0]
+    monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
+        refuse = _refusing(rt, "front", clock)
+        for index in range(40):  # twenty of each within twenty seconds
+            await refuse("h265" if index % 2 == 0 else "vp9", index * 0.5)
+        within_the_minute = len(log_.refusals())
+        await refuse("h265", 61)   # its line is a minute old
+        await refuse("vp9", 61.2)  # and so is this one's
+        await refuse("h265", 61.4)
+        return within_the_minute, await _drain_camera_states(rt)
+
+    with _RuntimeLog() as log_:
+        within_the_minute, states = run(body)
+    assert within_the_minute == 2
+    assert len(log_.refusals()) == 4
+    assert states[-1].error[1].startswith("the topic carries H.265")  # the state still says the latest
+
+
+def test_a_camera_whose_reason_never_settles_is_a_bounded_number_of_lines(units, compressed_video, monkeypatch):
+    """A `format` that is a new word with every message is a new sentence
+    with every message. Eight are written within a minute, then one line
+    that says the rest is not, and where the reason still is."""
+    clock = [5000.0]
+    monkeypatch.setattr(ros_runtime.time, "monotonic", lambda: clock[0])
+    limit = ros_runtime.PASSTHROUGH_REFUSAL_LOG_SENTENCES
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front", type_=COMPRESSED_VIDEO_TYPE)]))
+        refuse = _refusing(rt, "front", clock)
+        for index in range(200):
+            await refuse("codec{}".format(index), index * 0.1)  # twenty seconds
+        within_the_minute = (len(log_.refusals()), [line for line in log_.lines if "keeps changing" in line])
+        await refuse("codec-late", 90)  # the minute is over
+        return within_the_minute, await _drain_camera_states(rt)
+
+    with _RuntimeLog() as log_:
+        (written, overflow), states = run(body)
+    assert written == limit
+    assert len(overflow) == 1 and "front" in overflow[0] and "state" in overflow[0]
+    assert len(log_.refusals()) == limit + 1 and "codec-late" in log_.refusals()[-1]
+    assert states[-1].error[1].startswith("the topic carries codec-late")
 
 
 def test_a_refused_camera_answers_a_start_with_its_sentence_and_opens_no_publisher(units):
