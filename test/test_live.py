@@ -13,6 +13,7 @@ produced and what timestamp it carries — are exactly what a fake would have
 to invent.
 """
 import asyncio
+import concurrent.futures
 import logging
 import re
 import time
@@ -1470,6 +1471,239 @@ def test_a_resume_before_the_track_is_published_is_still_heard():
     pub._set_paused(False)
     assert pub.paused is False
     assert resumes == [True]
+
+
+# --- the first frame after a resume ------------------------------------------
+#
+# The sender pulls from the track the moment it has it back, and the track
+# hands out the last frame it was given: the one from before the pause. So the
+# track goes back only once the camera's held message has been converted and
+# pushed -- `on_resume` returns the future of that conversion.
+
+
+def _coloured_frame(value, height=4, width=6):
+    frame = np.zeros((height, width, 3), dtype=np.uint8)
+    frame[:, :] = value
+    return frame
+
+
+class _RecordingTrack(_FakeTrack):
+    def __init__(self, order):
+        super().__init__()
+        self._order = order
+
+    def push(self, rgb):
+        super().push(rgb)
+        self._order.append(("push", int(rgb[0, 0, 0])))
+
+
+class _RecordingSender(_FakeSender):
+    def __init__(self, order):
+        super().__init__()
+        self._order = order
+
+    def replaceTrack(self, track):
+        super().replaceTrack(track)
+        self._order.append(("track", track is not None))
+
+    def _send_keyframe(self):
+        super()._send_keyframe()
+        self._order.append(("keyframe",))
+
+
+def _paused_with_a_held_message(*, fps=4, held=None, on_resume=None):
+    """A started publisher that has pushed one frame (value 1) and is paused,
+    with a camera that holds a message whose conversion `held` stands for.
+
+    4 fps unless a test asks otherwise: a resume waits for that conversion
+    for one frame interval at most, and at 250 ms the wait outlasts every
+    pause these tests make before they let it land."""
+    order = []
+    holder = LatestFrameHolder()
+    holder.set(_coloured_frame(1), timestamp_ms=100)
+    held = held if held is not None else concurrent.futures.Future()
+    pub, signal, connection, track = _started(
+        holder=holder, fps=fps,
+        connection=_FakeConnection(sender=_RecordingSender(order)),
+        track=_RecordingTrack(order),
+        on_resume=on_resume if on_resume is not None else (lambda: held),
+    )
+    return pub, signal, connection.sender, track, holder, held, order
+
+
+def test_a_resume_hands_the_track_back_only_once_the_held_message_is_on_it():
+    async def scenario():
+        pub, signal, sender, track, holder, held, order = _paused_with_a_held_message()
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        del order[:]
+
+        signal.fire("on_quality_update", _quality(False, False, True))
+        await asyncio.sleep(0.02)
+        waiting = (pub.paused, list(order))
+
+        # The conversion lands: the newest frame is in the holder, and its future is done.
+        holder.set(_coloured_frame(2), timestamp_ms=200)
+        held.set_result(None)
+        await asyncio.sleep(0.02)
+        await pub.stop()
+        return waiting, order
+
+    waiting, order = asyncio.run(scenario())
+    # Unpaused at once -- the camera converts again from this moment -- and
+    # nothing handed to the sender yet.
+    assert waiting == (False, [])
+    # The held message's picture first, then the track, then the keyframe;
+    # and that picture once, whoever pushed it.
+    assert order == [("push", 2), ("track", True), ("keyframe",)]
+
+
+def test_a_conversion_that_takes_too_long_does_not_hold_the_resume():
+    async def scenario():
+        # 10 fps: the wait is one frame interval, 100 ms.
+        pub, signal, sender, track, holder, held, order = _paused_with_a_held_message(fps=10)
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        del order[:]
+
+        signal.fire("on_quality_update", _quality(False, False, True))
+        await asyncio.sleep(0.03)
+        early = list(order)
+        await asyncio.sleep(0.2)
+        late = list(order)
+        cancelled = held.cancelled()
+        await pub.stop()
+        return early, late, cancelled
+
+    handler, watched = _capturing()
+    try:
+        early, late, cancelled = asyncio.run(scenario())
+    finally:
+        watched.removeHandler(handler)
+    assert early == []  # still inside the wait
+    assert late == [("track", True), ("keyframe",)]  # resumed as it always was
+    # The conversion itself is left alone: it still lands, a moment later.
+    assert cancelled is False
+    assert [m for m in handler.messages if "newest frame" in m] == [
+        "Resuming live without waiting longer for the camera's newest frame: TimeoutError"
+    ]
+
+
+def test_the_wait_is_never_longer_than_a_quarter_second_however_slow_the_camera():
+    async def scenario():
+        # 1 fps: a frame interval is a whole second, and nobody who has just
+        # come back should sit that long without a picture.
+        pub, signal, sender, track, holder, held, order = _paused_with_a_held_message(fps=1)
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        del order[:]
+
+        signal.fire("on_quality_update", _quality(False, False, True))
+        await asyncio.sleep(0.15)
+        early = list(order)
+        await asyncio.sleep(0.25)
+        late = list(order)
+        await pub.stop()
+        return early, late
+
+    early, late = asyncio.run(scenario())
+    assert early == []
+    assert late == [("track", True), ("keyframe",)]
+
+
+def test_a_conversion_that_fails_does_not_hold_the_resume():
+    async def scenario():
+        pub, signal, sender, track, holder, held, order = _paused_with_a_held_message()
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        del order[:]
+
+        signal.fire("on_quality_update", _quality(False, False, True))
+        held.set_exception(RuntimeError("a credential: hunter2"))
+        await asyncio.sleep(0.02)
+        await pub.stop()
+        return order
+
+    handler, watched = _capturing()
+    try:
+        order = asyncio.run(scenario())
+    finally:
+        watched.removeHandler(handler)
+    assert order == [("track", True), ("keyframe",)]
+    messages = [m for m in handler.messages if "newest frame" in m]
+    assert messages == ["Resuming live without waiting longer for the camera's newest frame: RuntimeError"]
+    assert "hunter2" not in " ".join(messages)  # by type name, like every other log line here
+
+
+def test_a_pause_during_the_wait_takes_the_resume_back():
+    async def scenario():
+        pub, signal, sender, track, holder, held, order = _paused_with_a_held_message()
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        del order[:]
+
+        signal.fire("on_quality_update", _quality(False, False, True))
+        signal.fire("on_quality_update", _quality(False, False, False))  # gone again before the frame landed
+        holder.set(_coloured_frame(2), timestamp_ms=200)
+        held.set_result(None)
+        await asyncio.sleep(0.05)
+        await pub.stop()
+        return pub.paused, order
+
+    paused, order = asyncio.run(scenario())
+    assert paused is True
+    # The track never went back, no keyframe was asked for, nothing was pushed.
+    assert order == [("track", False)]
+
+
+def test_a_stop_during_the_wait_hands_nothing_back():
+    async def scenario():
+        pub, signal, sender, track, holder, held, order = _paused_with_a_held_message()
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        del order[:]
+
+        signal.fire("on_quality_update", _quality(False, False, True))
+        await pub.stop()
+        held.set_result(None)
+        await asyncio.sleep(0.05)
+        return order
+
+    assert asyncio.run(scenario()) == []
+
+
+def test_a_second_resume_while_the_first_still_waits_hands_the_track_back_once():
+    async def scenario():
+        first, second = concurrent.futures.Future(), concurrent.futures.Future()
+        answers = [first, second]
+        pub, signal, sender, track, holder, held, order = _paused_with_a_held_message(
+            on_resume=lambda: answers.pop(0)
+        )
+        await pub.start("wss://media.example", "room-1", "tok-1")
+        await asyncio.sleep(0.02)
+        signal.fire("on_quality_update", _quality(False, False, False))
+        del order[:]
+
+        signal.fire("on_quality_update", _quality(False, False, True))
+        signal.fire("on_quality_update", _quality(False, False, False))
+        signal.fire("on_quality_update", _quality(False, False, True))
+        first.set_result(None)  # the resume that was taken back
+        await asyncio.sleep(0.02)
+        between = list(order)
+        second.set_result(None)
+        await asyncio.sleep(0.02)
+        await pub.stop()
+        return between, order
+
+    between, order = asyncio.run(scenario())
+    assert between == [("track", False)]
+    assert order == [("track", False), ("track", True), ("keyframe",)]
 
 
 def test_a_quality_update_carrying_no_layers_changes_nothing():

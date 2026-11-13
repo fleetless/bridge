@@ -26,9 +26,9 @@ from cv_bridge import CvBridge
 from helpers import by_slug
 
 from fleetless_bridge import camera
-from fleetless_bridge.live import LivePublisher
+from fleetless_bridge.live import CameraTrack, LivePublisher
 from fleetless_bridge.ros_runtime import RosRuntime
-from test_live import _FakeConnection, _FakeSignal, _FakeTrack, _quality
+from test_live import _FakeConnection, _FakeSender, _FakeSignal, _FakeTrack, _quality
 from test_ros_runtime import (
     _camera_cfg,
     _drain_camera_states,
@@ -653,3 +653,90 @@ def test_snapshots_keep_working_while_the_publisher_is_paused(monkeypatch):
     assert header["slug"] == "front"
     assert len(image_bytes) > 0
     assert conversions == 1  # the one frame the snapshot sent, not thirty a second
+
+
+class _PullingSender(_FakeSender):
+    """Pulls one frame from the track each time it is handed one, as aiortc's
+    sender does the moment it has a track: `recv()` returns at once after a
+    pause, because the pacing interval is long over."""
+
+    def __init__(self, pulled):
+        super().__init__()
+        self._pulled = pulled
+        self.pulls = []
+
+    def pull(self, track):
+        self.pulls.append(asyncio.ensure_future(self._pull(track)))
+
+    def replaceTrack(self, track):
+        super().replaceTrack(track)
+        if track is not None:
+            self.pull(track)
+
+    async def _pull(self, track):
+        frame = await track.recv()
+        self._pulled.append(frame.to_ndarray(format="rgb24")[0, 0].tolist())
+
+
+class _PullingConnection(_FakeConnection):
+    def addTrack(self, track):
+        sender = super().addTrack(track)
+        sender.pull(track)
+        return sender
+
+
+def _publisher_factory_with_a_pulling_sender(pulled, signals):
+    """The shipped `LivePublisher` with the shipped `CameraTrack`: what a
+    viewer is sent is what the sender pulls from that track, and that is
+    recorded here."""
+
+    def factory(**kwargs):
+        signal = _FakeSignal()
+        signals.append(signal)
+
+        def signal_factory(url, token, **callbacks):
+            signal.callbacks = callbacks
+            return signal
+
+        connection = _PullingConnection(sender=_PullingSender(pulled))
+        return LivePublisher(
+            signal_factory=signal_factory,
+            connection_factory=lambda ice_servers: connection,
+            track_factory=lambda width, height, fps, bitrate_kbps: CameraTrack(width, height, fps),
+            **kwargs,
+        )
+
+    return factory
+
+
+def test_the_first_frame_after_a_resume_is_the_held_message_not_the_one_from_before_the_pause():
+    """The viewer who comes back sees the newest picture the camera has, at
+    once. The track keeps the last frame it was given, and the sender pulls
+    the moment it has the track back: handed back straight away, the track
+    gave out the picture from before the pause, as the resume's keyframe, and
+    the held message followed a frame interval later -- half a second at
+    2 fps. So the track goes back only when the held message is on it.
+
+    At 5 fps, with a pause longer than a frame interval: both the frame
+    limit and the track's pacing are out of the way."""
+    pulled, signals = [], []
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=5)]))
+        entry = rt._cameras["front"]
+        entry.raw.set(_image_msg((10, 20, 30)), 1_000)  # before the start
+        await rt.start_live("front", "wss://media.example", "room-1", "tok-1", "req-1")
+        await _eventually(lambda: len(pulled) >= 1)  # the start's picture
+
+        signals[0].fire("on_quality_update", _quality(*_NOBODY))
+        await asyncio.sleep(0.4)
+        entry.raw.set(_image_msg((40, 50, 60)), 2_000)  # held while nobody watches
+        signals[0].fire("on_quality_update", _quality(*_SOMEBODY))
+        await _eventually(lambda: len(pulled) >= 2)
+        after_resume = list(pulled)
+        await rt.stop_live("front", request_id="req-2")
+        return after_resume
+
+    after_resume = run(body, live_publisher_factory=_publisher_factory_with_a_pulling_sender(pulled, signals))
+    # BGR (10, 20, 30) and (40, 50, 60), as RGB.
+    assert after_resume == [[30, 20, 10], [60, 50, 40]]

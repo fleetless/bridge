@@ -79,6 +79,7 @@ that is handed an `encoder` uses that object instead:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import importlib
 import logging
 import re
@@ -250,6 +251,15 @@ def set_max_packet_bytes(max_packet_bytes: int) -> int:
 
 
 set_max_packet_bytes(LIVE_DEFAULTS["max_packet_bytes"])
+
+
+#: The longest a resume waits for the camera's held message before it hands
+#: the track back without it. The wait is one frame interval where that is
+#: shorter: past it the feed loop would have replaced the old picture anyway,
+#: so waiting longer buys nothing. The cap is for a slow camera, where a
+#: frame interval is a second or more and a viewer who has just come back
+#: would sit that long without any picture if the conversion were stuck.
+RESUME_WAIT_MAX_S = 0.25
 
 
 class LiveStartError(Exception):
@@ -558,8 +568,13 @@ class LivePublisher:
         # the sender. It is how the camera source learns that a picture is
         # wanted again: while this publisher is paused, a ROS camera keeps its
         # messages unconverted (ros_runtime.py, `conversion_wanted`), and the
-        # newest of them is what the returning viewer should see. Whatever it
-        # returns is ignored, and so is what it raises.
+        # newest of them is what the returning viewer should see.
+        #
+        # If it returns a `concurrent.futures.Future` -- the conversion of
+        # that message -- the track goes back to the sender when the future
+        # is done, with the converted frame already on it, or after a short
+        # wait if it is not (`_resume_with_held_frame`). Anything else it
+        # returns, and anything it raises, resumes at once.
         self._on_resume = on_resume
         self._signal = None
         self._pc = None
@@ -572,6 +587,13 @@ class LivePublisher:
         self._early_candidates: List[Dict[str, Any]] = []
         self._answer_applied = False
         self._feed_task: Optional["asyncio.Task"] = None
+        # The capture time of the last frame handed to the track, by the feed
+        # loop or by a resume: whichever of the two comes second leaves the
+        # frame alone.
+        self._last_fed_timestamp_ms: Optional[int] = None
+        # A resume that is waiting for the camera's held message before it
+        # hands the track back; `None` when no resume is under way.
+        self._resume_task: Optional["asyncio.Task"] = None
         self._bitrate_task: Optional["asyncio.Task"] = None
         self._teardown_task: Optional["asyncio.Task"] = None
         self._stopping = False
@@ -799,6 +821,7 @@ class LivePublisher:
         same as any other loss) are recognised as expected rather than
         reported through `on_lost`."""
         self._stopping = True
+        self._cancel_resume()
         await self._cancel_feed()
         # A loss already in flight owns the same objects; let it finish before
         # tearing down again, so the two cannot interleave inside `pc.close()`.
@@ -846,6 +869,7 @@ class LivePublisher:
         if self._feed_task is not None:
             self._feed_task.cancel()
             self._feed_task = None
+        self._cancel_resume()
         self._teardown_task = asyncio.ensure_future(self._teardown())
         if self._on_lost is not None:
             self._on_lost("room disconnected: {}".format(reason))
@@ -1040,15 +1064,38 @@ class LivePublisher:
         sender's loop idles instead of pulling frames), and the feed loop's own
         check stops the *colour conversion*, which is the robot's CPU and the
         actual reason a robot pauses anything.
+
+        **A resume hands the track back with the newest picture on it.** The
+        sender pulls from the track the moment it has it, the pacing interval
+        is long over by then, and the track hands out the last frame it was
+        given: the one from before the pause. That frame would be the
+        resume's keyframe -- the first thing a viewer who has just come back
+        can decode -- and the camera's newest message would follow a frame
+        interval later. So the flag turns and the camera is told at once, and
+        the track goes back when the conversion `on_resume` started is done
+        (`_resume_with_held_frame`). A pause in between takes the resume back.
         """
         if paused == self._paused:
             return
         self._paused = paused
+        # Whatever resume was still waiting belongs to a state that is over.
+        self._cancel_resume()
+        held = None
         if not paused:
             # After the flag and before anything else, sender or no sender:
             # from the flag on, the camera converts each message as it
             # arrives, so this call only has to fetch what was held before.
-            self._tell_resume()
+            held = self._tell_resume()
+        if self._sender is None:
+            return
+        if paused or not isinstance(held, concurrent.futures.Future):
+            self._hand_track(paused)
+            return
+        self._resume_task = asyncio.ensure_future(self._resume_with_held_frame(held))
+
+    def _hand_track(self, paused: bool) -> None:
+        """Take the track from the sender, or give it back and ask for a
+        keyframe."""
         sender, track = self._sender, self._track
         if sender is None:
             return
@@ -1070,16 +1117,56 @@ class LivePublisher:
         log.info("Live publish %s (subscribed layers: %s)",
                  "paused" if paused else "resumed", "none" if paused else "at least one")
 
-    def _tell_resume(self) -> None:
-        if self._on_resume is None:
-            return
+    async def _resume_with_held_frame(self, held: "concurrent.futures.Future") -> None:
+        """Waits for the camera's held message to be converted, puts the
+        newest frame on the track, and only then hands the track back.
+
+        **Never longer than a frame interval, and never longer than
+        `RESUME_WAIT_MAX_S`.** A conversion that is late, or that failed, does
+        not hold the resume: the track goes back as it always did, with the
+        picture it has, and the line below says so, by type name only. The
+        conversion itself is shielded -- giving up the wait must not cancel
+        it; it still lands, and the feed loop picks it up at its next tick.
+
+        Cancelled by a pause, a stop or a loss (`_cancel_resume`): the track
+        then stays where it is.
+        """
+        landed = asyncio.wrap_future(held)
+        # Whoever stops waiting, the outcome is looked at once, so that a
+        # failure nobody waited for is not reported as never retrieved.
+        landed.add_done_callback(lambda done: done.cancelled() or done.exception())
         try:
-            self._on_resume()
+            await asyncio.wait_for(asyncio.shield(landed), min(1.0 / self._fps, RESUME_WAIT_MAX_S))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - late or failed: resume as before
+            log.warning(
+                "Resuming live without waiting longer for the camera's newest frame: %s",
+                type(exc).__name__,
+            )
+        if self._paused or self._stopping:
+            return
+        self._feed_newest_frame()
+        self._hand_track(False)
+
+    def _cancel_resume(self) -> None:
+        task, self._resume_task = self._resume_task, None
+        if task is not None:
+            task.cancel()
+
+    def _tell_resume(self) -> Any:
+        """Calls `on_resume` and returns what it returned, `None` if there is
+        no hook or it raised."""
+        if self._on_resume is None:
+            return None
+        try:
+            return self._on_resume()
         except Exception as exc:  # noqa: BLE001 - the resume goes ahead either way
             # The viewer then gets the camera's next message instead of the
             # one it was holding: later by one camera interval at the most.
             log.error("Could not tell the camera that live publishing resumed: %s",
                       type(exc).__name__)
+            return None
 
     def _answer_keyframe_requests_at_once(self) -> None:
         """Make a keyframe request wake the track as well.
@@ -1125,27 +1212,34 @@ class LivePublisher:
     # -- the frame feed ----------------------------------------------------
 
     async def _feed_frames(self) -> None:
-        last_timestamp_ms: Optional[int] = None
         interval_s = 1.0 / self._fps
         while True:
             if not self._paused:
-                frame = self._holder.get()
-                if frame is not None and frame.timestamp_ms != last_timestamp_ms:
-                    last_timestamp_ms = frame.timestamp_ms
-                    try:
-                        self._push_frame(frame.bgr)
-                    except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the feed loop
-                        # (this loop had no try/except at all, so a
-                        # raise here silently ended the unawaited feed task —
-                        # the publisher stayed registered, the cloud still
-                        # believed publishing:true, and viewers froze with no
-                        # error anywhere. A genuinely dead session is caught
-                        # by `_on_room_disconnected` instead, which is the
-                        # authoritative signal — a single bad frame is not.)
-                        # Type name only — same credential-adjacent rule as
-                        # every other except in this class.
-                        log.error("Could not push a live frame: %s", type(exc).__name__)
+                self._feed_newest_frame()
             await asyncio.sleep(interval_s)
+
+    def _feed_newest_frame(self) -> None:
+        """Pushes the holder's frame to the track unless it is the one already
+        there. Called by the feed loop on every tick, and by a resume just
+        before it hands the track back; the capture time they share keeps
+        either from pushing a frame the other has pushed."""
+        frame = self._holder.get()
+        if frame is None or frame.timestamp_ms == self._last_fed_timestamp_ms:
+            return
+        self._last_fed_timestamp_ms = frame.timestamp_ms
+        try:
+            self._push_frame(frame.bgr)
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the feed loop
+            # (this loop had no try/except at all, so a
+            # raise here silently ended the unawaited feed task —
+            # the publisher stayed registered, the cloud still
+            # believed publishing:true, and viewers froze with no
+            # error anywhere. A genuinely dead session is caught
+            # by `_on_room_disconnected` instead, which is the
+            # authoritative signal — a single bad frame is not.)
+            # Type name only — same credential-adjacent rule as
+            # every other except in this class.
+            log.error("Could not push a live frame: %s", type(exc).__name__)
 
     def _push_frame(self, bgr) -> None:
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
