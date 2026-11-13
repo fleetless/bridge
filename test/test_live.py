@@ -21,7 +21,7 @@ import traceback
 import numpy as np
 import pytest
 from aioice import stun
-from aiortc import RTCIceServer
+from aiortc import RTCIceGatherer, RTCIceServer, RTCPeerConnection
 from aiortc.mediastreams import MediaStreamError
 from aiortc.rtcicetransport import connection_kwargs
 
@@ -32,6 +32,7 @@ from fleetless_bridge.live import (
     LivePublisher,
     LiveStartError,
     _default_connection_factory,
+    _ice_servers_without_stun,
 )
 from fleetless_bridge.livekit_signal import IceServer, JoinInfo
 
@@ -617,6 +618,109 @@ def test_the_ice_servers_from_join_reach_the_connection_factory():
     ]
     assert connection.ice_servers[1].username == "u"
     assert connection.ice_servers[1].credential == "c"
+
+
+# --- the ICE servers the robot asks ---------------------------------------------
+
+
+def _gathering_servers(pc):
+    """The STUN and TURN server a real peer connection will ask while it
+    gathers, read where aiortc keeps them: on the aioice connection behind the
+    sender's transport."""
+    sender = pc.addTrack(CameraTrack(64, 48, 10))
+    ice = sender.transport.transport.iceGatherer._connection
+    return ice.stun_server, ice.turn_server
+
+
+def test_the_default_factory_keeps_turn_and_drops_stun():
+    """No STUN from the robot: it only ever connects to a media server it can
+    reach itself, directly or through TURN, and that server learns the robot's
+    address from the first connectivity check. A reflexive candidate adds
+    nothing, and asking for one costs the full gathering timeout on every
+    interface that reaches no STUN server."""
+    servers = _ice_servers_without_stun((
+        IceServer(urls=("stun:stun.example:3478", "STUN:upper.example:3478")),
+        IceServer(urls=("stuns:secure.example:5349", "STUNS:upper.example:5349")),
+        IceServer(
+            urls=(
+                "stun:second.example:3478",
+                "turn:turn.example:3478?transport=udp",
+                "turns:turn.example:443?transport=tcp",
+            ),
+            username="u", credential="c",
+        ),
+    ))
+    assert [(server.urls, server.username, server.credential) for server in servers] == [
+        (["turn:turn.example:3478?transport=udp", "turns:turn.example:443?transport=tcp"],
+         "u", "c"),
+    ]
+
+    async def real_peer():
+        pc = _default_connection_factory((
+            IceServer(urls=("stun:stun.example:3478",)),
+            IceServer(urls=("turn:turn.example:3478?transport=udp",),
+                      username="u", credential="c"),
+        ))
+        try:
+            return _gathering_servers(pc)
+        finally:
+            await pc.close()
+
+    assert asyncio.run(real_peer()) == (None, ("turn.example", 3478))
+
+
+def test_a_stun_only_join_yields_an_empty_list_and_never_none():
+    """`iceServers=None` does not mean "none" to aiortc: it means "yours", and
+    upstream's own list is a public STUN server. Ubuntu's packages ship that
+    list empty, so the trap is shut on a robot today and open on any aiortc
+    installed from upstream. It is put back here on purpose: with it open, a
+    peer connection given no configuration asks the built-in server, and the
+    one from the default factory still asks nobody."""
+    stun_only = (IceServer(urls=("stun:stun.example:3478", "stuns:secure.example:5349")),)
+    assert _ice_servers_without_stun(stun_only) == []
+    assert _ice_servers_without_stun(()) == []
+
+    async def real_peers():
+        unconfigured = RTCPeerConnection()
+        ours = _default_connection_factory(stun_only)
+        try:
+            return _gathering_servers(unconfigured), _gathering_servers(ours)
+        finally:
+            await unconfigured.close()
+            await ours.close()
+
+    original = RTCIceGatherer.getDefaultIceServers
+    RTCIceGatherer.getDefaultIceServers = classmethod(
+        lambda cls: [RTCIceServer(urls="stun:builtin.example:3478")]
+    )
+    try:
+        unconfigured, ours = asyncio.run(real_peers())
+    finally:
+        RTCIceGatherer.getDefaultIceServers = original
+    # The control: the trap is open and this read can see what falls into it.
+    assert unconfigured == (("builtin.example", 3478), None)
+    assert ours == (None, None)
+
+
+def test_gathering_does_not_wait_for_a_stun_server_that_never_answers():
+    """192.0.2.1 is reserved for documentation and answers nobody. aioice asks
+    the STUN server from every host address and then waits five seconds for
+    all the answers together, so one address without a route to it used to
+    cost every start those five seconds. A real peer connection, because the
+    wait is aioice's and no fake has it."""
+
+    async def scenario():
+        pc = _default_connection_factory((IceServer(urls=("stun:192.0.2.1:3478",)),))
+        try:
+            pc.addTrack(CameraTrack(64, 48, 10))
+            offer = await pc.createOffer()
+            started = time.monotonic()
+            await pc.setLocalDescription(offer)
+            return time.monotonic() - started
+        finally:
+            await pc.close()
+
+    assert asyncio.run(scenario()) < 1.0
 
 
 # --- the start line ------------------------------------------------------------
