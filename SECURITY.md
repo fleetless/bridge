@@ -91,11 +91,15 @@ of a GStreamer package, and at every start of a bridge whose user cannot
 write that directory.
 
 GStreamer's libraries may write short-lived files of their own besides the
-registry. One is known: with liborc 0.4.42 the scanner creates a file for
-code it compiles, `orcexec.*`, in `$XDG_RUNTIME_DIR`, or in `$HOME` where
-that is not set, and deletes it at once. The driver of an encoder chip is a
-library GStreamer loads too, and may keep files of its own; this project has
-run none yet.
+registry. One is known: liborc, which GStreamer's video conversion uses,
+creates a file for code it compiles, `orcexec.*`, maps it and deletes it at
+once. The bridge's own process does so after each start, at the first session
+whose chain converts the picture in `videoconvert`, which both `vaapi` chains
+always do; that is one file or two, on every supported distribution. With
+liborc 0.4.42 the scanner creates one as well. The file goes to
+`$XDG_RUNTIME_DIR`, else to `$HOME`, else to `$TMPDIR` or `/tmp`. The driver
+of an encoder chip is a library GStreamer loads too, and may keep files of
+its own; this project has run none yet.
 
 Nothing from a cloud message reaches the scanner's command line: the binary
 and its arguments are GStreamer's. What the cloud can do is cause it to run,
