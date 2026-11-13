@@ -57,6 +57,13 @@ QUEUE_MAX_UNITS = 512
 #: does, long before the other two bounds.
 QUEUE_MAX_BYTES = 32 * 1024 * 1024
 
+#: What one queued NAL unit is counted as beyond its own bytes: the object
+#: that holds it and its place in the unit. The bound above is about memory,
+#: and a unit of thousands of two-byte NAL units takes some twenty times its
+#: bytes. An honest unit has a handful of NAL units, and this adds nothing
+#: that matters to it.
+NAL_OVERHEAD_BYTES = 64
+
 #: The largest access unit a camera's stream may hand over: this many bytes
 #: for every pixel of the configured size, which is twice a raw 4:2:0
 #: picture, and never less than the floor, for the small sizes. An encoder
@@ -108,8 +115,9 @@ class Unit:
     nals: Tuple[bytes, ...]
     timestamp_ms: int
     keyframe: bool
-    #: Bytes this unit takes in the queue and on its way out: its NAL
-    #: units, the parameter sets put in front of a keyframe included.
+    #: What this unit takes in the queue, in bytes: its NAL units, the
+    #: parameter sets put in front of a keyframe included, and
+    #: `NAL_OVERHEAD_BYTES` for each of them.
     size: int = 0
 
 
@@ -287,12 +295,12 @@ class PassthroughStream:
                 return False  # nothing to build on yet
             else:
                 nals = info.nals
-            # Counted as what is queued and sent, not as what arrived: a
-            # keyframe that lacked its parameter sets carries the stored
-            # ones now.
+            # Counted as what is queued, not as what arrived: a keyframe
+            # that lacked its parameter sets carries the stored ones now, and
+            # every NAL unit is an object of its own.
             unit = Unit(
                 nals=nals, timestamp_ms=timestamp_ms, keyframe=usable_keyframe,
-                size=sum(len(nal) for nal in nals),
+                size=sum(len(nal) + NAL_OVERHEAD_BYTES for nal in nals),
             )
 
             woke = self._offer(unit)

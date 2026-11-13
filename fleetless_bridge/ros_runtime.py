@@ -5282,7 +5282,6 @@ class RosRuntime:
             # somebody watched. There is nothing left to forward, so the
             # stream ends, and says why. A source that stalls or drops
             # (other codes) leaves a running stream as it leaves any other.
-            #
             self._log_refusal(slug, entry, message)
             self._end_live_from_executor(slug, (code, message))
 

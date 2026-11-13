@@ -37,6 +37,11 @@ class _Lines(logging.Handler):
         self.messages.append(record.getMessage())
 
 
+def _counted(nals):
+    """What the queue counts a unit of these NAL units as."""
+    return sum(len(nal) + passthrough.NAL_OVERHEAD_BYTES for nal in nals)
+
+
 @contextlib.contextmanager
 def _logged():
     """What `passthrough.py` logs inside the block, as a list of messages.
@@ -566,8 +571,9 @@ def test_the_byte_count_follows_what_is_taken_out():
         return full, after_one, stream.pending_bytes()
 
     full, after_one, empty = asyncio.run(scenario())
-    # What is queued: the NAL units, without the start codes between them.
-    sizes = [sum(len(nal) for nal in streams.split(unit)) for unit in units]
+    # What is queued: the NAL units, without the start codes between them,
+    # and what holding each of them costs.
+    sizes = [_counted(streams.split(unit)) for unit in units]
     assert full == sum(sizes)
     assert after_one == full - sizes[0] and empty == 0
 
@@ -592,8 +598,34 @@ def test_a_keyframe_counts_as_what_is_sent_for_it_with_the_stored_sets_in_front(
 
     counted, unit = asyncio.run(scenario())
     assert sps in unit.nals and pps in unit.nals
-    assert counted == unit.size == sum(len(nal) for nal in unit.nals)
-    assert counted == sum(len(nal) for nal in streams.split(bare)) + len(sps) + len(pps)
+    assert counted == unit.size == _counted(unit.nals)
+    assert counted == _counted(streams.split(bare)) + _counted([sps, pps])
+
+
+def test_a_unit_of_many_tiny_nal_units_is_counted_as_the_memory_it_takes():
+    """A two-byte NAL unit is an object of some forty bytes with a place in
+    a tuple. Counted by its bytes alone, a queue of units at the count
+    bound held about twenty times what the byte bound says. Each NAL unit
+    is counted with what holding it costs, so the byte bound ends the queue
+    where its memory ends."""
+    units = streams.encode_stream(width=1920, height=1080, frames=1)
+    piece = b"\x00\x00\x01\x41\xc0"
+
+    async def scenario():
+        stream = _stream(width=1920, height=1080)
+        stream.attach(asyncio.get_running_loop())
+        stream.push(units[0], 10_000)
+        tiny = piece * stream.max_unit_nals
+        peak = 0
+        for index in range(400):  # inside two seconds, under 512 units
+            stream.push(tiny, 10_001 + index)
+            peak = max(peak, stream.pending())
+        return stream.max_unit_nals, peak
+
+    nals, peak = asyncio.run(scenario())
+    one_unit = nals * (2 + passthrough.NAL_OVERHEAD_BYTES)
+    assert peak <= passthrough.QUEUE_MAX_BYTES // one_unit + 1  # some sixty units, not four hundred
+    assert peak < 100
 
 
 def test_an_oversized_keyframe_of_the_wrong_size_is_refused_for_its_size():
