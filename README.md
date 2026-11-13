@@ -237,7 +237,7 @@ chip can use that instead:
 |---|---|---|
 | `software` | the CPU | none |
 | `nvenc` | NVIDIA: a Jetson, then a desktop card | `nvv4l2h264enc`, then `nvh264enc` |
-| `vaapi` | Intel and AMD graphics | `vah264enc`, then `vaapih264enc` |
+| `vaapi` | Intel and AMD graphics | `vah264enc`, then `vah264lpenc`, then `vaapih264enc` |
 | `v4l2` | a V4L2 encoder, as on a Raspberry Pi 4 | `v4l2h264enc` |
 | `auto` | the first of `nvenc`, `vaapi`, `v4l2` that starts | as above |
 
@@ -267,7 +267,7 @@ not depend on. Everything but `software` needs `python3-gi`,
 `gir1.2-gstreamer-1.0`, `gir1.2-gst-plugins-base-1.0`,
 `gstreamer1.0-plugins-base` and `gstreamer1.0-plugins-bad` on the robot, and
 the plugin with the encoder element: on a Jetson it comes with L4T,
-`gstreamer1.0-plugins-bad` has `nvh264enc` and `vah264enc`,
+`gstreamer1.0-plugins-bad` has `nvh264enc`, `vah264enc` and `vah264lpenc`,
 `gstreamer1.0-vaapi` has `vaapih264enc`, and `gstreamer1.0-plugins-good` has
 `v4l2h264enc`.
 

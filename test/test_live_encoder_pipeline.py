@@ -559,11 +559,11 @@ def test_a_setting_the_installed_element_does_not_have_is_left_out():
 
 def test_the_chains_are_what_the_spec_lists_in_the_order_it_lists_them():
     assert [chain.encoder for chain in CHAINS["nvenc"]] == ["nvv4l2h264enc", "nvh264enc"]
-    assert [chain.encoder for chain in CHAINS["vaapi"]] == ["vah264enc", "vaapih264enc"]
+    assert [chain.encoder for chain in CHAINS["vaapi"]] == ["vah264enc", "vah264lpenc", "vaapih264enc"]
     assert [chain.encoder for chain in CHAINS["v4l2"]] == ["v4l2h264enc"]
     assert live_encoder.AUTO_ORDER == ("nvenc", "vaapi", "v4l2")
     assert [chain.name for chain in live_encoder.chains_for("auto")] == [
-        "nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/vaapi", "v4l2",
+        "nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/va-lp", "vaapi/vaapi", "v4l2",
     ]
     assert live_encoder.chains_for("nvenc") == CHAINS["nvenc"]
     assert live_encoder.chains_for("software") == ()

@@ -36,7 +36,7 @@ hardware session, after an update of a GStreamer package, and at every start
 where that directory cannot be written. GStreamer's libraries may write
 short-lived files besides. liborc creates `orcexec.*` for code it compiles,
 maps it and deletes it at once: in this process, at the first session whose
-chain converts the picture in `videoconvert`, as both `vaapi` chains do,
+chain converts the picture in `videoconvert`, as every `vaapi` chain does,
 and with liborc 0.4.42 in the scanner too. It goes to `$XDG_RUNTIME_DIR`,
 else `$HOME`, else `$TMPDIR` or `/tmp`. Nothing from a cloud message reaches
 the scanner's command line. `GST_REGISTRY_FORK=no` would spare the child by
@@ -263,6 +263,24 @@ CHAINS: Dict[str, Tuple[Chain, ...]] = {
             elements=("videoconvert", "vah264enc"),
             convert="videoconvert ! video/x-raw,format=NV12",
             encoder="vah264enc",
+            settings=(
+                ("rate-control", "cbr"),
+                ("b-frames", "0"),
+                ("key-int-max", "{gop}"),
+            ),
+            bitrate=("bitrate", "{kbps}"),
+        ),
+        # The low-power entrypoint of the same driver, which the `va` plugin
+        # registers as an element of its own. Intel Arc and Meteor Lake
+        # encode H.264 only there, so the chain above finds no element on
+        # them and this one does. The same chain with the other element.
+        # Untested.
+        Chain(
+            name="vaapi/va-lp",
+            backend="vaapi",
+            elements=("videoconvert", "vah264lpenc"),
+            convert="videoconvert ! video/x-raw,format=NV12",
+            encoder="vah264lpenc",
             settings=(
                 ("rate-control", "cbr"),
                 ("b-frames", "0"),

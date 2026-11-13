@@ -231,19 +231,49 @@ def test_every_other_setting_builds_the_encoder_over_its_chains_and_nothing_else
         encoder.close()
 
 
+def test_vaapi_tries_va_then_its_low_power_encoder_then_gstreamer_vaapi(logged):
+    # An Intel chip that encodes H.264 only on its low-power entrypoint has
+    # `vah264lpenc` and no `vah264enc`: the second chain is the one for it.
+    factory = _Factory()
+    encoder = _stand_in(chains=chains_for("vaapi"), backend="vaapi", pipeline_factory=factory)
+    encoder.encode(moving_frame(0), False)
+    encoder.close()
+    assert factory.asked == ["vaapi/va", "vaapi/va-lp", "vaapi/vaapi"]
+    warnings = logged.at(logging.WARNING)
+    assert len(warnings) == 1
+    said = [
+        "vaapi/va cannot be built: GStreamer has no element 'vah264enc'",
+        "vaapi/va-lp cannot be built: GStreamer has no element 'vah264lpenc'",
+        "vaapi/vaapi cannot be built: GStreamer has no element 'vaapih264enc'",
+    ]
+    positions = [warnings[0].index(sentence) for sentence in said]
+    assert positions == sorted(positions)
+    assert warnings[0].startswith("live.encoder=vaapi: no hardware encoder could be used (")
+
+
+def test_the_low_power_chain_is_the_va_chain_with_the_other_element():
+    va, low_power = CHAINS["vaapi"][0], CHAINS["vaapi"][1]
+    assert (va.name, low_power.name) == ("vaapi/va", "vaapi/va-lp")
+    assert low_power.encoder == "vah264lpenc"
+    assert low_power.elements == ("videoconvert", "vah264lpenc")
+    for field in ("backend", "convert", "settings", "bitrate", "caps", "keyframe"):
+        assert getattr(low_power, field) == getattr(va, field), field
+
+
 def test_auto_tries_nvenc_then_vaapi_then_v4l2_and_then_software(logged):
     factory = _Factory()
     encoder = _stand_in(chains=chains_for("auto"), backend="auto", pipeline_factory=factory)
     payloads, _ = encoder.encode(moving_frame(0), False)
     encoder.close()
-    assert factory.asked == ["nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/vaapi", "v4l2"]
+    assert factory.asked == ["nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/va-lp", "vaapi/vaapi", "v4l2"]
     assert encoder.software and payloads
     warnings = logged.at(logging.WARNING)
     assert len(warnings) == 1
     assert warnings[0].startswith("live.encoder=auto: no hardware encoder could be used (")
     for name, element in [
         ("nvenc/jetson", "nvv4l2h264enc"), ("nvenc/desktop", "nvh264enc"),
-        ("vaapi/va", "vah264enc"), ("vaapi/vaapi", "vaapih264enc"), ("v4l2", "v4l2h264enc"),
+        ("vaapi/va", "vah264enc"), ("vaapi/va-lp", "vah264lpenc"), ("vaapi/vaapi", "vaapih264enc"),
+        ("v4l2", "v4l2h264enc"),
     ]:
         assert "{} cannot be built: GStreamer has no element '{}'".format(name, element) in warnings[0]
     assert "software H.264" in warnings[0]
@@ -344,7 +374,7 @@ def test_the_chain_that_worked_is_tried_first():
     memory.worked(CHAINS["v4l2"][0])
     to_try, known_bad = memory.candidates(chains_for("auto"), (WIDTH, HEIGHT))
     assert [chain.name for chain in to_try] == [
-        "v4l2", "nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/vaapi",
+        "v4l2", "nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/va-lp", "vaapi/vaapi",
     ]
     assert known_bad == {}
     # A picture of one size it did not take leaves it the one that works.

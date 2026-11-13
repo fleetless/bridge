@@ -94,8 +94,8 @@ GStreamer's libraries may write short-lived files of their own besides the
 registry. One is known: liborc, which GStreamer's video conversion uses,
 creates a file for code it compiles, `orcexec.*`, maps it and deletes it at
 once. The bridge's own process does so after each start, at the first session
-whose chain converts the picture in `videoconvert`, which both `vaapi` chains
-always do; that is one file or two, on every supported distribution. With
+whose chain converts the picture in `videoconvert`, which every `vaapi` chain
+always does; that is one file or two, on every supported distribution. With
 liborc 0.4.42 the scanner creates one as well. The file goes to
 `$XDG_RUNTIME_DIR`, else to `$HOME`, else to `$TMPDIR` or `/tmp`. The driver
 of an encoder chip is a library GStreamer loads too, and may keep files of
