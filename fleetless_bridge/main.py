@@ -7,15 +7,34 @@ Exit codes, because a supervisor cannot read log messages:
   1  stopped by an unexpected error
   2  stopped because it will not heal by itself: no token, an unusable cloud
      URL, a token the cloud rejects, or another bridge that took over the robot
+
+A stop is heard from the first statement of `main()` on, and it is exit 0
+whenever it comes: during the imports, while the ROS node is being created,
+before the cloud has answered. `_EarlyStop` says how.
 """
 from __future__ import annotations
 
 import importlib.util
 import logging
+import os
+import signal
 import site
 import sys
 
+# Nothing slow up here. Whatever this file imports at its top runs before
+# `main()` does, and until `main()` has run nobody listens for a stop: the
+# client, ROS and asyncio are imported in `run()`.
 log = logging.getLogger("fleetless_bridge")
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_WONT_RETRY = 2
+
+# For the reader and for a type checker. At run time `run()` imports them.
+TYPE_CHECKING = False
+if TYPE_CHECKING:
+    from fleetless_bridge.client import BridgeClient, StopReason
+    from fleetless_bridge.ros_runtime import RosRuntime
 
 
 def shadowed_numpy_warning() -> "str | None":
@@ -34,11 +53,11 @@ def shadowed_numpy_warning() -> "str | None":
     `AttributeError` — meaning `camera.py`'s own
     module-level `import cv2` would crash the *whole process* on startup,
     with a bare traceback and no exit code from this file's own table,
-    before `main()` is ever reached. So this check cannot live in
-    `camera.py`, cannot `import numpy`, and cannot run from inside `run()`:
-    it uses `importlib.util.find_spec`, which locates a module without
-    executing it, and it runs here, at this file's own import time, before
-    the `from fleetless_bridge.ros_runtime import RosRuntime` line below
+    before `run()` is past its imports. So this check cannot live in
+    `camera.py` and cannot `import numpy`: it uses
+    `importlib.util.find_spec`, which locates a module without executing
+    it, and it runs here, at this file's own import time, before the
+    `from fleetless_bridge.ros_runtime import RosRuntime` line in `run()`
     ever gets a chance to drag `camera.py` (and `cv2`) in.
 
     Returns a message naming the real path if numpy resolves to a user
@@ -75,26 +94,91 @@ def shadowed_numpy_warning() -> "str | None":
 _shadow_warning = shadowed_numpy_warning()
 if _shadow_warning is not None:
     # No logging.basicConfig() yet (that is _configure_logging()'s job,
-    # called from main() below, itself unreachable if camera.py's import
-    # is about to crash the process) — Python's own "handler of last
-    # resort" still puts this on stderr.
+    # called from main() below) — Python's own "handler of last resort"
+    # still puts this on stderr.
     log.warning("%s", _shadow_warning)
 
-import asyncio  # noqa: E402 - the check above must run before any fleetless_bridge import
-import signal  # noqa: E402
 
-from fleetless_bridge import __version__  # noqa: E402
-from fleetless_bridge.client import BridgeClient, StopReason  # noqa: E402
-from fleetless_bridge.config import BridgeConfig  # noqa: E402
-from fleetless_bridge.protocol import PROTOCOL_VERSION  # noqa: E402
-from fleetless_bridge.ros_runtime import RosRuntime  # noqa: E402
+class _EarlyStop:
+    """SIGINT and SIGTERM, from the first statement of `main()` until the
+    event loop takes them over.
 
-EXIT_OK = 0
-EXIT_ERROR = 1
-EXIT_WONT_RETRY = 2
+    A robot's container is often stopped right after it started, and the
+    bridge needs a second or more to import ROS before it has a loop that
+    could listen. In that time Python answers a SIGINT with a
+    `KeyboardInterrupt` in the middle of an import, and the kernel answers a
+    SIGTERM by killing the process. A bridge born with SIGINT ignored (a
+    shell's background job, a container's entrypoint) does not hear a SIGINT
+    at all: Python leaves an inherited "ignore" alone until a handler is
+    installed over it. To a supervisor each of the three is a crash, or a
+    bridge that will not stop.
+
+    So `main()` installs these handlers before anything else. What a stop
+    does then depends on how far the start has come:
+
+    - **While the imports run** nothing has been started that needs undoing,
+      and the handler itself ends the process with exit 0. It does not
+      raise: an exception from a signal handler lands in whichever import is
+      running, where a bare `except` swallows it.
+    - **From `started()` on** the handler only records the request. The
+      starting code asks `requested()` at each seam (`_run_client`,
+      `_serve`) and leaves through the normal way out, which undoes what was
+      started.
+
+    A second signal changes nothing: the first is already being acted on.
+    """
+
+    def __init__(self) -> None:
+        #: The signal that asked for a stop, or `None`.
+        self._signal: int | None = None
+        self._nothing_started = True
+        self._said = False
+
+    def listen(self) -> None:
+        # `signal.signal`, whatever is installed now: an explicit handler is
+        # the one thing that replaces an inherited "ignore".
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, self._on_signal)
+
+    def started(self) -> None:
+        """From here on a stop has something to undo, so the handler leaves
+        it to the code that knows what."""
+        self._nothing_started = False
+
+    def requested(self) -> bool:
+        """Whether a stop was asked for. The first yes says so in the log."""
+        if self._signal is None:
+            return False
+        if not self._said:
+            self._said = True
+            _log_received(self._signal)
+        return True
+
+    def _on_signal(self, number: int, frame) -> None:
+        if self._signal is not None:
+            return
+        self._signal = number
+        if not self._nothing_started:
+            return
+        # The two lines every stop writes, then out. `os._exit` and not
+        # `sys.exit`, which is an exception like any other. A line that
+        # cannot be written is not worth a stack trace on the way out, and
+        # the exit does not depend on it.
+        logging.raiseExceptions = False
+        try:
+            _configure_logging()
+            self.requested()
+            log.info("Bridge stopped")
+        finally:
+            os._exit(EXIT_OK)
+
+
+_early_stop = _EarlyStop()
 
 
 def main() -> None:
+    # Before anything else: see `_EarlyStop`.
+    _early_stop.listen()
     _configure_logging()
     sys.exit(run())
 
@@ -121,6 +205,18 @@ def _configure_logging() -> None:
 
 def run() -> int:
     """Everything main() does, minus the process exit — so tests can call it."""
+    # The slow part: the client, ROS and OpenCV. Here and not at the top of
+    # this file, so that `main()` listens for a stop first; a stop during
+    # these lines ends the process in the handler.
+    import asyncio
+
+    from fleetless_bridge import __version__
+    from fleetless_bridge.client import BridgeClient, StopReason
+    from fleetless_bridge.config import BridgeConfig
+    from fleetless_bridge.protocol import PROTOCOL_VERSION
+    from fleetless_bridge.ros_runtime import RosRuntime
+
+    _early_stop.started()
     try:
         config = BridgeConfig.from_env()
     except ValueError as exc:
@@ -157,6 +253,14 @@ async def _run_client(client: BridgeClient, ros: RosRuntime) -> StopReason:
     # node and joins the executor thread, so SIGTERM never hangs.
     # RosRuntime's lifecycle is kept out of `_serve` itself so tests can go
     # on monkeypatching `_serve` with its original single-argument shape.
+    import asyncio
+
+    from fleetless_bridge.client import StopReason
+
+    # A stop that came while the bridge was still starting is acted on at
+    # the next seam. Here ROS has not been initialised: nothing to undo.
+    if _early_stop.requested():
+        return StopReason.SHUTDOWN
     ros.start(asyncio.get_event_loop())
     try:
         return await _serve(client)
@@ -166,10 +270,19 @@ async def _run_client(client: BridgeClient, ros: RosRuntime) -> StopReason:
 
 async def _serve(client: BridgeClient) -> StopReason:
     _install_signal_handlers(client)
+    # The next seam: the node exists, the loop's handlers have just replaced
+    # the early one, the client has not connected. A stop recorded until
+    # here would wait for a second signal that nobody owes. It is passed on
+    # now: `client.run()` returns before it connects, and `_run_client`
+    # ends ROS again.
+    if _early_stop.requested():
+        client.stop()
     return await client.run()
 
 
 def _install_signal_handlers(client: BridgeClient) -> None:
+    import asyncio
+
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -181,8 +294,12 @@ def _install_signal_handlers(client: BridgeClient) -> None:
 
 
 def _request_stop(client: BridgeClient, sig: int) -> None:
-    log.info("Received %s — shutting down", signal.Signals(sig).name)
+    _log_received(sig)
     client.stop()
+
+
+def _log_received(sig: int) -> None:
+    log.info("Received %s — shutting down", signal.Signals(sig).name)
 
 
 if __name__ == "__main__":
