@@ -1335,6 +1335,14 @@ class AssetProgress:
     state: str
 
 
+def _done_future() -> "concurrent.futures.Future":
+    """A future that already holds `None`: for work that was asked for and
+    turned out to be nothing to do, where the caller is promised a future."""
+    future: "concurrent.futures.Future" = concurrent.futures.Future()
+    future.set_result(None)
+    return future
+
+
 class _RosSourceAdapter(camera_sources.CameraSourceAdapter):
     """`kind: 'ros'` — the one adapter camera_sources.py's rclpy-free module
     cannot host itself (it needs `self._node`; see that module's own
@@ -2612,8 +2620,26 @@ class RosRuntime:
 
         A no-op for a slug with no camera, for a camera holding nothing raw
         -- an RTSP or V4L2 source never does, it decodes continuously --
-        and for a raw message older than what `latest` already has."""
-        return self._enqueue(lambda: self._convert_newest_raw_frame(slug))
+        and for a raw message older than what `latest` already has.
+
+        Also a no-op while the runtime is not running, and the future it
+        returns is then already done. Before `start` there is no guard
+        condition to wake the executor with, and `_enqueue` would leave its
+        item in the queue and fail on the wake-up; after `stop` the guard
+        condition belongs to a destroyed node. Whoever asks does not know
+        which of the two it is and has no use for the difference: there is no
+        camera to convert a frame for either way. The same guard, for the
+        same reason, as `_on_job_delivered`."""
+        if self._guard is None or self._stopped:
+            return _done_future()
+        try:
+            return self._enqueue(lambda: self._convert_newest_raw_frame(slug))
+        except Exception:  # noqa: BLE001 - shutting down between the check and the wake-up
+            log.debug(
+                "Could not hand the conversion of the newest camera frame for slug %r to the executor",
+                slug, exc_info=True,
+            )
+            return _done_future()
 
     def _convert_newest_raw_frame(self, slug: str) -> None:
         """Runs on the executor thread, where `self._cameras` lives. Never
