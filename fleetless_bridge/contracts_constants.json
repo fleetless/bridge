@@ -45,5 +45,14 @@
     "datapoint_max_hz": 1,
     "camera": "reduce",
     "camera_bitrate_kbps": 300
+  },
+  "LIVE_DEFAULTS": {
+    "max_packet_bytes": 1200
+  },
+  "LIVE_BOUNDS": {
+    "max_packet_bytes": {
+      "min": 576,
+      "max": 1350
+    }
   }
 }

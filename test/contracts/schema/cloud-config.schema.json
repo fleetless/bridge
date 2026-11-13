@@ -2058,6 +2058,31 @@
             }
           },
           "additionalProperties": false
+        },
+        "live": {
+          "description": "How the bridge sends live video, for every camera of the robot. Each key overrides the bridge's ROS parameter of the same name; an absent key leaves the parameter alone.",
+          "defaultSnippets": [
+            {
+              "label": "live video, packet size",
+              "description": "Caps every RTP packet the bridge sends. 1200 is the default; lower it for viewers behind a tunnel inside a tunnel.",
+              "body": {
+                "max_packet_bytes": 1200
+              }
+            }
+          ],
+          "type": "object",
+          "properties": {
+            "max_packet_bytes": {
+              "description": "The largest RTP packet the bridge sends, in bytes: fixed header, header extensions and payload, before SRTP adds its tag, retransmissions included. It is not an MTU: the MTU belongs to the path to each viewer, which the robot does not know. On the wire a packet is up to about 80 bytes longer. Lower it when a viewer's path carries less, such as a tunnel inside a tunnel. The ceiling sits just under what the bridge's SRTP library protects (1356 bytes); past that, live video stops. Overrides the bridge's ROS parameter `live.max_packet_bytes`; without either, the bridge sends 1200. A change holds from the next frame, for running streams too.",
+              "examples": [
+                1200
+              ],
+              "type": "integer",
+              "minimum": 576,
+              "maximum": 1350
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": [

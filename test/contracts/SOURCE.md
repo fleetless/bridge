@@ -48,6 +48,12 @@ low-bandwidth ROS parameters fall back to, read by `protocol.py` the same way
 and for the same reason: a default typed twice is a default that disagrees
 with itself eventually.
 
+Since contracts 15.2.0 it carries `LIVE_DEFAULTS` and `LIVE_BOUNDS` too: the
+default and the bounds of `live.max_packet_bytes`, the largest RTP packet the
+bridge sends. `protocol.py` reads both. The ROS parameter is declared with the
+default and refused outside the bounds, which are the two numbers the cloud
+refuses a published document by.
+
 Since 1.3.0 it also carries the **protocol version window**:
 `PROTOCOL_VERSION`, `PROTOCOL_VERSIONS` (which bridge version first spoke
 each protocol version, and when that version was deprecated),
@@ -95,16 +101,17 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@15.0.0
+    Source: @fleetless/contracts@15.2.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-Diffed file by file against the copies the previous pin (14.0.0) carried: the
-only vendored file that changed is `schema/cloud-config.schema.json`. The
-descriptions of its five sections (`datapoints`, `actions`, `services`,
-`publishers` and `cameras`) no longer name `robot_details` as a built-in slug;
-`bridge_state` is the only built-in one, and `history`, `assets` and
-`job_history` stay reserved. The bridge reads none of this and ignores it.
-Every other vendored schema and `constants.json` are byte-identical.
+Diffed file by file against the copies the previous pin (15.0.0) carried; two
+vendored files changed. `schema/cloud-config.schema.json` gains the optional
+top-level section `live` of the document, with one key, `max_packet_bytes`, an
+integer from 576 to 1350. `constants.json` gains `LIVE_DEFAULTS`
+(`max_packet_bytes: 1200`) and `LIVE_BOUNDS` (`max_packet_bytes`: `min` 576,
+`max` 1350). The bridge reads the section and both constants. Every other
+vendored schema is byte-identical; nothing 15.0.1 or 15.1.0 changed is among
+the files vendored here.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
