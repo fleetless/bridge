@@ -941,6 +941,23 @@ def test_the_log_line_about_a_clamped_budget_knows_this_encoder():
     assert ENCODER_CLAMP_BPS["H264Encoder"] == (500_000, 3_000_000)
 
 
+def test_a_session_that_fell_back_keeps_the_whole_range_in_software():
+    """The README says so. aiortc's own H.264 encoder clamps to 500 kbps to
+    3 Mbps in its setter; this class replaced the setter, and libx264 then
+    takes what it is given: 8 Mbps for a camera configured so, and the
+    150 kbps of low-bandwidth mode's `reduce`."""
+    encoder = _stand_in(chains=(JETSON,))  # no such chain here: software from the first frame
+    try:
+        encoder.target_bitrate = 8_000_000
+        assert encoder.encode(moving_frame(0), False)[0] and encoder.software
+        assert encoder.codec.bit_rate == 8_000_000
+        encoder.target_bitrate = 150_000
+        assert encoder.encode(moving_frame(1), False)[0]
+        assert encoder.codec.bit_rate == 150_000
+    finally:
+        encoder.close()
+
+
 def test_a_change_of_a_tenth_or_less_is_not_passed_to_the_pipeline_and_a_larger_one_is():
     factory = _Factory({"nvenc/jetson": "works"})
     encoder = _stand_in(chains=CHAINS["nvenc"], pipeline_factory=factory)
