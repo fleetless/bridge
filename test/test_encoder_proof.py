@@ -75,6 +75,11 @@ def test_the_stand_in_passes_every_check():
         "level 2.0"
     ) in said
     assert "note:" not in said
+    # A check that passed says what it saw, and nothing that reads like a
+    # failure: the whole output is what gets pasted into a report.
+    unit = next(line for line in said.splitlines() if "the bitrate is in the target's unit" in line)
+    assert unit.startswith("  ok   ") and unit.endswith(" kbps at a target of 1500 kbps)")
+    assert " off" not in unit and "thousand" not in unit
 
 
 def test_a_backend_whose_hardware_is_missing_is_exit_2_and_says_what_is_missing():
