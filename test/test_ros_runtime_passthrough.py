@@ -989,6 +989,44 @@ def test_a_passthrough_camera_hands_its_stream_to_the_publisher(units):
     assert (video.width, video.height, video.bitrate_kbps) == (WIDTH, HEIGHT, 500)
 
 
+@pytest.mark.parametrize("setting", ["software", "auto", "nvenc"])
+def test_no_encoder_is_built_for_a_passthrough_camera_whatever_live_encoder_says(setting, monkeypatch):
+    """`live.encoder` is for a publisher that encodes pictures. `start_live`
+    builds the session's encoder from it and hands it over as a keyword of
+    its own -- and for a passthrough camera does neither: nothing is built,
+    so there is nothing to probe, hand over or close, and the keyword is
+    not there at all."""
+    built = []
+    sentinel = object()
+
+    def build_encoder(value, *, fps):
+        built.append((value, fps))
+        return None if value == "software" else sentinel
+
+    monkeypatch.setattr(ros_runtime.live_encoder, "build_encoder", build_encoder)
+    seen = {}
+
+    def factory(**kwargs):
+        seen[kwargs["slug"]] = set(kwargs)
+        return _Publisher(**kwargs)
+
+    async def body(rt):
+        rt._live_encoder = setting
+        await rt.apply_cameras(by_slug([_h264_camera("video"), _camera_cfg("front", fps=7)]))
+        await _feed(rt, "video", streams.encode_stream(width=WIDTH, height=HEIGHT, frames=4, gop=4))
+        await rt.start_live("video", "wss://media.example", "room-1", "tok-1", "req-1")
+        await rt.start_live("front", "wss://media.example", "room-2", "tok-2", "req-2")
+
+    run(body, live_publisher_factory=factory)
+    video, front = _FakeLivePublisher.instances
+    # One encoder asked for, the picture camera's, at its frame rate.
+    assert built == [(setting, 7)]
+    assert front.encoder is (None if setting == "software" else sentinel)
+    assert "encoder" in seen["front"] and "passthrough" not in seen["front"]
+    assert "encoder" not in seen["video"] and "passthrough" in seen["video"]
+    assert video.encoder is None
+
+
 def test_a_picture_camera_gets_exactly_the_publisher_arguments_it_always_got():
     """An existing publisher factory -- every fake in the suite, and
     `live.LivePublisher` before it learned about streams -- is not handed a
@@ -1069,6 +1107,27 @@ def test_start_live_starts_the_real_passthrough_publisher_through_the_default_fa
     # Only the picture camera's publisher asks its camera for the held
     # message at a resume.
     assert video._on_resume is None and callable(front._on_resume)
+
+
+def test_a_hardware_encoder_handed_to_a_passthrough_publisher_is_closed_unopened():
+    """`start_live` builds none for a passthrough camera. A caller that
+    hands one over all the same gets it closed, and closing the bridge's
+    own hardware encoder before its first frame -- no pipeline yet, nothing
+    probed -- has to be safe."""
+    from fleetless_bridge import live_encoder
+
+    encoder = live_encoder.build_encoder("auto", fps=10)
+    stream = passthrough.PassthroughStream(width=WIDTH, height=HEIGHT, slug="video")
+    publisher = ros_runtime._default_live_publisher_factory(
+        holder=camera.LatestFrameHolder(), width=WIDTH, height=HEIGHT, fps=10, bitrate_kbps=500,
+        on_lost=lambda reason: None, slug="video", received_s=None,
+        encoder=encoder, passthrough=stream,
+    )
+    assert isinstance(publisher._encoder, live_passthrough.PassthroughEncoder)
+    wait_for = time.monotonic() + 5.0
+    while not encoder._closed and time.monotonic() < wait_for:
+        time.sleep(0.01)
+    assert encoder._closed and encoder.codec is None
 
 
 @pytest.mark.parametrize("handed", ["none", "an encoder"])
