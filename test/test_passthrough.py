@@ -504,8 +504,82 @@ def test_the_byte_count_follows_what_is_taken_out():
         return full, after_one, stream.pending_bytes()
 
     full, after_one, empty = asyncio.run(scenario())
-    assert full == sum(len(unit) for unit in units)
-    assert after_one == full - len(units[0]) and empty == 0
+    # What is queued: the NAL units, without the start codes between them.
+    sizes = [sum(len(nal) for nal in streams.split(unit)) for unit in units]
+    assert full == sum(sizes)
+    assert after_one == full - sizes[0] and empty == 0
+
+
+def test_a_keyframe_counts_as_what_is_sent_for_it_with_the_stored_sets_in_front():
+    """A keyframe that lacks its parameter sets goes out with the stored
+    ones. The queue's byte bound is about what is queued, so it counts
+    them: a source that stored large sets and then sends small keyframes is
+    not queued as if the keyframes were small."""
+    units = streams.encode_stream(frames=2, gop=1)
+    sps, pps = streams.parameter_sets(units[0])
+    bare = streams.strip_parameter_sets(units[1])
+
+    async def scenario():
+        stream = _stream()
+        stream.attach(asyncio.get_running_loop())
+        stream.set_parameter_sets(streams.join([sps, pps]))
+        stream.push(bare, 10_000)
+        counted = stream.pending_bytes()
+        (unit,) = await _drain(stream)
+        return counted, unit
+
+    counted, unit = asyncio.run(scenario())
+    assert sps in unit.nals and pps in unit.nals
+    assert counted == unit.size == sum(len(nal) for nal in unit.nals)
+    assert counted == sum(len(nal) for nal in streams.split(bare)) + len(sps) + len(pps)
+
+
+def test_an_oversized_keyframe_of_the_wrong_size_is_refused_for_its_size():
+    """A 1920x1080 stream on a camera configured as 64x48, with keyframes
+    over the bound. Each is dropped unread, so its SPS was never seen and
+    the only refusal came ten seconds later, for a missing keyframe, which
+    sends whoever reads it to the camera's keyframe interval. The SPS at
+    the head of the unit is read, and the refusal names the two sizes."""
+    big = streams.encode_stream(width=1920, height=1080, frames=1)[0]
+    stream = _stream()
+    oversized = streams.padded(big, stream.max_unit_bytes + 1)
+    with pytest.raises(PassthroughRefused) as refused:
+        stream.push(oversized, 10_000)
+    assert "1920x1080" in str(refused.value) and "64x48" in str(refused.value)
+    assert stream.newest_keyframe() is None
+
+
+def test_an_oversized_unit_of_the_right_size_is_dropped_and_refuses_nothing():
+    units = streams.encode_stream(frames=4, gop=2)
+    stream = _stream()
+    assert stream.push(units[0], 10_000) is True
+    assert stream.push(streams.padded(units[2], stream.max_unit_bytes + 1), 10_033) is False
+    assert stream.refusal is None
+    assert stream.newest_keyframe().timestamp_ms == 10_000
+
+
+@pytest.mark.parametrize("head", [
+    b"",                                             # not Annex B at all
+    b"\x00\x00\x00\x01\x67\x42",                     # an SPS cut short, and the only unit
+    b"\x00\x00\x00\x01\x67\x42\x00\x00\x00\x01\x68",  # an SPS that does not parse
+    b"\x00\x00\x00\x01\xe7\x42\x00\x00\x00\x01\x68",  # the forbidden bit set
+])
+def test_an_oversized_unit_whose_head_is_not_an_sps_is_dropped_like_any_other(head):
+    stream = _stream()
+    data = head + b"\xff" * (stream.max_unit_bytes + 1)
+    assert stream.push(data, 10_000) is False
+    assert stream.refusal is None
+
+
+def test_only_the_head_of_an_oversized_unit_is_looked_at():
+    """An SPS behind the first few kilobytes is not searched for: the point
+    of the bound is that a unit over it costs nothing to turn away."""
+    big = streams.encode_stream(width=1920, height=1080, frames=1)[0]
+    stream = _stream()
+    filler = b"\x00\x00\x00\x01\x0c" + b"\xff" * passthrough.OVERSIZED_HEAD_BYTES + b"\x80"
+    data = streams.padded(filler + big, stream.max_unit_bytes + 1)
+    assert stream.push(data, 10_000) is False
+    assert stream.refusal is None
 
 
 # --- pause and resume (spec test 9), and nobody watching ---------------------
