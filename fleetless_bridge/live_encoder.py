@@ -46,6 +46,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import av
+import numpy as np
 from aiortc.codecs.h264 import H264Encoder
 
 log = logging.getLogger(__name__)
@@ -361,6 +362,56 @@ def _load_gst() -> Tuple[Any, Any]:
         return _gst
 
 
+# --- a picture, laid out the way GStreamer reads it ----------------------------------
+
+
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
+def gst_i420_layout(width: int, height: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], int]:
+    """`(strides, offsets, size)` of an I420 picture in a GStreamer buffer
+    that carries no layout of its own.
+
+    An element that is handed such a buffer reads it by the caps alone, and
+    for I420 that means rows padded to a multiple of four bytes, in the
+    luma plane and in each chroma plane, and an even number of luma rows.
+    A picture packed tightly is that layout only where its width is a
+    multiple of eight; at any other width it is too short, and every row
+    after the first is read from the wrong place.
+
+    The numbers are `gst_video_info_set_format`'s, and the pipeline's tests
+    hold them against `GstVideo.VideoInfo` of each GStreamer the bridge
+    runs on.
+    """
+    luma_stride = _round_up(width, 4)
+    chroma_stride = _round_up(_round_up(width, 2) // 2, 4)
+    luma_rows = _round_up(height, 2)
+    chroma_rows = luma_rows // 2
+    second = luma_stride * luma_rows
+    third = second + chroma_stride * chroma_rows
+    return (
+        (luma_stride, chroma_stride, chroma_stride),
+        (0, second, third),
+        third + chroma_stride * chroma_rows,
+    )
+
+
+def i420_for_gst(picture: "av.VideoFrame") -> bytes:
+    """The three planes of a `yuv420p` frame as the bytes of one GStreamer
+    buffer, each row padded to where `gst_i420_layout` says the next
+    begins. The padding is zero and is never shown."""
+    strides, offsets, size = gst_i420_layout(picture.width, picture.height)
+    packed = np.zeros(size, dtype=np.uint8)
+    for plane, stride, offset in zip(picture.planes, strides, offsets):
+        # libav pads its rows too, to a width of its own choosing.
+        rows = np.frombuffer(plane, np.uint8).reshape(-1, abs(plane.line_size))
+        packed[offset:offset + stride * plane.height].reshape(plane.height, stride)[
+            :, :plane.width
+        ] = rows[:plane.height, :plane.width]
+    return packed.tobytes()
+
+
 # --- one chain, running -----------------------------------------------------------
 
 
@@ -501,9 +552,7 @@ class Pipeline:
         if self._pipeline is None:
             raise ChainFailed("the pipeline is closed")
         picture = frame if frame.format.name == "yuv420p" else frame.reformat(format="yuv420p")
-        buffer = Gst.Buffer.new_wrapped_bytes(
-            self._GLib.Bytes.new(picture.to_ndarray().tobytes())
-        )
+        buffer = Gst.Buffer.new_wrapped_bytes(self._GLib.Bytes.new(i420_for_gst(picture)))
         buffer.pts = self._pts_ns(frame)
         buffer.duration = self._frame_ns
         if force_keyframe:
@@ -581,33 +630,67 @@ def _reason(exc: BaseException) -> str:
 
 
 class ChainMemory:
-    """Which chains failed their probe, and which one worked.
+    """Which chains are not worth building, and which one worked.
 
     A missing chip stays missing: probing it again at every live start costs
     a pipeline build, or a second of waiting, for an answer already known.
     So the outcome of a probe is kept until `clear()`, which the runtime
     calls when `live.encoder` changes. A restart clears it by itself.
+
+    Two findings are kept apart, because they are about different things:
+
+    - A chain that **cannot be built**, or does not start: an element or a
+      typelib is missing, the pipeline does not parse, the device does not
+      open. That is about the machine, and holds for every camera.
+    - A chain that was built and **did not encode the first picture** it
+      was given. That may be the chip and it may be the picture, and one
+      failure cannot tell which. It is kept for pictures of that size: the
+      same camera, or another of the same size, is not probed again, and a
+      camera of another size is. So a camera whose picture a chip does not
+      take encodes in software and does not switch the chip off for the
+      others.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._failed: Dict[str, str] = {}
+        self._unbuildable: Dict[str, str] = {}
+        self._refused: Dict[Tuple[str, Tuple[int, int]], str] = {}
         self._working: Optional[str] = None
 
-    def candidates(self, chains: Sequence[Chain]) -> Tuple[List[Chain], Dict[str, str]]:
-        """`(to try, known bad)`: the chains worth building, the one that
-        worked before first, and the reasons of the ones that are not."""
+    def candidates(
+        self, chains: Sequence[Chain], size: Tuple[int, int]
+    ) -> Tuple[List[Chain], Dict[str, str]]:
+        """`(to try, known bad)` for a picture of `size`: the chains worth
+        building, the one that worked before first, and for each of the
+        others what failed, as `cannot_be_built` and `did_not_encode` say
+        it."""
         with self._lock:
-            known_bad = {c.name: self._failed[c.name] for c in chains if c.name in self._failed}
-            to_try = [c for c in chains if c.name not in self._failed]
+            to_try: List[Chain] = []
+            known_bad: Dict[str, str] = {}
+            for chain in chains:
+                if chain.name in self._unbuildable:
+                    known_bad[chain.name] = cannot_be_built(chain, self._unbuildable[chain.name])
+                elif (chain.name, size) in self._refused:
+                    known_bad[chain.name] = did_not_encode(
+                        chain, size, self._refused[(chain.name, size)]
+                    )
+                else:
+                    to_try.append(chain)
             to_try.sort(key=lambda c: c.name != self._working)  # stable: the rest keep their order
             return to_try, known_bad
 
-    def failed(self, chain: Chain, reason: str) -> None:
+    def cannot_be_built(self, chain: Chain, reason: str) -> None:
+        """The chain is known bad for the process."""
         with self._lock:
-            self._failed[chain.name] = reason
+            self._unbuildable[chain.name] = reason
             if self._working == chain.name:
                 self._working = None
+
+    def did_not_encode(self, chain: Chain, size: Tuple[int, int], reason: str) -> None:
+        """The chain is known bad for pictures of `size`. If it worked for
+        another size it still does."""
+        with self._lock:
+            self._refused[(chain.name, size)] = reason
 
     def worked(self, chain: Chain) -> None:
         with self._lock:
@@ -623,13 +706,25 @@ class ChainMemory:
 
     def clear(self) -> None:
         with self._lock:
-            self._failed.clear()
+            self._unbuildable.clear()
+            self._refused.clear()
             self._working = None
 
     @property
     def working(self) -> Optional[str]:
         with self._lock:
             return self._working
+
+
+def cannot_be_built(chain: Chain, reason: str) -> str:
+    """What the log says about a chain that could not be built or started."""
+    return "{} cannot be built: {}".format(chain.name, reason)
+
+
+def did_not_encode(chain: Chain, size: Tuple[int, int], reason: str) -> str:
+    """What the log says about a chain that was built and did not turn the
+    first picture into an access unit."""
+    return "{} did not encode a {}x{} picture: {}".format(chain.name, size[0], size[1], reason)
 
 
 #: The memory of this process.
@@ -659,8 +754,10 @@ class HardwareH264Encoder(H264Encoder):
 
     **The first frame is the probe.** The chains are tried in order with
     it, each given `frame_timeout_s`. The first that returns an access unit
-    carries the session. A chain that fails is remembered (`ChainMemory`)
-    and not built again in this process.
+    carries the session. A chain that fails is remembered (`ChainMemory`):
+    one that cannot be built is not built again in this process, one that
+    did not encode the picture is not tried again for pictures of that
+    size.
 
     **The fallback is the same object.** The offer said H.264 and the
     sender holds this encoder; when no chain works, or the one in use
@@ -822,10 +919,10 @@ class HardwareH264Encoder(H264Encoder):
     def _probe(self, frame: "av.VideoFrame") -> Optional[bytes]:
         """Find a chain that encodes `frame`; its first access unit, or
         `None` with the session set to software."""
-        to_try, known_bad = self._memory.candidates(self._chains)
-        failures = ["{}: {} (known from an earlier start)".format(n, r) for n, r in known_bad.items()]
+        size = (frame.width, frame.height)
+        to_try, known_bad = self._memory.candidates(self._chains, size)
+        failures = ["{} (known from an earlier start)".format(said) for said in known_bad.values()]
         for index, chain in enumerate(to_try):
-            pipeline = None
             try:
                 pipeline = self._pipeline_factory(
                     chain,
@@ -835,19 +932,23 @@ class HardwareH264Encoder(H264Encoder):
                     bitrate_bps=self._bitrate_bps,
                     frame_timeout_s=self._frame_timeout_s,
                 )
-                # The first frame of a stream is a keyframe.
-                data = pipeline.encode(frame, True)
             except GstUnavailable as unavailable:
                 # Not this chain's failure: none of them can be built.
                 for other in to_try[index:]:
-                    self._memory.failed(other, unavailable.reason)
+                    self._memory.cannot_be_built(other, unavailable.reason)
                 failures.append(unavailable.reason)
                 break
             except Exception as exc:  # noqa: BLE001 - a chain's failure, whatever it raised
-                if pipeline is not None:
-                    self._close_pipeline(pipeline)
-                self._memory.failed(chain, _reason(exc))
-                failures.append("{}: {}".format(chain.name, _reason(exc)))
+                self._memory.cannot_be_built(chain, _reason(exc))
+                failures.append(cannot_be_built(chain, _reason(exc)))
+                continue
+            try:
+                # The first frame of a stream is a keyframe.
+                data = pipeline.encode(frame, True)
+            except Exception as exc:  # noqa: BLE001 - a chain's failure, whatever it raised
+                self._close_pipeline(pipeline)
+                self._memory.did_not_encode(chain, size, _reason(exc))
+                failures.append(did_not_encode(chain, size, _reason(exc)))
                 continue
             self._memory.worked(chain)
             self._pipeline = pipeline
@@ -857,8 +958,9 @@ class HardwareH264Encoder(H264Encoder):
         self._software = True
         log.warning(
             "live.encoder=%s: no hardware encoder could be used (%s). This session is "
-            "encoded in software H.264. A chain that failed is not tried again until "
-            "live.encoder changes or the bridge restarts.",
+            "encoded in software H.264. Until live.encoder changes or the bridge restarts, "
+            "a chain that cannot be built is not tried again, and one that did not encode "
+            "a picture is not tried again for pictures of that size.",
             self._backend, "; ".join(failures) or "no chain is defined for it",
         )
         return None

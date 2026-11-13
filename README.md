@@ -274,10 +274,13 @@ the plugin with the encoder element: on a Jetson it comes with L4T,
 **A hardware encoder that does not start costs no stream.** If GStreamer is
 missing, no chain can be built, or a chain returns nothing within a second
 for a frame, that session is encoded in software H.264 instead and the bridge
-logs one warning with the backend, the chain and the reason. A chain that
-failed is not tried again until `live.encoder` changes or the bridge
-restarts. The fallback catches an encoder that fails. It does not catch one
-that draws a wrong picture, so look at the stream once after choosing one.
+logs one warning with the backend, the chain and the reason. Until
+`live.encoder` changes or the bridge restarts, a chain that cannot be built
+is not tried again, and a chain that did not encode a camera's first picture
+is not tried again for pictures of that size: one camera a chip does not
+take leaves the chip to the others. The fallback catches an encoder that
+fails. It does not catch one that draws a wrong picture, so look at the
+stream once after choosing one.
 
 With a hardware encoder the bitrate follows `bitrate_kbps` over its whole
 range. The software encoders clamp it: VP8 to 250 to 1500 kbps, H.264 to 500

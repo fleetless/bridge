@@ -235,7 +235,7 @@ def test_auto_tries_nvenc_then_vaapi_then_v4l2_and_then_software(logged):
         ("nvenc/jetson", "nvv4l2h264enc"), ("nvenc/desktop", "nvh264enc"),
         ("vaapi/va", "vah264enc"), ("vaapi/vaapi", "vaapih264enc"), ("v4l2", "v4l2h264enc"),
     ]:
-        assert "{}: GStreamer has no element '{}'".format(name, element) in warnings[0]
+        assert "{} cannot be built: GStreamer has no element '{}'".format(name, element) in warnings[0]
     assert "software H.264" in warnings[0]
 
 
@@ -298,8 +298,15 @@ def test_with_every_chain_known_bad_nothing_is_probed_and_the_session_still_says
     assert payloads and encoder.software
     warnings = logged.at(logging.WARNING)
     assert len(warnings) == 2
-    assert "nvenc/jetson: GStreamer has no element 'nvv4l2h264enc' (known from an earlier start)" in warnings[1]
-    assert "not tried again until live.encoder changes or the bridge restarts" in warnings[1]
+    assert (
+        "nvenc/jetson cannot be built: GStreamer has no element 'nvv4l2h264enc' "
+        "(known from an earlier start)"
+    ) in warnings[1]
+    assert warnings[1].endswith(
+        "Until live.encoder changes or the bridge restarts, a chain that cannot be built is "
+        "not tried again, and one that did not encode a picture is not tried again for "
+        "pictures of that size."
+    )
 
 
 def test_forgetting_the_chains_makes_the_next_start_probe_again():
@@ -310,10 +317,10 @@ def test_forgetting_the_chains_makes_the_next_start_probe_again():
     encoder.encode(moving_frame(0), False)
     encoder.close()
     assert encoder._memory is live_encoder.MEMORY
-    assert live_encoder.MEMORY.candidates(CHAINS["nvenc"])[0] == []
+    assert live_encoder.MEMORY.candidates(CHAINS["nvenc"], (WIDTH, HEIGHT))[0] == []
 
     forget_chains()
-    to_try, known_bad = live_encoder.MEMORY.candidates(CHAINS["nvenc"])
+    to_try, known_bad = live_encoder.MEMORY.candidates(CHAINS["nvenc"], (WIDTH, HEIGHT))
     assert [chain.name for chain in to_try] == ["nvenc/jetson", "nvenc/desktop"] and known_bad == {}
     factory = _Factory()
     encoder = HardwareH264Encoder("nvenc", CHAINS["nvenc"], fps=FPS, pipeline_factory=factory)
@@ -325,14 +332,19 @@ def test_forgetting_the_chains_makes_the_next_start_probe_again():
 def test_the_chain_that_worked_is_tried_first():
     memory = ChainMemory()
     memory.worked(CHAINS["v4l2"][0])
-    to_try, known_bad = memory.candidates(chains_for("auto"))
+    to_try, known_bad = memory.candidates(chains_for("auto"), (WIDTH, HEIGHT))
     assert [chain.name for chain in to_try] == [
         "v4l2", "nvenc/jetson", "nvenc/desktop", "vaapi/va", "vaapi/vaapi",
     ]
     assert known_bad == {}
-    memory.failed(CHAINS["v4l2"][0], "gone")
+    # A picture of one size it did not take leaves it the one that works.
+    memory.did_not_encode(CHAINS["v4l2"][0], (7680, 4320), "too large")
+    assert memory.working == "v4l2"
+    assert memory.candidates(chains_for("auto"), (WIDTH, HEIGHT))[0][0].name == "v4l2"
+    memory.cannot_be_built(CHAINS["v4l2"][0], "gone")
     assert memory.working is None
-    assert [chain.name for chain in memory.candidates(chains_for("auto"))[0]][0] == "nvenc/jetson"
+    to_try, known_bad = memory.candidates(chains_for("auto"), (WIDTH, HEIGHT))
+    assert to_try[0].name == "nvenc/jetson" and known_bad == {"v4l2": "v4l2 cannot be built: gone"}
 
 
 def test_a_chain_that_stops_after_its_probe_is_probed_again_at_the_next_start(logged):
@@ -352,11 +364,112 @@ def test_a_chain_that_stops_after_its_probe_is_probed_again_at_the_next_start(lo
     # Forgotten as working, not marked bad: minutes of video are not a
     # missing chip.
     assert memory.working is None
-    assert [chain.name for chain in memory.candidates(CHAINS["nvenc"])[0]] == [
+    assert [chain.name for chain in memory.candidates(CHAINS["nvenc"], (WIDTH, HEIGHT))[0]] == [
         "nvenc/jetson", "nvenc/desktop",
     ]
     # And the mid-session failure did not go looking for another chain.
     assert factory.asked == ["nvenc/jetson"]
+
+
+def test_a_chain_that_cannot_be_built_is_known_bad_for_a_picture_of_any_size():
+    memory = ChainMemory()
+    first = _Factory()
+    encoder = _stand_in(chains=(JETSON,), memory=memory, pipeline_factory=first)
+    encoder.encode(moving_frame(0), False)
+    encoder.close()
+    assert first.asked == ["nvenc/jetson"]
+
+    second = _Factory()
+    encoder = _stand_in(chains=(JETSON,), memory=memory, pipeline_factory=second)
+    encoder.encode(moving_frame(0, width=160, height=120), False)
+    encoder.close()
+    assert second.asked == [] and encoder.software
+
+
+# A chain that takes pictures 320 wide and no others: a caps filter refuses
+# the rest when the first buffer arrives, the way an encoder refuses a size it
+# was not made for. It builds and starts for any size.
+_ONLY_320_WIDE = None
+
+
+def _only_320_wide():
+    global _ONLY_320_WIDE
+    if _ONLY_320_WIDE is None:
+        _ONLY_320_WIDE = _variant(
+            name="stand-in/only-320", convert="videoconvert ! video/x-raw,width=320"
+        )
+    return _ONLY_320_WIDE
+
+
+def test_a_picture_a_chain_does_not_take_is_that_picture_size_s_problem_and_no_other_s(logged):
+    """One camera with a picture the chip refuses must not switch the chip
+    off for the cameras beside it."""
+    chain = _only_320_wide()
+    memory = ChainMemory()
+    built = []
+
+    def factory(chain, **kwargs):
+        built.append(Pipeline(chain, **kwargs))
+        return built[-1]
+
+    def session(width, height):
+        encoder = _stand_in(
+            chains=(chain,), memory=memory, pipeline_factory=factory, frame_timeout_s=0.5
+        )
+        try:
+            payloads = [
+                encoder.encode(moving_frame(index, width=width, height=height), False)[0]
+                for index in range(3)
+            ]
+            return all(payloads), encoder.chain, encoder.software
+        finally:
+            encoder.close()
+
+    # The odd camera: software, and the warning says what was refused.
+    assert session(160, 120) == (True, None, True)
+    assert [pipeline.size for pipeline in built] == [(160, 120)]
+    warnings = logged.at(logging.WARNING)
+    assert len(warnings) == 1
+    assert "stand-in/only-320 did not encode a 160x120 picture: " in warnings[0]
+    assert "cannot be built" not in warnings[0].split("). ")[0]
+
+    # The camera beside it: probed, and on the chain.
+    assert session(WIDTH, HEIGHT) == (True, chain, False)
+    assert [pipeline.size for pipeline in built] == [(160, 120), (WIDTH, HEIGHT)]
+    assert len(logged.at(logging.WARNING)) == 1
+    assert memory.working == chain.name
+
+    # The odd camera again: not probed a second time, and told why.
+    assert session(160, 120) == (True, None, True)
+    assert len(built) == 2
+    warnings = logged.at(logging.WARNING)
+    assert len(warnings) == 2
+    assert "stand-in/only-320 did not encode a 160x120 picture: " in warnings[1]
+    assert "(known from an earlier start)" in warnings[1]
+    # And the one that works still does, and is still tried first.
+    assert session(WIDTH, HEIGHT) == (True, chain, False)
+    assert [pipeline.final_state for pipeline in built] == ["null"] * 3
+
+
+@pytest.mark.parametrize("first, second", [((900, 600), (1024, 768)), ((854, 480), (642, 480))])
+def test_cameras_of_widths_that_are_not_a_multiple_of_eight_all_encode_on_the_chain(
+    logged, first, second
+):
+    """What a robot with one camera at 854x480 and three at 1024x768 gets:
+    every one of them on the chain, and nothing learned about a failure."""
+    memory = ChainMemory()
+    for width, height in (first, second):
+        encoder = _stand_in(memory=memory)
+        try:
+            for index in range(4):
+                payloads, _ = encoder.encode(moving_frame(index, width=width, height=height), False)
+                assert payloads
+            assert encoder.chain is STAND_IN and not encoder.software, (width, height)
+            assert _decodes(encoder.units) == [1] * 4
+        finally:
+            encoder.close()
+    assert logged.at(logging.WARNING) == []
+    assert memory.candidates((STAND_IN,), first) == ([STAND_IN], {})
 
 
 # --- the fallback, with real pipelines and real libx264 -------------------------
@@ -380,9 +493,13 @@ _SILENT = _variant(
 @pytest.mark.parametrize(
     "chain, reason",
     [
-        (JETSON, "nvenc/jetson: GStreamer has no element 'nvvidconv'"),
-        (_erroring(1), "stand-in/errors: breaks: "),
-        (_SILENT, "stand-in/silent: no access unit within 0.2 s of a frame"),
+        (JETSON, "nvenc/jetson cannot be built: GStreamer has no element 'nvvidconv'"),
+        (_erroring(1), "stand-in/errors did not encode a 320x240 picture: breaks: "),
+        (
+            _SILENT,
+            "stand-in/silent did not encode a 320x240 picture: "
+            "no access unit within 0.2 s of a frame",
+        ),
     ],
     ids=["cannot-be-built", "errors-on-the-bus", "delivers-nothing"],
 )
@@ -410,7 +527,7 @@ def test_a_chain_that_fails_its_probe_leaves_software_h264_from_that_very_frame(
     assert len(warnings) == 1
     assert warnings[0].startswith("live.encoder=nvenc: no hardware encoder could be used (")
     assert reason in warnings[0]
-    assert memory.candidates((chain,))[0] == []
+    assert memory.candidates((chain,), (WIDTH, HEIGHT))[0] == []
 
 
 def test_a_chain_that_fails_mid_session_is_followed_by_a_software_keyframe(logged):
@@ -492,7 +609,9 @@ def test_without_gstreamer_the_session_is_software_and_the_warning_names_the_pac
         assert package in warnings[0]
     # Said once, not once per chain; and none of the five is tried again.
     assert warnings[0].count("cannot be loaded") == 1
-    assert memory.candidates(chains_for("auto"))[0] == []
+    # None of them for a picture of any size: this is about the machine.
+    assert memory.candidates(chains_for("auto"), (WIDTH, HEIGHT))[0] == []
+    assert memory.candidates(chains_for("auto"), (1024, 768))[0] == []
 
 
 # --- nothing is raised out of the encoder ----------------------------------------
@@ -548,7 +667,7 @@ def test_an_exception_nobody_foresaw_is_a_chain_that_failed_and_its_message_is_n
     assert not any("hunter2" in message or "camera.local" in message for _, message in logged.records)
     # In the probe it is a failed chain like any other and is remembered; a
     # chain that had worked is probed again next time.
-    assert (memory.candidates((JETSON,))[0] == []) == (explode_after == 0)
+    assert (memory.candidates((JETSON,), (WIDTH, HEIGHT))[0] == []) == (explode_after == 0)
 
 
 def test_when_software_cannot_encode_either_the_frame_is_dropped_and_the_next_one_is_a_keyframe(
