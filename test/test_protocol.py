@@ -866,6 +866,64 @@ def test_an_rtsp_camera_source_defaults_transport_and_has_no_credentials_when_ab
     )
 
 
+def test_an_rtsp_camera_source_is_not_passed_through_unless_it_says_so():
+    """`passthrough` is opt-in: an RTSP camera that exists today is decoded
+    and encoded again after an upgrade, exactly as before."""
+    raw = dict(_RAW_CAMERA, source={"kind": "rtsp", "url": "rtsp://cam.local/stream"})
+    assert _parse_config(cameras={"yard": raw}).cameras["yard"].source.passthrough is False
+
+
+@pytest.mark.parametrize("written", [True, False])
+def test_an_rtsp_camera_source_carries_passthrough(written):
+    raw = dict(
+        _RAW_CAMERA,
+        source={"kind": "rtsp", "url": "rtsp://cam.local/stream", "passthrough": written},
+    )
+    validate_frame("cloud-config", _config_frame(cameras={"yard": raw}))
+    source = _parse_config(cameras={"yard": raw}).cameras["yard"].source
+    assert source == RtspSource(
+        url="rtsp://cam.local/stream", transport="tcp", credentials=None, passthrough=written
+    )
+
+
+@pytest.mark.parametrize("written", ["true", 1, 0, "h264", [], {}])
+def test_an_rtsp_camera_source_with_a_passthrough_that_is_no_boolean_is_malformed(written):
+    """`1` is not `True` here. A parser that took any truthy value would
+    switch a camera to passthrough on a typo the schema refuses."""
+    raw = dict(
+        _RAW_CAMERA,
+        source={"kind": "rtsp", "url": "rtsp://cam.local/stream", "passthrough": written},
+    )
+    assert isinstance(_parse_config(cameras={"yard": raw}), Unknown)
+
+
+@pytest.mark.parametrize("source", [
+    {"kind": "ros", "topic": "/image_raw", "type": "sensor_msgs/msg/Image", "passthrough": True},
+    {"kind": "mjpeg", "url": "http://cam.local/s.mjpg", "passthrough": True},
+    {"kind": "v4l2", "device": "/dev/video0", "passthrough": True},
+    {"kind": "rtsp", "url": "rtsp://cam.local/stream", "passthrough": "yes"},
+])
+def test_the_wire_schema_refuses_passthrough_where_it_does_not_belong(source):
+    """RTSP is the one source that carries the switch, and it is a boolean.
+    The cloud refuses the rest before a frame is sent; shown here on the
+    vendored copy of what it validates with."""
+    import jsonschema
+
+    with pytest.raises(jsonschema.ValidationError):
+        validate_frame("cloud-config", _config_frame(cameras={"yard": dict(_RAW_CAMERA, source=source)}))
+
+
+def test_a_compressed_video_camera_is_a_valid_config_frame():
+    raw = dict(
+        _RAW_CAMERA,
+        source={"kind": "ros", "topic": "/camera/h264", "type": "foxglove_msgs/msg/CompressedVideo"},
+    )
+    frame = _config_frame(cameras={"front_cam": raw})
+    validate_frame("cloud-config", frame)
+    source = parse_cloud_message(json.dumps(frame)).cameras["front_cam"].source
+    assert source.type == "foxglove_msgs/msg/CompressedVideo"
+
+
 def test_an_rtsp_camera_source_with_an_invalid_transport_is_malformed():
     raw = dict(
         _RAW_CAMERA,

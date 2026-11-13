@@ -504,11 +504,16 @@ class RtspSource:
     wrote it **inside this source**, replacing the `credentials_ref` into a
     frame-level map that no longer exists. `None` means none was written,
     which still permits userinfo in `url` itself
-    (camera_sources.resolve_credentials)."""
+    (camera_sources.resolve_credentials).
+
+    `passthrough` is `True` only when the document says so: the bridge then
+    forwards the camera's H.264 and neither decodes nor encodes video. Absent
+    is `False`, today's decode and re-encode."""
 
     url: str
     transport: str
     credentials: Optional[Tuple[str, str]]
+    passthrough: bool = False
 
 
 @dataclass(frozen=True)
@@ -1614,7 +1619,14 @@ def _parse_camera_source(payload: object) -> Optional[CameraSource]:
         credentials = _parse_camera_credentials(payload.get("credentials"))
         if credentials is _INVALID:
             return None
-        return RtspSource(url=url, transport=transport, credentials=credentials)
+        # A boolean or nothing. `1` and `"true"` are refused, not read as
+        # yes: which path a camera takes is not decided by truthiness.
+        passthrough = payload.get("passthrough", False)
+        if not isinstance(passthrough, bool):
+            return None
+        return RtspSource(
+            url=url, transport=transport, credentials=credentials, passthrough=passthrough
+        )
 
     if kind == "mjpeg":
         url = payload.get("url")

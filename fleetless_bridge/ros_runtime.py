@@ -122,6 +122,7 @@ from unique_identifier_msgs.msg import UUID as RosUUID
 from fleetless_bridge import (
     camera, camera_sources, introspection, live, live_encoder, params, sampling,
 )
+from fleetless_bridge import live_passthrough, passthrough
 from fleetless_bridge.jobs import JobManager, JobUpdate
 from fleetless_bridge.goal_state import (
     load_mapping, load_terminal_observations, mapping_path, save_mapping,
@@ -588,9 +589,9 @@ class CameraStateQueue:
     That is exactly the split `JobUpdateQueue` (jobs.py) already makes —
     terminal updates drop-nothing, non-terminal ones latest-per-job — and
     this class borrows its structure too: `_order` holds either a
-    request-answering `CameraStateUpdate` directly or a bare slug string
-    standing for "the latest unsolicited update for this slug is in
-    `_pending`". The bound the design asked for is unaffected: a flapping
+    request-answering `CameraStateUpdate` directly or a key standing for
+    "the latest unsolicited update of this kind for this slug is in
+    `_pending`" (see `put` for the two kinds). The bound the design asked for is unaffected: a flapping
     source reports `cause='source'` with `request_id=None` by
     construction, so the unbounded-growth case is precisely the coalesced
     one, and the uncoalesced remainder is bounded by how many commands the
@@ -635,7 +636,7 @@ class CameraStateQueue:
 
     def __init__(self, on_put: Optional[Callable[[], None]] = None) -> None:
         self._order: Deque[Any] = deque()
-        self._pending: Dict[str, "CameraStateUpdate"] = {}
+        self._pending: Dict[Tuple[str, bool], "CameraStateUpdate"] = {}
         self.on_put = on_put
 
     def put_threadsafe(
@@ -648,13 +649,21 @@ class CameraStateQueue:
     def put(self, update: "CameraStateUpdate") -> None:
         if update.request_id is not None:
             self._order.append(update)
-        elif update.slug not in self._pending:
-            self._order.append(update.slug)
-            self._pending[update.slug] = update
         else:
-            # Coalesced, not queued: the position this slug already holds
-            # is kept, only the payload it resolves to is replaced.
-            self._pending[update.slug] = update
+            # Two levels per slug, not one: what the source is doing
+            # (`cause: source`) and what became of publishing (`live_lost`,
+            # `config_change`). The cloud keeps them as two facets of the
+            # camera's health, and only `live_lost` ends its sessions. A
+            # stream that ends because the source turned unusable reports
+            # both in the same moment; one slot for the two would deliver
+            # whichever was queued last and lose the other fact.
+            key = (update.slug, update.cause == CAMERA_STATE_CAUSE_SOURCE)
+            if key not in self._pending:
+                self._order.append(key)
+            # Otherwise coalesced, not queued: the position this level
+            # already holds is kept, only the payload it resolves to is
+            # replaced.
+            self._pending[key] = update
         if self.on_put is not None:
             self.on_put()
 
@@ -666,7 +675,7 @@ class CameraStateQueue:
         if not self._order:
             return None
         item = self._order.popleft()
-        if isinstance(item, str):
+        if isinstance(item, tuple):
             return self._pending.pop(item)
         return item
 
@@ -1347,6 +1356,58 @@ def _done_future() -> "concurrent.futures.Future":
     return future
 
 
+#: The third camera type, known by name. Nothing here imports
+#: `foxglove_msgs`, and neither `package.xml` nor the test image names it: a
+#: robot that has the package can use the type, and one that has not reports
+#: `unknown type` for the camera that asks for it.
+COMPRESSED_VIDEO_TYPE = "foxglove_msgs/msg/CompressedVideo"
+
+#: The type that carries a picture or H.264, by its messages' `format`.
+COMPRESSED_IMAGE_TYPE = "sensor_msgs/msg/CompressedImage"
+
+#: The code every passthrough refusal is reported with: a wrong picture size,
+#: B-frames, no keyframe, a codec other than H.264. It is the code the
+#: adapters already report for a source that answers and cannot be used, so
+#: the cloud's mapping needs no new entry.
+PASSTHROUGH_REFUSAL_CODE = "source_error"
+
+#: The fields the bridge reads that type by. `timestamp` is the publisher's
+#: own clock and is not used as time: `timestamp_ms` is bridge capture time
+#: for every camera. It is in this list because a class without it is not
+#: the message this name promises.
+COMPRESSED_VIDEO_FIELDS = ("data", "format", "timestamp")
+
+#: What a codec is called in a sentence a developer reads.
+_VIDEO_CODEC_NAMES = {"h265": "H.265", "hevc": "H.265", "vp9": "VP9", "av1": "AV1"}
+
+
+def _default_live_publisher_factory(*, passthrough: Any = None, **kwargs: Any) -> Any:
+    """The publisher of a camera: the one that forwards for a passthrough
+    camera, which is handed its stream, and `live.LivePublisher` for every
+    other."""
+    if passthrough is not None:
+        return live_passthrough.PassthroughPublisher(passthrough=passthrough, **kwargs)
+    return live.LivePublisher(**kwargs)
+
+
+def _missing_fields(message_class: Any, names: Sequence[str]) -> List[str]:
+    """Which of `names` a ROS message class does not have."""
+    getter = getattr(message_class, "get_fields_and_field_types", None)
+    present = getter() if callable(getter) else {}
+    return [name for name in names if name not in present]
+
+
+def _codec_display_name(codec: str) -> str:
+    """`codec` as a message's `format` field spelled it, for a camera error.
+    The field is free text from whoever publishes the topic, so anything
+    that is not a short plain word is not repeated."""
+    if codec in _VIDEO_CODEC_NAMES:
+        return _VIDEO_CODEC_NAMES[codec]
+    if 0 < len(codec) <= 16 and codec.replace("-", "").replace("_", "").replace(".", "").isalnum() and codec.isascii():
+        return codec
+    return "another codec"
+
+
 class _RosSourceAdapter(camera_sources.CameraSourceAdapter):
     """`kind: 'ros'` — the one adapter camera_sources.py's rclpy-free module
     cannot host itself (it needs `self._node`; see that module's own
@@ -1384,19 +1445,34 @@ class _RosSourceAdapter(camera_sources.CameraSourceAdapter):
         on_error: camera_sources.OnError, raw: "camera.RawFrameHolder",
         conversion_wanted: Callable[[], bool], on_raw_frame: Callable[[int], None],
         encoded: Optional["camera.EncodedFrameHolder"] = None,
+        on_video: Optional[Callable[[str, bytes, int], None]] = None,
+        on_picture: Optional[Callable[[], None]] = None,
     ) -> None:
         try:
             message_class = get_message(type_name)
         except Exception as exc:
             raise RuntimeError("unknown type {!r}: {}".format(type_name, exc)) from exc
-        # Structural, like every other config-apply check: a
-        # camera's `type` is contractually one of these two shapes
-        # (contracts' cameraSource.ros), not an arbitrary message —
-        # camera.py only knows how to convert these two.
-        if message_class not in (Image, CompressedImage):
+        # Structural, like every other config-apply check: a camera's
+        # `type` is contractually one of three (contracts'
+        # cameraSource.ros), not an arbitrary message. Two of them are
+        # classes this package depends on. The third is known by its name
+        # and its fields only, so that `foxglove_msgs` stays something a
+        # robot may or may not have: without it, `get_message` above has
+        # already failed, for this one camera.
+        self._video_type = type_name == COMPRESSED_VIDEO_TYPE
+        if self._video_type:
+            missing = _missing_fields(message_class, COMPRESSED_VIDEO_FIELDS)
+            if missing:
+                raise RuntimeError(
+                    "{} lacks {} on this robot; the bridge reads the type by those "
+                    "fields".format(type_name, ", ".join(missing))
+                )
+        elif message_class not in (Image, CompressedImage):
             raise RuntimeError(
-                "camera type must be sensor_msgs/msg/Image or "
-                "sensor_msgs/msg/CompressedImage, got {!r}".format(type_name)
+                "camera type must be sensor_msgs/msg/Image, "
+                "sensor_msgs/msg/CompressedImage or {}, got {!r}".format(
+                    COMPRESSED_VIDEO_TYPE, type_name
+                )
             )
         self._node = node
         self._topic = topic
@@ -1409,10 +1485,47 @@ class _RosSourceAdapter(camera_sources.CameraSourceAdapter):
         # Only a `CompressedImage` arrives encoded; an `Image` has nothing
         # to keep here.
         self._encoded = encoded if message_class is CompressedImage else None
+        self._on_video = on_video
+        self._on_picture = on_picture
         self._handle: Optional[object] = None
+
+    def _video_codec(self, msg) -> Optional[str]:
+        """What encoded video `msg` carries, lower case, or `None` for a
+        picture. `CompressedVideo` always carries video and names the codec
+        in `format`. A `CompressedImage` is video when its `format` names
+        H.264 -- `h264` anywhere in it, any case -- and a picture otherwise,
+        which is what it has always been here. Judged per message: the
+        format is a field of the message, not of the topic."""
+        if self._video_type:
+            return str(getattr(msg, "format", "")).strip().lower()
+        if self._message_class is CompressedImage and "h264" in str(msg.format).lower():
+            return "h264"
+        return None
+
+    def _route_video(self, msg) -> bool:
+        """Hands a message that carries encoded video to the camera's
+        passthrough path and says so. `False` for a picture, which the
+        callback below treats as it always has.
+
+        A method and not part of the closure, so that a test can hand it a
+        message of a type the test image does not have."""
+        if self._on_video is None:
+            return False
+        codec = self._video_codec(msg)
+        if codec is None:
+            if self._on_picture is not None and self._message_class is CompressedImage:
+                self._on_picture()
+            return False
+        # Not converted and not held as a raw picture: the bytes go on as
+        # they are, with the capture instant read first as for a picture.
+        timestamp_ms = sampling.capture_timestamp_ms()
+        self._on_video(codec, bytes(msg.data), timestamp_ms)
+        return True
 
     def start(self) -> None:
         def callback(msg):
+            if self._route_video(msg):
+                return
             # The capture instant, read before any conversion work — the
             # same bridge-capture-time promise a datapoint sample makes.
             # Rides with the raw message untouched when
@@ -1510,6 +1623,17 @@ class _CameraEntry:
     # the-wrong-moment bug `observed_at_ms` itself exists to close, just at a
     # different call site.
     last_source_error: Optional[Tuple[str, str, int]] = None
+    # The H.264 stream of a camera whose source can deliver one: RTSP with
+    # `passthrough: true`, a `CompressedVideo` topic, a `CompressedImage`
+    # topic (which carries H.264 or JPEG, by its messages). `None` for every
+    # other camera. It holds the queue to the sender and the newest keyframe.
+    h264_stream: Optional["passthrough.PassthroughStream"] = None
+    # Whether this camera is a passthrough camera right now. Fixed for RTSP
+    # and `CompressedVideo`; for `CompressedImage` it follows the messages.
+    passes_through: bool = False
+    # Capture time of the keyframe last decoded for a snapshot, so that one
+    # keyframe is decoded once however often a snapshot comes due.
+    keyframe_decoded_ms: Optional[int] = None
 
 
 #: The `live.*` ROS parameters and the check each proposed value has to pass.
@@ -1757,7 +1881,7 @@ class RosRuntime:
         # the default builds a real live.LivePublisher; tests substitute one
         # that never touches a real LiveKit server.
         self._live_publishers: Dict[str, object] = {}
-        self._live_publisher_factory = live_publisher_factory or live.LivePublisher
+        self._live_publisher_factory = live_publisher_factory or _default_live_publisher_factory
         # One asyncio.Lock per slug — see _live_lock's docstring
         # for the start_live/stop_live race it closes.
         self._live_locks: Dict[str, asyncio.Lock] = {}
@@ -2299,6 +2423,20 @@ class RosRuntime:
                 )
             return
         for slug, publisher in list(self._live_publishers.items()):
+            if self._lb_active and getattr(publisher, "passthrough", None) is not None:
+                # `reduce` re-targets an encoder. A passthrough stream has
+                # none: the bridge forwards what the source sends and cannot
+                # make it smaller, so the stream ends as under `stop`.
+                await self.stop_live(
+                    slug,
+                    cause=CAMERA_STATE_CAUSE_LIVE_LOST,
+                    error=(
+                        "low_bandwidth",
+                        "Live video stopped: the bridge entered low-bandwidth "
+                        "mode, and a passthrough stream has no bitrate to reduce.",
+                    ),
+                )
+                continue
             if self._lb_active:
                 kbps = self._lb_bitrate_kbps
             else:
@@ -2789,6 +2927,20 @@ class RosRuntime:
             # unsolicited background reporting `_on_source_error`/
             # `_on_source_frame` do (`cause: 'source'`) — it only
             # ever fires in response to this joiner's own request.
+            if entry.passes_through and entry.last_source_error is not None:
+                # A passthrough camera whose stream is refused, or whose
+                # source is gone, has nothing to forward: unlike a picture
+                # camera it holds no last frame to show meanwhile.
+                code, message, observed_at_ms = entry.last_source_error
+                self.camera_states.put(
+                    CameraStateUpdate(
+                        slug, False, (code, message),
+                        cause=CAMERA_STATE_CAUSE_COMMAND, observed_at_ms=observed_at_ms,
+                        request_id=request_id,
+                    )
+                )
+                return
+
             if self._newest_frame_ms(entry) is None and entry.last_source_error is not None:
                 code, message, observed_at_ms = entry.last_source_error
                 self.camera_states.put(
@@ -2812,15 +2964,34 @@ class RosRuntime:
             # only for that one. The keyword is a dict of its own so that a
             # camera with any other kind of publisher is given none at all,
             # not even `None`: such a publisher brings its encoder with it.
+            # A passthrough camera's is that other kind: nothing of its
+            # stream is encoded, and no encoder is built for it.
             #
             # `None` for `software`: aiortc builds its own encoder and the
             # answer picks the codec, as before the setting existed. Anything
             # else is an encoder of this session's own, which the publisher
             # closes. Nothing is built or probed here; that happens with the
             # first frame, in aiortc's encoder thread.
-            encoder_kwargs = {
-                "encoder": live_encoder.build_encoder(self._live_encoder, fps=entry.fps)
-            }
+            encoder_kwargs = (
+                {} if entry.passes_through
+                else {"encoder": live_encoder.build_encoder(self._live_encoder, fps=entry.fps)}
+            )
+            # A passthrough camera hands its publisher the stream to forward;
+            # every other camera gets exactly the publisher it always got.
+            passthrough_kwargs = (
+                {"passthrough": entry.h264_stream} if entry.passes_through else {}
+            )
+            # While its publisher is paused a camera keeps its messages raw
+            # (`conversion_wanted` in `_create_camera`). The one it holds when
+            # a viewer comes back is converted at once, as at a start, rather
+            # than left until the camera's next message. Not for a passthrough
+            # camera: it holds no raw message, nothing of it is converted for
+            # live, and its stream resumes at the source's next keyframe by
+            # itself. Its publisher is handed no `on_resume` to wait for.
+            resume_kwargs = (
+                {} if entry.passes_through
+                else {"on_resume": lambda slug=slug: self.convert_newest_raw_frame(slug)}
+            )
             publisher = self._live_publisher_factory(
                 holder=entry.latest,
                 width=entry.width,
@@ -2830,12 +3001,9 @@ class RosRuntime:
                 on_lost=lambda reason, slug=slug: self._on_live_lost(slug, reason),
                 slug=slug,
                 received_s=received_s,
-                # While this publisher is paused the camera keeps its messages
-                # raw (`conversion_wanted` in `_create_camera`). The one it
-                # holds when a viewer comes back is converted at once, as at a
-                # start, rather than left until the camera's next message.
-                on_resume=lambda slug=slug: self.convert_newest_raw_frame(slug),
+                **resume_kwargs,
                 **encoder_kwargs,
+                **passthrough_kwargs,
             )
             try:
                 await publisher.start(url, room, token)
@@ -2881,7 +3049,9 @@ class RosRuntime:
                 # catch it, on the very link the mode has just called narrow.
                 # A join takes seconds on such a link, which is exactly when
                 # this window is widest.
-                if self._lb_camera == "stop":
+                # A passthrough stream has no bitrate to reduce, so `reduce`
+                # ends it as `stop` does.
+                if self._lb_camera == "stop" or passthrough_kwargs:
                     await publisher.stop()
                     self.camera_states.put(
                         CameraStateUpdate(
@@ -2904,6 +3074,39 @@ class RosRuntime:
                         "Could not re-target a live stream that joined during "
                         "low-bandwidth mode, slug %r", slug,
                     )
+            if bool(passthrough_kwargs) != entry.passes_through:
+                # A `CompressedImage` topic changed what it carries while
+                # this join was in flight. The publisher was built for the
+                # other kind, and the change found no running stream to end.
+                await publisher.stop()
+                self.camera_states.put(
+                    CameraStateUpdate(
+                        slug, False,
+                        (
+                            "live_unavailable",
+                            "the topic changed between pictures and H.264 while "
+                            "the stream started; start it again",
+                        ),
+                        cause=CAMERA_STATE_CAUSE_COMMAND,
+                        observed_at_ms=sampling.capture_timestamp_ms(),
+                        request_id=request_id,
+                    )
+                )
+                return
+            if passthrough_kwargs and entry.last_source_error is not None:
+                # The stream was refused while this join was in flight. The
+                # refusal looked for a running stream to end and found none
+                # yet, so this one would commit with nothing to forward.
+                code, message, observed_at_ms = entry.last_source_error
+                await publisher.stop()
+                self.camera_states.put(
+                    CameraStateUpdate(
+                        slug, False, (code, message),
+                        cause=CAMERA_STATE_CAUSE_COMMAND, observed_at_ms=observed_at_ms,
+                        request_id=request_id,
+                    )
+                )
+                return
             self._live_publishers[slug] = publisher
             self.camera_states.put(
                 CameraStateUpdate(
@@ -4479,6 +4682,10 @@ class RosRuntime:
         on_raw_frame: Callable[[int], None],
         encoded: Optional[camera.EncodedFrameHolder] = None,
         on_jpeg: Optional[camera_sources.OnJpeg] = None,
+        h264_stream: Optional["passthrough.PassthroughStream"] = None,
+        on_healthy: Optional[Callable[[int], None]] = None,
+        on_video: Optional[Callable[[str, bytes, int], None]] = None,
+        on_picture: Optional[Callable[[], None]] = None,
     ) -> camera_sources.CameraSourceAdapter:
         """The one place that turns a `CameraSource` into a running
         adapter. Everything below this — `_on_source_frame`, the snapshot
@@ -4500,6 +4707,14 @@ class RosRuntime:
                 on_frame=on_frame, on_error=on_error,
                 raw=raw, conversion_wanted=conversion_wanted, on_raw_frame=on_raw_frame,
                 encoded=encoded,
+                on_video=on_video, on_picture=on_picture,
+            )
+        if isinstance(source, RtspSource) and source.passthrough:
+            # Its own adapter, not a mode of the decoding one: it opens the
+            # stream with another library and hands on units, not pictures.
+            return camera_sources.RtspPassthroughSourceAdapter(
+                url=source.url, transport=source.transport, credentials=resolved_credentials,
+                stream=h264_stream, on_healthy=on_healthy, on_error=on_error,
             )
         if isinstance(source, RtspSource):
             return camera_sources.RtspSourceAdapter(
@@ -4622,6 +4837,11 @@ class RosRuntime:
         entry.bitrate_kbps = cfg.bitrate_kbps
         entry.snapshot_interval_seconds = cfg.snapshot_interval_seconds
         entry.rate = sampling.MaxHzPolicy(cfg.fps)
+        if entry.h264_stream is not None:
+            # The stream is judged against the configured size; a new size
+            # is a new judgement, from the next keyframe.
+            entry.h264_stream.set_size(cfg.width, cfg.height)
+            entry.keyframe_decoded_ms = None
 
     def _create_camera(self, slug: str, cfg: CameraConfig) -> None:
         resolved_credentials = self._resolve_camera_credentials(cfg.source)
@@ -4746,10 +4966,42 @@ class RosRuntime:
             # raw rather than being converted.
             self._clear_source_error(slug, entry, timestamp_ms)
 
+        # Passthrough. A camera is one from the start when its source says so
+        # (RTSP with `passthrough: true`, a `CompressedVideo` topic); a
+        # `CompressedImage` topic gets the stream too and becomes one with
+        # its first H.264 message.
+        source = cfg.source
+        fixed_passthrough = (
+            isinstance(source, RtspSource) and source.passthrough
+        ) or (isinstance(source, RosSource) and source.type == COMPRESSED_VIDEO_TYPE)
+        h264_stream = None
+        if fixed_passthrough or (
+            isinstance(source, RosSource) and source.type == COMPRESSED_IMAGE_TYPE
+        ):
+            h264_stream = passthrough.PassthroughStream(
+                width=cfg.width, height=cfg.height, slug=slug
+            )
+
+        def on_healthy(timestamp_ms: int) -> None:
+            # From the RTSP passthrough adapter's own thread, once per
+            # connection: marshalled like on_frame and on_error.
+            self._enqueue(lambda: self._clear_source_error(slug, entry, timestamp_ms))
+
+        def on_video(codec: str, data: bytes, timestamp_ms: int) -> None:
+            # From the ROS subscription callback, which is the executor
+            # thread already.
+            self._on_camera_video(slug, entry, codec, data, timestamp_ms)
+
+        def on_picture() -> None:
+            self._on_camera_picture(slug, entry)
+
         adapter = self._build_source_adapter(
             cfg.source, resolved_credentials, on_frame, on_error,
             raw=raw, conversion_wanted=conversion_wanted, on_raw_frame=on_raw_frame,
             encoded=encoded, on_jpeg=on_jpeg,
+            h264_stream=h264_stream, on_healthy=on_healthy,
+            on_video=on_video if h264_stream is not None else None,
+            on_picture=on_picture if h264_stream is not None else None,
         )
         entry = _CameraEntry(
             source=cfg.source,
@@ -4764,6 +5016,8 @@ class RosRuntime:
             raw=raw,
             encoded=encoded,
             adapter=adapter,
+            h264_stream=h264_stream,
+            passes_through=fixed_passthrough,
         )
         adapter.start()
         self._cameras[slug] = entry
@@ -4997,6 +5251,136 @@ class RosRuntime:
                 request_id=None,
             )
         )
+        if entry.passes_through and code == PASSTHROUGH_REFUSAL_CODE:
+            # The stream turned into one that cannot be passed through while
+            # somebody watched. There is nothing left to forward, so the
+            # stream ends, and says why. A source that stalls or drops
+            # (other codes) leaves a running stream as it leaves any other.
+            #
+            # And one line in the robot's own log, once per refusal: the
+            # sentence travels to the cloud in the camera's state, and the
+            # console shows a state's kind and not its text. The sentence is
+            # this package's own, built from sizes and codec names.
+            log.warning("Camera slug %r is not passed through: %s", slug, message)
+            self._end_live_from_executor(slug, (code, message))
+
+    # --- cameras: H.264 that is passed through ------------------------------
+
+    def _on_camera_video(
+        self, slug: str, expected_entry: _CameraEntry, codec: str, data: bytes, timestamp_ms: int
+    ) -> None:
+        """One ROS message carrying encoded video, on the executor thread.
+
+        H.264 goes into the camera's stream, which decides what becomes of
+        it; any other codec is a camera error. Nothing is decoded here.
+        Same stale-adapter guard as `_on_source_frame`."""
+        entry = self._cameras.get(slug)
+        if entry is not expected_entry or entry.h264_stream is None:
+            return
+        if codec != "h264":
+            self._on_passthrough_refused(
+                slug, entry,
+                "the topic carries {} and not H.264; passthrough forwards H.264 "
+                "only".format(_codec_display_name(codec)),
+            )
+            return
+        if not entry.passes_through:
+            self._set_passes_through(slug, entry, True)
+        try:
+            accepted = entry.h264_stream.push(data, timestamp_ms)
+        except passthrough.PassthroughRefused as refused:
+            self._on_passthrough_refused(slug, entry, str(refused))
+            return
+        if accepted:
+            self._clear_source_error(slug, entry, timestamp_ms)
+
+    def _on_camera_picture(self, slug: str, expected_entry: _CameraEntry) -> None:
+        """A `CompressedImage` topic delivered a picture. If it carried
+        H.264 until now, the camera is a picture source again."""
+        entry = self._cameras.get(slug)
+        if entry is expected_entry and entry.passes_through:
+            self._set_passes_through(slug, entry, False)
+
+    def _set_passes_through(self, slug: str, entry: _CameraEntry, passes_through: bool) -> None:
+        """A `CompressedImage` topic changed what it carries. A stream that
+        runs was built for the other kind and ends; the cloud's next
+        `camera_start` gets the publisher that fits."""
+        entry.passes_through = passes_through
+        entry.keyframe_decoded_ms = None
+        if not passes_through:
+            entry.h264_stream.reset()
+        self._end_live_from_executor(
+            slug,
+            (
+                "live_unavailable",
+                "the topic changed from {} to {}; the stream ended and can be "
+                "started again".format(
+                    "pictures" if passes_through else "H.264",
+                    "H.264" if passes_through else "pictures",
+                ),
+            ),
+        )
+
+    def _on_passthrough_refused(self, slug: str, entry: _CameraEntry, message: str) -> None:
+        """A refused stream raises for every unit until its cause is gone;
+        the camera reports it once."""
+        current = entry.last_source_error
+        if current is not None and current[:2] == (PASSTHROUGH_REFUSAL_CODE, message):
+            return
+        self._on_source_error(slug, entry, PASSTHROUGH_REFUSAL_CODE, message)
+
+    def _end_live_from_executor(self, slug: str, error: Tuple[str, str]) -> None:
+        """Ends `slug`'s running stream from the executor thread, with a
+        reason. `stop_live` is the event loop's, so the work is handed there
+        and not waited for. A slug that is not live is left alone.
+
+        The membership test reads `_live_publishers` from the wrong thread,
+        like `conversion_wanted` does and for the same price: a stream that
+        commits in the instant after it is not seen here, which is why
+        `start_live` looks at the camera's error once more after its join."""
+        if slug not in self._live_publishers or self._loop is None:
+            return
+
+        def report(future: "concurrent.futures.Future") -> None:
+            if not future.cancelled() and future.exception() is not None:
+                log.error(
+                    "Could not end the live stream for slug %r: %s",
+                    slug, type(future.exception()).__name__,
+                )
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.stop_live(slug, cause=CAMERA_STATE_CAUSE_LIVE_LOST, error=error),
+                self._loop,
+            ).add_done_callback(report)
+        except RuntimeError:
+            pass  # the loop is closed; every stream ended with it
+
+    def _decode_due_keyframe(self, slug: str, entry: _CameraEntry) -> None:
+        """The snapshot of a passthrough camera: its newest keyframe, decoded
+        now. Called for a camera `_next_snapshot` has just found due, beside
+        `_convert_due_raw_frame` and for the same reason -- nothing is
+        decoded for a picture nobody asked for, and a passthrough camera is
+        decoded nowhere else at all.
+
+        One keyframe is decoded once: a snapshot that comes due before the
+        next keyframe sends the picture `entry.latest` already holds. The
+        picture goes through `_on_source_frame` like every other, so `fps`
+        bounds how often one is taken and the header carries the keyframe's
+        capture time."""
+        stream = entry.h264_stream
+        if stream is None or not entry.passes_through:
+            return
+        keyframe = stream.newest_keyframe()
+        if keyframe is None or keyframe.timestamp_ms == entry.keyframe_decoded_ms:
+            return
+        entry.keyframe_decoded_ms = keyframe.timestamp_ms
+        try:
+            bgr = passthrough.decode_keyframe(keyframe.data)
+        except passthrough.KeyframeDecodeError as exc:
+            log.error("Could not decode a keyframe for a snapshot of camera slug %r: %s", slug, exc)
+            return
+        self._on_source_frame(slug, entry, bgr, keyframe.timestamp_ms)
 
     # --- the shared watchdog: one timer, runs on the executor ---------------
 
@@ -5513,6 +5897,7 @@ class RosRuntime:
                 entry.last_snapshot_at = now
                 return passed_through
             self._convert_due_raw_frame(slug, entry)
+            self._decode_due_keyframe(slug, entry)
             frame = entry.latest.get()
             if frame is None:
                 continue
