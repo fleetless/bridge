@@ -1,3 +1,45 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.4.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * feat(live): a live publisher can be handed an H.264 encoder of the bridge's own
+  * fix(live): close a handed encoder in a thread of its own, so a stuck close cannot hold the bridge at exit
+  * feat(camera): send a camera's own JPEG as the snapshot, and decode MJPEG only on demand
+  * fix(camera): start live for a camera whose snapshots were only ever passed through
+  * fix(camera): asking for a held frame's conversion does nothing while the bridge is not running
+  * fix(camera): a held frame with no recorded arrival time counts as arriving now
+  * fix(camera): a ROS camera converts no frames for live while nobody is subscribed
+  * fix(live): the first frame after a resume is the camera's newest, not the one from before the pause
+  * docs(camera): the cloud's linger is off unless configured, and a paused publisher exists without it
+  * feat(live): encode live video with the robot's hardware encoder, chosen with live.encoder
+  * fix(live): a camera whose width is not a multiple of eight no longer switches the hardware encoder off for every camera
+  * fix(live): a hardware encoder's stream names the colours that are in it, so pictures of more than 576 lines are no longer shown slightly off
+  * fix(live): an encoder element that reports an error is believed with that frame, and its messages no longer pile up for the length of a session
+  * refactor(live): the encoder chosen with live.encoder is handed to a camera's publisher as a keyword of its own
+  * docs(readme): what a session that fell back does with the bitrate, and what GStreamer's first start costs
+  * fix(live): an encoder element that stops returning costs one late frame, not the bridge's worker threads
+  * docs(security): GStreamer's plugin scanner is a second child process, and its registry a file in the bridge user's cache
+  * docs(security): the plugin scanner can start more than once in a scan, and GStreamer's libraries may write short-lived files besides the registry
+  * fix(live): a camera whose picture size changes no longer rebuilds an encoder chain whose pipeline did not shut down
+  * docs(security): GStreamer writes its registry in the bridge's own process, not in the scanner
+  * fix(live): the first camera started after the bridge can no longer switch the hardware encoder off for the others
+  * docs(security): liborc's short-lived file is written by the bridge's own process too, on every distribution
+  * feat(camera): pass H.264 from an RTSP camera or a ROS topic through to live viewers without decoding or encoding it
+  * fix(camera): a still from a kept keyframe does not report a passthrough camera recovered
+  * fix(camera): SPS goes before PPS in front of a passthrough keyframe
+  * fix(live): a passthrough camera takes no encoder from live.encoder
+  * fix(camera): bound the parameter sets, the access units and the queue of a passthrough stream
+  * fix(camera): a passthrough camera's snapshot is its keyframe, also beside a JPEG it once sent
+  * fix(camera): an RTSP passthrough camera that drops right after its first keyframe is not reconnected at the shortest delay for ever
+  * fix(camera): the reason a camera cannot be passed through is logged when it is new, and at most once a minute while it is repeated
+  * fix(live): a passthrough camera is not asked for a held frame when a viewer comes back
+  * fix(camera): a passthrough keyframe counts as what is sent for it, and an oversized stream of the wrong size is refused for its size
+  * fix(camera): bound the number of NAL units in one access unit of a passthrough stream
+  * fix(camera): the robot's log ends on the reason a camera cannot be passed through now, also when that reason was already logged within the minute
+  * fix(camera): an RTSP passthrough camera that answered with an RTSP status in between reports again why its stream is refused
+  * fix(camera): the passthrough queue counts a NAL unit as the memory it takes
+  * docs(config): the vendoring notes say the bridge reads passthrough
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Fri, 13 Nov 2026 13:27:39 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.3.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * fix(live): log how long each live start took
