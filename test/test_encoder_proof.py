@@ -231,6 +231,22 @@ def test_a_colour_is_converted_by_the_matrix_and_the_range_it_is_given():
     assert round(proof.as_a_viewer_shows_it(218.0, 128.0, 128.0, 6, True)[0]) == 218
 
 
+def test_a_chain_that_starts_and_then_refuses_the_stream_fails_and_is_not_called_absent(monkeypatch):
+    """Exit 2 is for hardware that is not there. A chain that is there,
+    starts, and then refuses the size is a chain that does not do what it
+    must, whichever of the pipeline's two threads noticed first. Here it is
+    the constructor: x264 refuses an odd width as soon as the caps reach
+    it."""
+    from test_live_encoder_pipeline import Patient
+
+    monkeypatch.setattr(proof, "Pipeline", Patient)
+    result, said = _prove(STAND_IN, width=641, height=480)
+    assert result == "fail"
+    assert "FAIL frame 0: an access unit for the frame (enc: " in said
+    assert "=> FAIL: the chain started and then refused the stream" in said
+    assert "not on this machine" not in said
+
+
 def test_a_chain_that_does_not_follow_the_bitrate_fails_the_proof():
     """A chain whose bitrate property does nothing: it names a property that
     is not the encoder's, so every target is the element's own default."""

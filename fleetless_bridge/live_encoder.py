@@ -142,6 +142,21 @@ class ChainFailed(Exception):
         self.reason = reason
 
 
+class StreamFailed(ChainFailed):
+    """A pipeline was built and started, and then one of its elements
+    reported an error.
+
+    Such an error comes from the pipeline's streaming thread, where the caps
+    are negotiated and the first buffers flow. It is about the stream: an
+    encoder that does not take this picture size says so there, and a
+    picture of another size may never meet it. A missing element, a pipeline
+    that does not parse and a state change that fails are `ChainFailed` and
+    nothing more; those are about the machine.
+
+    The difference decides what is remembered (`ChainMemory`): for every
+    camera, or for pictures of this size."""
+
+
 # --- the chains ----------------------------------------------------------------
 
 
@@ -539,11 +554,14 @@ class Pipeline:
 
             if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
                 raise ChainFailed(self._bus_error() or "the pipeline did not start")
-            # A device that cannot be opened says so on the bus, during the
-            # state change that has just returned.
+            # An element may have reported an error by now, though the state
+            # change succeeded: the streaming thread is running, and on the
+            # first pipeline of a process it is often quicker than this
+            # line. What it reports is about the stream, so it is not raised
+            # as a pipeline that cannot be built. See `StreamFailed`.
             error = self._bus_error()
             if error is not None:
-                raise ChainFailed(error)
+                raise StreamFailed(error)
         except BaseException:
             # What is raised is why it did not start; how the remains went
             # away adds nothing to that.
@@ -1023,6 +1041,15 @@ class HardwareH264Encoder(H264Encoder):
                     self._memory.cannot_be_built(other, unavailable.reason)
                 failures.append(unavailable.reason)
                 break
+            except StreamFailed as refused:
+                # Built and started, and then an element said no: the same
+                # finding as a first frame that does not come back, only
+                # sooner. Which of the two it is, is a race between the
+                # streaming thread and this one, and what is remembered
+                # must not depend on who won.
+                self._memory.did_not_encode(chain, size, refused.reason)
+                failures.append(did_not_encode(chain, size, refused.reason))
+                continue
             except Exception as exc:  # noqa: BLE001 - a chain's failure, whatever it raised
                 self._memory.cannot_be_built(chain, _reason(exc))
                 failures.append(cannot_be_built(chain, _reason(exc)))

@@ -54,6 +54,7 @@ from fleetless_bridge.live_encoder import (  # noqa: E402
     STAND_IN,
     ChainFailed,
     ChainMemory,
+    StreamFailed,
     GstUnavailable,
     HardwareH264Encoder,
     Pipeline,
@@ -325,6 +326,12 @@ def prove(chain, args, out):
     except GstUnavailable as unavailable:
         report.say("  not on this machine: {}".format(unavailable.reason))
         return "absent"
+    except StreamFailed as failed:
+        # It is here, it started, and then it refused the stream: a chain
+        # that runs and does not do what it must, not one that is absent.
+        report.check(False, "frame 0: an access unit for the frame", failed.reason)
+        report.say("  => FAIL: the chain started and then refused the stream")
+        return "fail"
     except ChainFailed as failed:
         report.say("  not on this machine: {}".format(failed.reason))
         return "absent"

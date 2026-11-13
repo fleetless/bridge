@@ -30,6 +30,7 @@ from fleetless_bridge.live_encoder import (
     ChainFailed,
     HardwareH264Encoder,
     Pipeline,
+    StreamFailed,
 )
 
 WIDTH, HEIGHT, FPS = 320, 240, 15
@@ -437,6 +438,43 @@ def test_a_chain_that_does_not_start_fails_at_construction_with_what_the_element
         _pipeline(broken)
     assert "/nonexistent-894/out" in failed.value.reason
     assert failed.value.reason.split(":")[0].startswith("filesink")
+
+
+class Patient(Pipeline):
+    """A pipeline whose every look at the bus waits half a second for an
+    error. On the first pipeline of a process the streaming thread is
+    often quicker than the constructor; this makes it so every time."""
+
+    def _bus_error(self):
+        message = self._bus.timed_pop_filtered(self._Gst.SECOND // 2, self._Gst.MessageType.ERROR)
+        if message is None:
+            return None
+        error, _debug = message.parse_error()
+        return "{}: {}".format(message.src.get_name(), error.message)
+
+
+def test_an_error_reported_after_a_successful_start_is_about_the_stream_and_not_the_build():
+    """x264 takes no odd width. It says so when the caps reach it, from the
+    streaming thread, after the state change has succeeded: sometimes before
+    the constructor looks at the bus and sometimes after. Either way it is
+    the stream that was refused."""
+    with pytest.raises(StreamFailed) as refused:
+        Patient(STAND_IN, width=641, height=480, fps=FPS, bitrate_bps=1_000_000)
+    assert refused.value.reason.startswith("enc: ")
+    assert isinstance(refused.value, ChainFailed)
+    # What is about the machine stays a plain failure of the build.
+    for chain in (
+        CHAINS["nvenc"][0],
+        _variant(caps="video/x-h264 ! nonsense-property-here=1 !"),
+        _variant(
+            convert="tee name=t t. ! queue ! filesink location=/nonexistent-894/out "
+            "t. ! queue ! videoconvert",
+            elements=("tee", "queue", "filesink", "videoconvert", "x264enc"),
+        ),
+    ):
+        with pytest.raises(ChainFailed) as failed:
+            Patient(chain, width=WIDTH, height=HEIGHT, fps=FPS, bitrate_bps=1_000_000)
+        assert type(failed.value) is ChainFailed, chain.name
 
 
 def test_a_chain_that_reports_an_error_while_running_fails_with_what_the_element_said():
