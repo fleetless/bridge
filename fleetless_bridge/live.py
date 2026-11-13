@@ -121,6 +121,17 @@ ENCODER_CLAMP_BPS = {
 }
 
 
+#: The least time between two frames the track produces ahead of its pacing.
+#: A viewer on a bad link asks for a keyframe again and again; answered every
+#: time, the stream would turn into keyframes at whatever rate the requests
+#: arrive, on the very link that is already losing packets. Once a second is
+#: often enough to end a visible stall and rare enough not to matter to the
+#: bitrate. A request inside that second is answered by the next regular
+#: frame, which is at most one second away at any frame rate a camera can be
+#: configured with.
+EARLY_FRAME_MIN_INTERVAL_S = 1.0
+
+
 class LiveStartError(Exception):
     """Live could not be started. The message becomes `bridgeCameraState`'s
     `error.message` (ros_runtime.py) — a camera that cannot start must say
@@ -147,6 +158,15 @@ class CameraTrack(VideoStreamTrack):
     waits for the first push rather than inventing a black frame — the same
     reason `LiveStartError` exists: a black rectangle read as live is the
     failure this path exists to avoid.
+
+    **One frame may come ahead of the pacing**, when `request_early_frame`
+    asks for it: the newest frame again, now, instead of at the next tick.
+    That is for a keyframe request, which aiortc's sender answers by flagging
+    the next frame it encodes -- a frame that at 2 fps is up to half a second
+    away. At most one such frame per `EARLY_FRAME_MIN_INTERVAL_S`, and the
+    pacing moves with it: the frame after an early one is a whole interval
+    later, so the configured rate stays a ceiling apart from the early frame
+    itself. With no request, the pacing is exactly what it is without this.
     """
 
     kind = "video"
@@ -162,6 +182,11 @@ class CameraTrack(VideoStreamTrack):
         self._have_frame = asyncio.Event()
         self._start_s: Optional[float] = None
         self._last_s: Optional[float] = None
+        # Set by a request for a frame ahead of the pacing, cleared by every
+        # frame produced: a request is answered by the next frame, whichever
+        # way that frame comes about.
+        self._early = asyncio.Event()
+        self._last_early_s: Optional[float] = None
         #: How many frames this track has handed to the encoder. Read by the
         #: browser proof to tell "the publisher produced nothing" from "the
         #: viewer never received what it produced" — two states a viewer alone
@@ -176,6 +201,21 @@ class CameraTrack(VideoStreamTrack):
         self._latest = rgb
         if not self._have_frame.is_set():
             self._have_frame.set()
+
+    def request_early_frame(self) -> None:
+        """Ask for the next frame now rather than at the next tick. Called on
+        the event loop, by whatever has just flagged that frame as a keyframe.
+
+        Ignored inside `EARLY_FRAME_MIN_INTERVAL_S` of the last early frame;
+        the request is then answered by the regular frame. What is counted is
+        early *frames*, not requests: a request that the next frame answers
+        on time anyway uses nothing up."""
+        if (
+            self._last_early_s is not None
+            and time.monotonic() - self._last_early_s < EARLY_FRAME_MIN_INTERVAL_S
+        ):
+            return
+        self._early.set()
 
     def stop(self) -> None:
         super().stop()
@@ -197,8 +237,14 @@ class CameraTrack(VideoStreamTrack):
         elif self._last_s is not None:
             due = self._last_s + self._interval_s
             if due > now:
-                await asyncio.sleep(due - now)
-                now = due
+                if await self._asked_for_before(due - now):
+                    # Early: stamped with the time it really is, and the
+                    # pacing counts on from here.
+                    now = time.monotonic()
+                    self._last_early_s = now
+                else:
+                    now = due
+        self._early.clear()
         self._last_s = now
 
         frame = VideoFrame.from_ndarray(self._latest, format="rgb24")
@@ -206,6 +252,15 @@ class CameraTrack(VideoStreamTrack):
         frame.time_base = VIDEO_TIME_BASE
         self.frames_sent += 1
         return frame
+
+    async def _asked_for_before(self, delay_s: float) -> bool:
+        """Waits out `delay_s`, the rest of the pacing interval, unless a
+        frame is asked for first; says whether one was."""
+        try:
+            await asyncio.wait_for(self._early.wait(), delay_s)
+        except asyncio.TimeoutError:
+            return False
+        return True
 
 
 def _ice_servers_without_stun(ice_servers: Sequence[IceServer]) -> List[RTCIceServer]:
@@ -514,6 +569,7 @@ class LivePublisher:
                 "could not publish the video track ({})".format(type(exc).__name__)
             ) from None
 
+        self._answer_keyframe_requests_at_once()
         log.info(
             "Live publish for %s ready in %d ms",
             self._slug if self._slug is not None else "camera",
@@ -732,6 +788,47 @@ class LivePublisher:
             return
         log.info("Live publish %s (subscribed layers: %s)",
                  "paused" if paused else "resumed", "none" if paused else "at least one")
+
+    def _answer_keyframe_requests_at_once(self) -> None:
+        """Make a keyframe request wake the track as well.
+
+        A viewer that has lost a keyframe sends a PLI, and aiortc's sender
+        answers it by calling its own `_send_keyframe`, which flags the next
+        frame it encodes. That frame comes when `CameraTrack.recv()` has
+        waited out its pacing interval: up to half a second at 2 fps, for
+        every keyframe a viewer asks for. So the method is wrapped, on this
+        one sender instance: the flag is set as before, and the track is
+        asked for its next frame now.
+
+        Once per session, on the sender that is finally used -- after the
+        TURN retry, if there was one. `_set_paused` calls the same method on
+        a resume and so wakes the track too.
+
+        `_send_keyframe` is aiortc's internal spelling, the same in 1.3.0,
+        1.6.0 and 1.14.0, and the name its own RTCP handler calls. A sender
+        without it, or a track that cannot be woken, costs the early frame
+        and nothing else: one line here, and a keyframe request is answered
+        at the next tick, as it was before this existed.
+        """
+        sender, track = self._sender, self._track
+        flag_keyframe = getattr(sender, "_send_keyframe", None)
+        wake_track = getattr(track, "request_early_frame", None)
+        if callable(flag_keyframe) and callable(wake_track):
+
+            def flag_keyframe_and_wake_track() -> None:
+                flag_keyframe()
+                wake_track()
+
+            try:
+                sender._send_keyframe = flag_keyframe_and_wake_track
+                return
+            except Exception:  # noqa: BLE001 - a sender that refuses the attribute
+                pass
+        log.warning(
+            "A keyframe request cannot be passed on to the track (this aiortc's "
+            "sender or this track has no hook for it); a keyframe a viewer asks "
+            "for waits for the next frame"
+        )
 
     # -- the frame feed ----------------------------------------------------
 
