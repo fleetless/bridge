@@ -1,3 +1,10 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.5.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(main): a stop in the bridge's first seconds ends it quietly
+  * docs(main): a stop waits for a long C call of the imports to return, and a start stuck inside ROS is ended only by the supervisor's SIGKILL
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Fri, 13 Nov 2026 19:06:34 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.5.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * feat(live): live.encoder vaapi also tries vah264lpenc, the low-power encoder some Intel chips encode H.264 with only
