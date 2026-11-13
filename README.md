@@ -290,8 +290,8 @@ exception: its software H.264 keeps the whole range.
 GStreamer is loaded with the first frame of the first hardware session after
 the bridge starts. When its plugin registry is missing or stale, it then runs
 its own plugin scanner, `gst-plugin-scanner`, as a child process, again for
-the rest of the scan if a plugin crashes it, and the scanner writes the
-registry to `~/.cache/gstreamer-1.0`. That delays that one picture: by
+the rest of the scan if a plugin crashes it, and then writes the registry to
+`~/.cache/gstreamer-1.0`. That delays that one picture: by
 0.2 s for the 250 plugins of this repository's test image, by more where more
 are installed. It happens again after an update of a GStreamer package, and
 at every start of a bridge whose user cannot write there; `GST_REGISTRY`

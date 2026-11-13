@@ -83,17 +83,19 @@ the bridge loads with the first live session that uses one. When GStreamer's
 plugin registry is missing or stale, its initialisation runs GStreamer's own
 plugin scanner (`gst-plugin-scanner`) as a child process, and starts it again
 for the rest of the scan whenever a plugin crashes it, so one scan can start
-it several times. The scanner writes the registry file to the bridge user's
-cache directory, `$XDG_CACHE_HOME/gstreamer-1.0/` (`~/.cache/gstreamer-1.0/`
-by default). That happens at the first hardware start, again after an update
+it several times. From what the scanner reports, GStreamer then writes the
+registry file itself, in the bridge's process, to the bridge user's cache
+directory: `$XDG_CACHE_HOME/gstreamer-1.0/` (`~/.cache/gstreamer-1.0/` by
+default). The scan happens at the first hardware start, again after an update
 of a GStreamer package, and at every start of a bridge whose user cannot
 write that directory.
 
 GStreamer's libraries may write short-lived files of their own besides the
 registry. One is known: with liborc 0.4.42 the scanner creates a file for
-code it compiles, `orcexec.*`, in `$XDG_RUNTIME_DIR` or else in `$HOME`, and
-deletes it at once. The driver of an encoder chip is a library GStreamer
-loads too, and may keep files of its own; this project has run none yet.
+code it compiles, `orcexec.*`, in `$XDG_RUNTIME_DIR`, or in `$HOME` where
+that is not set, and deletes it at once. The driver of an encoder chip is a
+library GStreamer loads too, and may keep files of its own; this project has
+run none yet.
 
 Nothing from a cloud message reaches the scanner's command line: the binary
 and its arguments are GStreamer's. What the cloud can do is cause it to run,
