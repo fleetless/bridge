@@ -449,15 +449,9 @@ class LivePublisher:
                     url for server in join.ice_servers for url in server.urls
                     if url.lower().startswith(("turn:", "turns:"))
                 ]
-                stun_servers = [
-                    IceServer(urls=tuple(
-                        url for url in server.urls
-                        if url.startswith("stun:")
-                    ))
-                    for server in join.ice_servers
-                ]
-                stun_servers = [server for server in stun_servers if server.urls]
-                if not turn_urls or not stun_servers:
+                # A TURN transaction failed, so only a `join` that named a
+                # relay is retried; anything else is not this path's failure.
+                if not turn_urls:
                     raise
                 # The server controls the reason text and the TURN URL. Keep
                 # only a safe address and a validated code in the warning.
@@ -488,11 +482,14 @@ class LivePublisher:
                         detail = "unknown TURN error"
                 for value in sensitive:
                     turn_url = turn_url.replace(value, "[redacted]")
-                log.warning("TURN gathering failed for %s (%s); retrying with STUN only",
+                log.warning("TURN gathering failed for %s (%s); retrying without TURN",
                             turn_url, detail)
                 self._pc = None
                 await pc.close()
-                pc = self._connection_factory(stun_servers)
+                # No ICE server at all: host candidates are what is left once
+                # the relay is out, and they reach every media server the
+                # robot can reach without one.
+                pc = self._connection_factory(())
                 self._pc = pc
                 pc.on("connectionstatechange", lambda pc=pc: self._on_connection_state(pc))
                 self._sender = pc.addTrack(track)
