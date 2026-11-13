@@ -2751,22 +2751,31 @@ class RosRuntime:
         `None` for a camera that has delivered none.
 
         **The one answer to "has this camera a frame".** A frame is known
-        in two places: converted, in `latest`, and as the source encoded it,
-        in `encoded`. A camera whose snapshots are all passed through never
-        has the first and works all the same, so whoever asks only `latest`
-        takes a working camera for one that never delivered: the health
-        restatement would say nothing about it, and a live start would
-        answer with an error from a stream drop it has long had frames
-        since. Both ask here. A third place a frame can be held belongs in
-        this method and nowhere else.
+        in three places: converted, in `latest`; as the source encoded it,
+        in `encoded`; and, for a camera whose H.264 is passed through, as
+        its stream's newest keyframe. A camera whose snapshots are all
+        passed through never has the first and works all the same, so
+        whoever asks only `latest` takes a working camera for one that never
+        delivered: the health restatement would say nothing about it, and a
+        live start would answer with an error from a stream drop it has long
+        had frames since. Both ask here. A fourth place a frame can be held
+        belongs in this method and nowhere else.
 
-        Both holders carry their own lock, so this may be asked from the
-        loop thread as well as from the executor."""
+        All three carry their own lock, so this may be asked from the loop
+        thread as well as from the executor."""
         seen_ms = [
             frame.timestamp_ms
             for frame in (entry.latest.get(), entry.encoded.get())
             if frame is not None
         ]
+        # The third place: a passthrough camera's newest keyframe. Such a
+        # camera has no picture anywhere until a snapshot was taken of it,
+        # and its stream holds a keyframe only while the stream is one the
+        # bridge forwards.
+        if entry.passes_through and entry.h264_stream is not None:
+            keyframe = entry.h264_stream.newest_keyframe()
+            if keyframe is not None:
+                seen_ms.append(keyframe.timestamp_ms)
         return max(seen_ms) if seen_ms else None
 
     def _live_lock(self, slug: str) -> asyncio.Lock:
@@ -5911,7 +5920,13 @@ class RosRuntime:
                 # the old `_ms` name is a NameError, not a silent 1000x bug.
                 if now - entry.last_snapshot_at < entry.snapshot_interval_seconds:
                     continue
-            passed_through = self._passthrough_snapshot(slug, entry, max_bytes)
+            # Not for a camera that passes H.264 through: a JPEG it still
+            # holds is from before its topic changed, and its snapshot is
+            # its newest keyframe (`_decode_due_keyframe`, below).
+            passed_through = (
+                None if entry.passes_through
+                else self._passthrough_snapshot(slug, entry, max_bytes)
+            )
             if passed_through is not None:
                 entry.last_snapshot_at = now
                 return passed_through

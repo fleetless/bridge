@@ -1070,6 +1070,48 @@ def test_a_topic_that_turns_to_another_codec_takes_its_last_keyframe_with_it(uni
     assert run(body) == (None, None)
 
 
+# --- beside the JPEG a camera sends as its own snapshot -------------------------
+
+
+def test_a_topic_that_turned_from_jpeg_to_h264_sends_the_keyframe_and_not_the_old_jpeg(units):
+    """A `CompressedImage` topic's JPEG is kept as the source encoded it and
+    goes out as the snapshot unchanged. When the topic turns to H.264 that
+    JPEG is still held, in the configured size, and would go out on every
+    pull, for good: the keyframe would never be asked."""
+    picture = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+    picture[:, :] = (10, 120, 200)
+    jpeg = camera.encode_jpeg(picture)
+
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front")]))
+        entry = rt._cameras["front"]
+        entry.encoded.set(jpeg, 900_000)  # what the last picture message left behind
+        await _feed(rt, "front", units[:6], start_ms=1_000_000)
+        return await _pull_snapshot(rt)
+
+    header, image = _split_snapshot_frame(run(body))
+    assert header["timestamp_ms"] == 1_000_000 + 5 * 33  # the newest keyframe's, not the JPEG's
+    assert image != jpeg
+
+
+def test_the_health_restatement_knows_a_passthrough_camera_by_its_newest_keyframe(units):
+    """After a reconnect the bridge says again what it knows of every
+    camera. A passthrough camera nobody took a snapshot of yet has no
+    picture anywhere; its newest keyframe is how it is known to work."""
+    async def body(rt):
+        await rt.apply_cameras(by_slug([_h264_camera("front"), _camera_cfg("silent", topic="/nobody")]))
+        await _feed(rt, "front", units[:8], start_ms=1_000_000)
+        await _drain_camera_states(rt)
+        await rt.report_current_camera_health()
+        return await _drain_camera_states(rt)
+
+    (state,) = run(body)  # and nothing about the camera that has delivered nothing
+    assert (state.slug, state.publishing, state.error, state.cause) == (
+        "front", False, None, CAMERA_STATE_CAUSE_SOURCE,
+    )
+    assert state.observed_at_ms == 1_000_000 + 5 * 33
+
+
 # --- low-bandwidth mode (spec test 10) -----------------------------------------
 
 
