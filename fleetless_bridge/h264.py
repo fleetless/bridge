@@ -42,6 +42,17 @@ SLICE_I = 2
 SLICE_SP = 3
 SLICE_SI = 4
 
+#: The largest `seq_parameter_set_id` and `pic_parameter_set_id` the standard
+#: has (7.4.2.1.1, 7.4.2.2). An id above them is not a parameter set to keep.
+SPS_ID_MAX = 31
+PPS_ID_MAX = 255
+
+#: The longest SPS or PPS NAL unit this module reads. A real one is a few
+#: dozen bytes, and a few hundred with every scaling list written out; this
+#: is several times that. Anything longer is refused before a bit of it is
+#: read: the reader below goes through a parameter set bit by bit, in Python.
+PARAMETER_SET_MAX_BYTES = 4096
+
 _START_CODE = b"\x00\x00\x01"
 _ANNEXB_START = b"\x00\x00\x00\x01"
 
@@ -179,11 +190,15 @@ def parse_sps(nal: bytes) -> Sps:
     field, because the size sits behind fields of variable length."""
     if nal_type(nal) != NAL_SPS:
         raise H264ParseError("not a sequence parameter set")
+    if len(nal) > PARAMETER_SET_MAX_BYTES:
+        raise H264ParseError("a sequence parameter set of {} bytes".format(len(nal)))
     bits = _Bits(_rbsp(nal[1:]))
     profile_idc = bits.u(8)
     bits.u(8)  # the constraint flags and two reserved bits
     level_idc = bits.u(8)
     sps_id = bits.ue()
+    if sps_id > SPS_ID_MAX:
+        raise H264ParseError("seq_parameter_set_id out of range")
 
     chroma_format_idc = 1
     separate_colour_plane = 0
@@ -253,8 +268,10 @@ def pps_id(nal: bytes) -> int:
     parameter sets are told apart by."""
     if nal_type(nal) != NAL_PPS:
         raise H264ParseError("not a picture parameter set")
+    if len(nal) > PARAMETER_SET_MAX_BYTES:
+        raise H264ParseError("a picture parameter set of {} bytes".format(len(nal)))
     value = _Bits(_rbsp(nal[1:9])).ue()
-    if value > 255:
+    if value > PPS_ID_MAX:
         raise H264ParseError("pic_parameter_set_id out of range")
     return value
 

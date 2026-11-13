@@ -51,6 +51,21 @@ QUEUE_MAX_MS = 2000
 #: seconds at 240 frames a second, with room.
 QUEUE_MAX_UNITS = 512
 
+#: The queue's third bound, in bytes: several times what two seconds of the
+#: highest bitrate a camera may be configured with come to (12.5 MB), so an
+#: honest stream never meets it. A stream whose units are large and many
+#: does, long before the other two bounds.
+QUEUE_MAX_BYTES = 32 * 1024 * 1024
+
+#: The largest access unit a camera's stream may hand over: this many bytes
+#: for every pixel of the configured size, which is twice a raw 4:2:0 picture
+#: -- no encoder makes a frame larger than the picture it encodes, let alone
+#: twice as large -- and never less than the floor, for the small sizes.
+#: The one bound that keeps three things small: what the queue holds per
+#: unit, the newest keyframe, and the decode a snapshot costs.
+UNIT_BYTES_PER_PIXEL = 3
+UNIT_MAX_BYTES_FLOOR = 4 * 1024 * 1024
+
 #: A stream without a keyframe for this long is refused, and a refusal for
 #: B-frames stands this long after the last one.
 KEYFRAME_TIMEOUT_S = 10.0
@@ -78,6 +93,8 @@ class Unit:
     nals: Tuple[bytes, ...]
     timestamp_ms: int
     keyframe: bool
+    #: Bytes this unit takes in the queue.
+    size: int = 0
 
 
 @dataclass(frozen=True)
@@ -106,6 +123,8 @@ class PassthroughStream:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._configured = (width, height)
+        #: The largest access unit this camera's size allows, in bytes.
+        self.max_unit_bytes = _max_unit_bytes(width, height)
         self._slug = slug
         self._clock = clock
         self._lock = threading.Lock()
@@ -131,6 +150,7 @@ class PassthroughStream:
 
         # The consumer: at most one, on an event loop.
         self._queue: Deque[Unit] = deque()
+        self._queue_bytes = 0
         self._attached = False
         self._paused = False
         # An IDR has been queued since the last attach, resume, overflow or
@@ -172,6 +192,15 @@ class PassthroughStream:
         stream arrives, so every unit in between raises it again; the caller
         reports a refusal once.
         """
+        size = len(data)
+        if size > self.max_unit_bytes:
+            # Before a byte of it is looked at. Dropped like a unit that
+            # does not parse: no stream of this camera's size has units
+            # this large, and what follows it has a hole in front.
+            return self._push_unparseable(
+                "an access unit of {} bytes, more than the {} this camera's "
+                "size allows".format(size, self.max_unit_bytes)
+            )
         try:
             info = h264.inspect_access_unit(data)
             sps = h264.parse_sps(info.sps) if info.sps is not None else None
@@ -224,11 +253,11 @@ class PassthroughStream:
                 nals = self._with_parameter_sets(info)
                 self._keyframe = Keyframe(data=h264.join_annexb(nals), timestamp_ms=timestamp_ms)
                 self._started = True
-                unit = Unit(nals=nals, timestamp_ms=timestamp_ms, keyframe=True)
+                unit = Unit(nals=nals, timestamp_ms=timestamp_ms, keyframe=True, size=size)
             elif not self._started:
                 return False  # nothing to build on yet
             else:
-                unit = Unit(nals=info.nals, timestamp_ms=timestamp_ms, keyframe=False)
+                unit = Unit(nals=info.nals, timestamp_ms=timestamp_ms, keyframe=False, size=size)
 
             woke = self._offer(unit)
         if woke:
@@ -252,7 +281,7 @@ class PassthroughStream:
             self._keyframe = None
             self._started = False
             self._last_arrival = None
-            self._queue.clear()
+            self._clear_queue()
             self._forwarding = False
 
     def set_size(self, width: int, height: int) -> None:
@@ -260,11 +289,12 @@ class PassthroughStream:
         is void: the stream is judged again, at its next keyframe."""
         with self._lock:
             self._configured = (width, height)
+            self.max_unit_bytes = _max_unit_bytes(width, height)
             self._refusal = None
             self._refused_until = 0.0
             self._started = False
             self._forwarding = False
-            self._queue.clear()
+            self._clear_queue()
             self._keyframe = None
             if self._size is not None:
                 self._check_size(self._clock())
@@ -292,14 +322,14 @@ class PassthroughStream:
             self._paused = False
             self._forwarding = False
             self._overflow_logged = False
-            self._queue.clear()
+            self._clear_queue()
 
     def detach(self) -> None:
         """The sender is gone. A `get()` still waiting returns `None`."""
         with self._lock:
             self._attached = False
             self._forwarding = False
-            self._queue.clear()
+            self._clear_queue()
         self._wake()
 
     def set_paused(self, paused: bool) -> None:
@@ -310,7 +340,7 @@ class PassthroughStream:
                 return
             self._paused = paused
             self._forwarding = False
-            self._queue.clear()
+            self._clear_queue()
 
     def resync(self) -> None:
         """A unit that was handed out did not reach the viewers. What
@@ -318,12 +348,17 @@ class PassthroughStream:
         keyframe. Callable from any thread."""
         with self._lock:
             self._forwarding = False
-            self._queue.clear()
+            self._clear_queue()
 
     def pending(self) -> int:
         """How many units wait for the sender."""
         with self._lock:
             return len(self._queue)
+
+    def pending_bytes(self) -> int:
+        """How many bytes those units are."""
+        with self._lock:
+            return self._queue_bytes
 
     async def get(self) -> Optional[Unit]:
         """The next unit, in order, waiting for one if need be. `None` once
@@ -333,7 +368,9 @@ class PassthroughStream:
                 if self._queue:
                     # The sender pulls again: an overflow episode is over.
                     self._overflow_logged = False
-                    return self._queue.popleft()
+                    unit = self._queue.popleft()
+                    self._queue_bytes -= unit.size
+                    return unit
                 if not self._attached:
                     return None
                 event = self._event
@@ -341,6 +378,10 @@ class PassthroughStream:
             await event.wait()
 
     # -- inside the lock ---------------------------------------------------
+
+    def _clear_queue(self) -> None:
+        self._queue.clear()
+        self._queue_bytes = 0
 
     def _note_arrival(self, now: float) -> None:
         """Both timeouts count time during which units arrive. After a
@@ -379,7 +420,7 @@ class PassthroughStream:
         self._refused_until = max(self._refused_until, now + hold_s)
         self._started = False
         self._forwarding = False
-        self._queue.clear()
+        self._clear_queue()
         self._keyframe = None
 
     def _with_parameter_sets(self, info: h264.AccessUnit) -> Tuple[bytes, ...]:
@@ -417,9 +458,10 @@ class PassthroughStream:
         if self._queue and (
             unit.timestamp_ms - self._queue[0].timestamp_ms > QUEUE_MAX_MS
             or len(self._queue) >= QUEUE_MAX_UNITS
+            or self._queue_bytes + unit.size > QUEUE_MAX_BYTES
         ):
             dropped = len(self._queue)
-            self._queue.clear()
+            self._clear_queue()
             if not self._overflow_logged:
                 self._overflow_logged = True
                 log.warning(
@@ -432,6 +474,7 @@ class PassthroughStream:
                 self._forwarding = False
                 return False
         self._queue.append(unit)
+        self._queue_bytes += unit.size
         return True
 
     # -- outside the lock --------------------------------------------------
@@ -470,6 +513,10 @@ class PassthroughStream:
             loop.call_soon_threadsafe(event.set)
         except RuntimeError:
             pass  # the loop is closed; nobody is waiting on it
+
+
+def _max_unit_bytes(width: int, height: int) -> int:
+    return max(UNIT_MAX_BYTES_FLOOR, UNIT_BYTES_PER_PIXEL * width * height)
 
 
 def _new_decoder():
