@@ -284,7 +284,15 @@ stream once after choosing one.
 
 With a hardware encoder the bitrate follows `bitrate_kbps` over its whole
 range. The software encoders clamp it: VP8 to 250 to 1500 kbps, H.264 to 500
-to 3000 kbps.
+to 3000 kbps. A session that fell back from a hardware encoder is the
+exception: its software H.264 keeps the whole range.
+
+GStreamer is loaded with the first frame of the first hardware session after
+the bridge starts. It then scans its plugins once and keeps the result in
+`~/.cache/gstreamer-1.0`, which delays that one picture: by 0.2 s for the 250
+plugins of this repository's test image, by more where more are installed. A
+bridge whose user cannot write there scans at every start; `GST_REGISTRY`
+names another file.
 
 ## 📄 What the robot exposes
 
