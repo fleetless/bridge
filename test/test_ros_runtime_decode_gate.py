@@ -589,6 +589,14 @@ def test_a_resume_converts_the_newest_held_message_before_the_next_one_arrives(m
         await _eventually(lambda: tracks[0].pushed)  # the start's own first picture
 
         signals[0].fire("on_quality_update", _quality(*_NOBODY))
+        # The frame limit counts between arrivals, and lets a message through
+        # only a whole frame interval (20 ms at 50 fps) after the one before
+        # it. Without this wait the gap was whatever the start happened to
+        # take: about one feed tick when the feed looked first, 2 ms when the
+        # start's conversion landed first -- and then the held message below
+        # was refused, rightly, and this test failed for it. A sleep only
+        # gets longer on a busy machine.
+        await asyncio.sleep(0.05)
         entry.raw.set(_image_msg((40, 50, 60)), 2_000)  # arrives while nobody watches
         await _executor_caught_up(rt)
         while_paused = (entry.latest.get().timestamp_ms, len(calls), len(tracks[0].pushed))
