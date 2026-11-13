@@ -2605,7 +2605,9 @@ class RosRuntime:
     def convert_newest_raw_frame(self, slug: str) -> "concurrent.futures.Future":
         """Convert the newest message `slug`'s camera holds unconverted, now,
         instead of leaving it for the next snapshot -- for the moment a
-        converted frame becomes wanted. A live start is that moment today.
+        converted frame becomes wanted. There are two such moments: a live
+        start, and a paused publisher resuming because somebody subscribed
+        again.
 
         While nobody watches, a ROS camera keeps only its newest raw message
         (`_RosSourceAdapter`). Whoever starts watching would otherwise look at
@@ -2767,6 +2769,11 @@ class RosRuntime:
                 on_lost=lambda reason, slug=slug: self._on_live_lost(slug, reason),
                 slug=slug,
                 received_s=received_s,
+                # While this publisher is paused the camera keeps its messages
+                # raw (`conversion_wanted` in `_create_camera`). The one it
+                # holds when a viewer comes back is converted at once, as at a
+                # start, rather than left until the camera's next message.
+                on_resume=lambda slug=slug: self.convert_newest_raw_frame(slug),
             )
             try:
                 await publisher.start(url, room, token)
@@ -4613,11 +4620,22 @@ class RosRuntime:
         encoded = camera.EncodedFrameHolder()
 
         def conversion_wanted() -> bool:
-            # `True` iff a live publish task for this slug is currently
-            # running — read directly, not via `_enqueue`: the ROS
+            # `True` iff a live publisher for this slug exists **and is not
+            # paused** — read directly, not via `_enqueue`: the ROS
             # subscription callback that calls this already runs on the
             # executor thread, the same thread `self._cameras` is always
             # touched from, so no marshaling is needed just to read a dict.
+            #
+            # Paused means nobody is subscribed. The publisher's encoder and
+            # its feed loop already idle then; converting every message for a
+            # picture nobody pulls was the last cost left, and since the cloud
+            # keeps a robot in its room for 30 s after the last viewer
+            # (fleetless/fleetless#1118) it is one paid for half a minute
+            # after every viewing. A paused publisher is to this camera what
+            # no publisher is: the newest message stays raw, a snapshot that
+            # falls due converts the one it sends, and the publisher's
+            # `on_resume` (`start_live`) has the newest one converted the
+            # moment somebody watches again.
             #
             # `_live_publishers` itself is mutated on the *loop* thread
             # (`start_live`/`stop_live`, both `_submit_async`-free asyncio
@@ -4631,13 +4649,25 @@ class RosRuntime:
             # frame interval, not lost) — never a crash, never stale data
             # served as current. A lock on this hot path would cost every
             # single incoming frame to close a race whose worst case is
-            # that cheap.
+            # that cheap. The same holds for `paused`, a flag the loop thread
+            # flips: a message read against the old value is converted once
+            # too often, or stays raw until `on_resume` or the next message
+            # picks it up.
             #
             # The MJPEG adapter asks the same question from its own thread,
-            # once per part, and the same holds there: a part decoded for a
-            # stream that has just ended, or one left as bytes for the lazy
-            # path to pick up.
-            return slug in self._live_publishers
+            # once per part, and the same holds there, for the publisher and
+            # for `paused` alike: a part decoded for a stream that has just
+            # ended or paused, or one left as bytes for the lazy path. A
+            # part left as bytes just before a resume reaches `raw` through
+            # the executor's queue, as the resume's own conversion does.
+            # Queued ahead of it, the resume converts that part. Queued
+            # behind it, the part waits in `raw` until the next one, decoded
+            # as it arrives, is the newer of the two; the older is then
+            # dropped unconverted (`_convert_due_raw_frame`). Either way the
+            # picture is one part behind for one camera interval at the
+            # most, and an older picture never replaces a newer one.
+            publisher = self._live_publishers.get(slug)
+            return publisher is not None and not publisher.paused
 
         def on_raw_frame(timestamp_ms: int) -> None:
             # Runs synchronously on the executor thread (the ROS

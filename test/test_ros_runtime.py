@@ -6566,12 +6566,17 @@ class _FakeLivePublisher:
 
     instances = []
 
+    #: Never paused: these tests are about the orchestration, and a fake that
+    #: paused would stop the camera converting for live (`conversion_wanted`).
+    paused = False
+
     def __init__(
         self, *, holder, width, height, fps, bitrate_kbps, on_lost=None,
-        slug=None, received_s=None,
+        slug=None, received_s=None, on_resume=None,
         fail_with=None, stop_delay=0.0, start_delay=0.0,
     ):
         self.slug = slug
+        self.on_resume = on_resume
         self.received_s = received_s
         self.holder = holder
         self.width = width
