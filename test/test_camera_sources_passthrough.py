@@ -273,6 +273,26 @@ def test_a_stream_that_ends_is_reported_and_the_adapter_connects_again(units):
     assert codes and set(codes) == {"source_unavailable"}
 
 
+def test_a_connection_that_ends_takes_its_keyframe_and_queue_with_it(units):
+    """The camera is gone. The stream object lives on -- it is the camera
+    entry's -- and must not go on holding the last keyframe of a stream that
+    ended: a snapshot would be decoded from it, and a viewer attached later
+    would be handed its queue."""
+    stream = passthrough.PassthroughStream(width=WIDTH, height=HEIGHT, slug="yard")
+    reports = _Reports()
+    server = RtspTestServer(units, fps=60.0, loop=True).start()
+    try:
+        with _running(server, stream, reports):
+            wait_until(lambda: stream.newest_keyframe() is not None, timeout=10.0)
+            server.stop()
+            wait_until(lambda: reports.errors, timeout=10.0)
+            wait_until(lambda: stream.newest_keyframe() is None, timeout=5.0)
+            assert stream.pending() == 0
+    finally:
+        server.stop()
+    assert reports.errors[0][0] in ("source_unavailable", "source_unreachable")
+
+
 def test_a_camera_that_falls_silent_is_source_unavailable(units):
     sink, reports = _Sink(), _Reports()
 
