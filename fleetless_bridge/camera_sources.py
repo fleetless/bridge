@@ -1348,6 +1348,13 @@ _RTSP_DEMUX_TIMEOUT_S = _RTSP_SOCKET_TIMEOUT_US / 1_000_000
 # on one that stalls.
 _RTSP_ANALYZE_DURATION_US = 200_000
 
+# How long a session must have delivered before the reconnect backoff starts
+# over. Counted from its first accepted keyframe. A camera that delivers one
+# keyframe and drops, again and again, would otherwise be reconnected at the
+# shortest delay for ever; one that ran for a while and then fails is retried
+# soon.
+_RTSP_STABLE_AFTER_S = 10.0
+
 # What ffmpeg calls the codecs a camera is likely to send instead.
 _CODEC_DISPLAY_NAMES = {"hevc": "H.265", "mjpeg": "MJPEG", "mpeg4": "MPEG-4", "vp8": "VP8", "vp9": "VP9", "av1": "AV1"}
 
@@ -1427,6 +1434,7 @@ class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
         self._demux_factory = demux_factory or _default_rtsp_demux_factory
         self._socket_factory = socket_factory
         self._healthy = False
+        self._healthy_since: Optional[float] = None
         self._refusal_reported: Optional[str] = None
 
     def _connect_and_read(self) -> None:
@@ -1484,6 +1492,7 @@ class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
             )
 
         self._healthy = False
+        self._healthy_since = None
         if self._last_reported_code != "source_error":
             # Whatever was reported last was about reaching the camera. A
             # refusal that still stands is said again, so the camera's state
@@ -1510,10 +1519,17 @@ class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
                 accepted = self._stream.push(data, timestamp_ms)
             except PassthroughRefused as refused:
                 self._healthy = False
+                self._healthy_since = None
                 self._report_refusal(str(refused))
                 continue
             if accepted and not self._healthy:
                 self._note_healthy(timestamp_ms)
+            elif (
+                self._healthy_since is not None
+                and time.monotonic() - self._healthy_since >= _RTSP_STABLE_AFTER_S
+            ):
+                self._healthy_since = None
+                self._backoff.reset()
         if self._stop_event.is_set():
             return
         # The iteration ended: the camera closed the session, or (PyAV 8) a
@@ -1529,13 +1545,15 @@ class RtspPassthroughSourceAdapter(_ThreadedSourceAdapter):
 
     def _note_healthy(self, timestamp_ms: int) -> None:
         """The first accepted keyframe of this connection: the camera works.
-        The backoff and the error memory start over here, not when the loop
-        returns -- a camera that ran for a day and then fails must be reported
-        again, and must be retried soon."""
+        The error memory starts over here, not when the loop returns -- a
+        camera that ran for a day and then fails must be reported again. The
+        backoff starts over later, once the session has delivered for
+        `_RTSP_STABLE_AFTER_S`: one keyframe is not yet a camera worth
+        reconnecting to every second."""
         self._healthy = True
+        self._healthy_since = time.monotonic()
         self._refusal_reported = None
         self._last_reported_code = None
-        self._backoff.reset()
         try:
             self._on_healthy(timestamp_ms)
         except Exception as exc:  # noqa: BLE001 - same module-wide rule as `_report_once`

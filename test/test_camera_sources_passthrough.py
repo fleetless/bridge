@@ -331,6 +331,57 @@ def test_stop_returns_in_time_while_the_camera_is_silent(units):
     assert elapsed < 4.5
 
 
+class _CountingBackoff(Backoff):
+    def __init__(self):
+        super().__init__(initial_s=0.05, max_s=0.2)
+        self.resets = 0
+
+    def reset(self):
+        self.resets += 1
+        super().reset()
+
+
+def test_one_keyframe_is_not_yet_a_camera_worth_reconnecting_to_every_second(units, monkeypatch):
+    """A camera that plays for a quarter of a second and drops, again and
+    again. Each session delivers a keyframe; none of them lasts. The backoff
+    must keep growing across them, and start over only for a session that
+    delivered for a while."""
+    sink, reports = _Sink(), _Reports()
+    backoff = _CountingBackoff()
+    with RtspTestServer(units, fps=120.0) as server:  # thirty units, then the camera hangs up
+        adapter = RtspPassthroughSourceAdapter(
+            url=server.url(), transport="tcp", credentials=None, stream=sink,
+            on_healthy=reports.on_healthy, on_error=reports.on_error, backoff=backoff,
+        )
+        adapter.start()
+        try:
+            wait_until(lambda: server.sessions >= 3, timeout=15.0)
+            # Read while it runs: stopping an adapter resets its backoff
+            # once, on the way out, and that is not the subject.
+            while_running = backoff.resets
+        finally:
+            adapter.stop()
+    assert while_running == 0
+
+    # The same camera, staying: after the time that counts as stable, once.
+    monkeypatch.setattr(camera_sources, "_RTSP_STABLE_AFTER_S", 0.2)
+    sink, reports = _Sink(), _Reports()
+    backoff = _CountingBackoff()
+    with RtspTestServer(units, fps=60.0, loop=True) as server:
+        adapter = RtspPassthroughSourceAdapter(
+            url=server.url(), transport="tcp", credentials=None, stream=sink,
+            on_healthy=reports.on_healthy, on_error=reports.on_error, backoff=backoff,
+        )
+        adapter.start()
+        try:
+            wait_until(lambda: backoff.resets >= 1, timeout=10.0)
+            time.sleep(0.5)
+            while_running = backoff.resets
+        finally:
+            adapter.stop()
+    assert while_running == 1  # once per session, not once per unit
+
+
 # --- a stream that is refused ------------------------------------------------
 
 
