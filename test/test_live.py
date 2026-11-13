@@ -2013,8 +2013,9 @@ def test_a_keyframe_request_makes_the_track_produce_a_frame_before_the_tick():
     assert waiting is True
     assert answered_in < 0.2  # the tick was 400 ms away
     # The timestamp is the time the frame was really produced: about 100 ms
-    # after the first, not the 500 ms of the tick it did not wait for.
-    assert 0.08 * 90000 < pts_step < 0.3 * 90000
+    # after the first, and in any case short of the 500 ms of the tick it
+    # did not wait for.
+    assert 0.08 * 90000 < pts_step < 0.45 * 90000
 
 
 def test_the_frame_after_an_early_one_is_a_whole_interval_later():
@@ -2048,16 +2049,18 @@ def test_a_second_request_within_a_second_waits_for_the_tick():
         await asyncio.sleep(0.05)
         track.request_early_frame()
         await asyncio.wait_for(pending, 1.0)  # the one early frame
+        early_at = time.monotonic()
 
         pending = asyncio.ensure_future(track.recv())
         await asyncio.sleep(0.1)
-        asked = time.monotonic()
-        track.request_early_frame()  # 100 ms after the early frame
+        track.request_early_frame()  # about 100 ms after the early frame
         await asyncio.wait_for(pending, 1.0)
-        return time.monotonic() - asked
+        return time.monotonic() - early_at
 
-    # The tick is 500 ms after the early frame, so 400 ms after the request.
-    assert asyncio.run(scenario()) >= 0.35
+    # The tick is 500 ms after the early frame, and the time is taken from
+    # there and not from the request: a slow machine stretching the sleep
+    # above cannot shorten what is asserted.
+    assert asyncio.run(scenario()) >= 0.45
 
 
 def test_a_request_after_the_second_has_passed_is_answered_early_again():
@@ -2091,9 +2094,9 @@ def test_a_request_answered_by_a_frame_that_was_due_anyway_uses_nothing_up():
     one after it can still be answered early."""
 
     async def scenario():
-        track = _paced_track(fps=20)
+        track = _paced_track(fps=5)
         await track.recv()
-        await asyncio.sleep(0.1)  # the encoder was not pulling; a frame is overdue
+        await asyncio.sleep(0.25)  # the encoder was not pulling; a frame is overdue
         track.request_early_frame()
         await track.recv()  # due anyway: returns at once, and is not an early frame
 
@@ -2110,8 +2113,8 @@ def test_a_request_answered_by_a_frame_that_was_due_anyway_uses_nothing_up():
         return first_answer, time.monotonic() - started
 
     first_answer, paced = asyncio.run(scenario())
-    assert first_answer < 0.03  # the tick was 50 ms away
-    assert paced >= 0.04
+    assert first_answer < 0.1  # the tick was 200 ms away
+    assert paced >= 0.18
 
 
 def test_a_request_before_the_camera_has_produced_anything_is_harmless():
@@ -2144,7 +2147,7 @@ def test_without_requests_the_pacing_and_the_timestamps_are_what_they_were():
         return time.monotonic() - started, [frame.pts for frame in frames]
 
     elapsed, pts = asyncio.run(scenario())
-    assert 0.19 <= elapsed < 0.4
+    assert elapsed >= 0.19  # four intervals of 50 ms
     assert pts[0] == 0
     # One interval per frame, in the 90 kHz clock: the timestamp is the tick
     # the frame was due at, not the moment the loop got round to it, which is

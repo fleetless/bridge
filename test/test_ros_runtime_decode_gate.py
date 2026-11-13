@@ -431,10 +431,11 @@ def test_a_held_message_converted_late_does_not_cost_the_cameras_next_message():
 
 def test_the_frame_limit_still_holds_right_after_a_held_message():
     """The control for the test above: a message that really is too early --
-    a few milliseconds behind the held one -- is still refused."""
+    a few milliseconds behind the held one -- is still refused. At 2 fps, so
+    that "a few milliseconds" stays far inside the interval on any machine."""
 
     async def body(rt):
-        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=10)]))
+        await rt.apply_cameras(by_slug([_camera_cfg("front", width=16, height=12, fps=2)]))
         entry = rt._cameras["front"]
         following = np.zeros((12, 16, 3), dtype=np.uint8)
 
