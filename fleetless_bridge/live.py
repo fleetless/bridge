@@ -47,6 +47,7 @@ wins.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import re
 import time
@@ -74,7 +75,9 @@ from aiortc.sdp import candidate_from_sdp
 from av import VideoFrame
 
 from fleetless_bridge.camera import LatestFrameHolder
+from fleetless_bridge.live_settings import check_max_packet_bytes
 from fleetless_bridge.livekit_signal import IceServer, SignalClient
+from fleetless_bridge.protocol import LIVE_DEFAULTS
 
 log = logging.getLogger(__name__)
 
@@ -130,6 +133,82 @@ ENCODER_CLAMP_BPS = {
 #: frame, which is at most one second away at any frame rate a camera can be
 #: configured with.
 EARLY_FRAME_MIN_INTERVAL_S = 1.0
+
+#: What an RTP packet carries besides the codec payload, in bytes, before
+#: SRTP. aiortc caps the *payload* (`PACKET_MAX`); `live.max_packet_bytes`
+#: caps the packet, and this is the difference. A serialized packet is the
+#: same on aiortc 1.3.0, 1.6.0 and 1.14.0: 12 bytes of fixed header and a
+#: 12-byte header extension block (abs-send-time and a mid of one to three
+#: characters) make 24, and a retransmission puts the original sequence number
+#: in front of the payload, which makes 26. The six bytes above that cover a
+#: mid of up to seven characters (30). Both packetizers keep to `PACKET_MAX`
+#: exactly, STAP-A aggregation included. `test_live_packet_size.py` is the
+#: arbiter, not this arithmetic: an aiortc that writes more around the payload
+#: fails there.
+RTP_OVERHEAD_BYTES = 32
+
+#: The largest RTP packet the SRTP layer protects. pylibsrtp (0.7.0, 0.8.0 and
+#: 0.12.0, the three Ubuntu ships) works in a 1500-byte buffer and keeps 144
+#: of it for the trailer, and refuses a longer packet with `ValueError`.
+#: aiortc's sender loop ends on that exception, so one oversized packet is the
+#: end of the stream, not one lost packet. The setting's own ceiling
+#: (`live_settings.MAX_PACKET_BYTES_MAX`, 1350) is below this for that reason;
+#: the clamp in `set_max_packet_bytes` is the backstop for the day somebody
+#: raises that ceiling without reading this.
+SRTP_MAX_PACKET_BYTES = 1356
+
+#: The modules whose `PACKET_MAX` aiortc packetizes against. Both read it
+#: inside their packetize functions, at call time, so an assignment holds from
+#: the next frame, for an encoder that is already running too.
+_PACKETIZERS = ("aiortc.codecs.vpx", "aiortc.codecs.h264")
+
+#: The packetizers already reported as not capped, so each is said once.
+_cap_not_applied: set = set()
+
+
+def set_max_packet_bytes(max_packet_bytes: int) -> int:
+    """Cap every RTP packet this process sends at `max_packet_bytes`, and
+    return the cap in force: the value itself, and never more than
+    `SRTP_MAX_PACKET_BYTES`.
+
+    The largest packet, before SRTP: fixed header, header extensions and
+    payload, retransmissions included. Process-wide, one value for all
+    cameras, because aiortc's cap is a module constant. Takes effect on the
+    next packetized frame.
+
+    `client.py` calls this with a resolved setting whenever it changes; the
+    call at the bottom of this block applies the default at import, so no
+    sender ever runs under aiortc's own 1300.
+
+    Raises `ValueError` for a value outside the bounds, having changed
+    nothing: a payload cap of zero or less does not send small packets, it
+    never returns from aiortc's packetizer.
+
+    A packetizer without a `PACKET_MAX` (an aiortc that packetizes some
+    other way) is reported once and skipped: that codec is then not capped,
+    and the session carries on.
+    """
+    in_force = min(check_max_packet_bytes(max_packet_bytes), SRTP_MAX_PACKET_BYTES)
+    payload_max = in_force - RTP_OVERHEAD_BYTES
+    for name in _PACKETIZERS:
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            module = None
+        if module is None or not hasattr(module, "PACKET_MAX"):
+            if name not in _cap_not_applied:
+                _cap_not_applied.add(name)
+                log.warning(
+                    "This aiortc has no %s.PACKET_MAX; live.max_packet_bytes is not "
+                    "applied to that codec, and its RTP packets keep aiortc's own size",
+                    name,
+                )
+            continue
+        module.PACKET_MAX = payload_max
+    return in_force
+
+
+set_max_packet_bytes(LIVE_DEFAULTS["max_packet_bytes"])
 
 
 class LiveStartError(Exception):

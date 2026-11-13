@@ -13,6 +13,8 @@ from fleetless_bridge.protocol import (
     CLOSE_CODE_TOKEN_ROTATED,
     FLEETLESS_FORMAT_VERSION,
     LATEST_BRIDGE_VERSION,
+    LIVE_BOUNDS,
+    LIVE_DEFAULTS,
     LOW_BANDWIDTH_DEFAULTS,
     PROTOCOL_VERSION,
     PROTOCOL_VERSIONS,
@@ -389,6 +391,51 @@ def test_a_malformed_low_bandwidth_section_taints_the_whole_frame():
     frame["doc"]["low_bandwidth"] = "on"
     message = parse_cloud_message(json.dumps(frame))
     assert isinstance(message, Unknown)
+
+
+def test_the_live_defaults_and_bounds_come_from_the_vendored_constants():
+    """Read, not typed, for `LOW_BANDWIDTH_DEFAULTS`' reason: the default is
+    also the ROS parameter's, and the bounds are the ones the cloud refuses
+    a published document by."""
+    assert LIVE_DEFAULTS == {"max_packet_bytes": 1200}
+    assert LIVE_BOUNDS == {"max_packet_bytes": {"min": 576, "max": 1350}}
+
+
+def test_config_carries_the_live_section_whole():
+    """Raw, as `low_bandwidth` is: `live_settings.LiveSettings` resolves it
+    against the parameter and the default."""
+    frame = _config_frame()
+    frame["doc"]["live"] = {"max_packet_bytes": 1000}
+    validate_frame("cloud-config", frame)
+    config = parse_cloud_message(json.dumps(frame))
+    assert isinstance(config, Config)
+    assert config.live == {"max_packet_bytes": 1000}
+
+
+def test_a_config_without_a_live_section_gets_an_empty_one():
+    assert _parse_config().live == {}
+
+
+def test_an_unknown_key_in_the_live_section_is_carried_not_refused():
+    """A console that writes a newer key must not take an older bridge off
+    the air. The key rides through; the resolver ignores what it does not
+    know."""
+    frame = _config_frame()
+    frame["doc"]["live"] = {"max_packet_bytes": 1000, "encoder": "h264"}
+    config = parse_cloud_message(json.dumps(frame))
+    assert isinstance(config, Config)
+    assert config.live == {"max_packet_bytes": 1000, "encoder": "h264"}
+
+
+@pytest.mark.parametrize("section", [1200, "small", [1200], True])
+def test_a_malformed_live_section_taints_the_whole_frame(section):
+    """The rule `low_bandwidth` follows: a cloud that sends this has a bug,
+    and there is no safe partial read of a settings block."""
+    frame = _config_frame()
+    frame["doc"]["live"] = section
+    message = parse_cloud_message(json.dumps(frame))
+    assert isinstance(message, Unknown)
+    assert message.reason == "config with a malformed live section"
 
 
 def test_the_mapping_key_is_the_entrys_slug():

@@ -96,6 +96,14 @@ LATEST_BRIDGE_VERSION: str = _CONSTANTS["LATEST_BRIDGE_VERSION"]
 #: and the console's placeholders, and a default written down twice ends up
 #: disagreeing with itself. `link_mode.py` is what reads them.
 LOW_BANDWIDTH_DEFAULTS: Dict[str, Any] = _CONSTANTS["LOW_BANDWIDTH_DEFAULTS"]
+#: The fallbacks for the `live` section, read for the same reason. One key
+#: today: `max_packet_bytes`, the largest RTP packet the bridge sends.
+#: `live_settings.py` is what reads them.
+LIVE_DEFAULTS: Dict[str, Any] = _CONSTANTS["LIVE_DEFAULTS"]
+#: The bounds of the same settings, `{key: {"min": …, "max": …}}`. The cloud
+#: refuses a document outside them when it is published; the bridge refuses a
+#: ROS parameter outside them with the same two numbers, read and not typed.
+LIVE_BOUNDS: Dict[str, Dict[str, Any]] = _CONSTANTS["LIVE_BOUNDS"]
 
 # The `fleetless.yaml` format version — `doc.fleetless`. Still a hand-kept
 # literal on both sides of the wire, which `PROTOCOL_VERSION` above stopped
@@ -574,7 +582,11 @@ class Config:
     defaults live in `LOW_BANDWIDTH_DEFAULTS`, so the resolution this parser
     would have to do is `link_mode.LowBandwidthSettings`'s job, once, where
     the ROS parameters are resolved against the same defaults. What this
-    parser owes the caller is only that the section is a mapping."""
+    parser owes the caller is only that the section is a mapping.
+
+    `live` is carried the same way and for the same reason: raw, `{}` when
+    absent, resolved by `live_settings.LiveSettings` against the ROS
+    parameter and `LIVE_DEFAULTS`."""
 
     version: int
     datapoints: Dict[str, DatapointConfig] = field(default_factory=dict)
@@ -584,6 +596,7 @@ class Config:
     cameras: Dict[str, CameraConfig] = field(default_factory=dict)
     messages: Dict[str, Any] = field(default_factory=dict)
     low_bandwidth: Dict[str, Any] = field(default_factory=dict)
+    live: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1779,6 +1792,13 @@ def parse_cloud_message(raw: object) -> CloudMessage:
         if low_bandwidth is not None and not isinstance(low_bandwidth, dict):
             return Unknown(raw, "config with a malformed low_bandwidth section")
 
+        # The same reading for `live`: whole, unknown keys included, so a
+        # console that writes a newer key does not take this bridge off the
+        # air. Only "is it a mapping" is checked here.
+        live = doc.get("live")
+        if live is not None and not isinstance(live, dict):
+            return Unknown(raw, "config with a malformed live section")
+
         sections = {}
         for key, parser in (
             ("datapoints", _parse_datapoint_config),
@@ -1800,6 +1820,7 @@ def parse_cloud_message(raw: object) -> CloudMessage:
             version=version,
             messages=messages,
             low_bandwidth=low_bandwidth or {},
+            live=live or {},
             **sections,
         )
     if kind == "invoke":
