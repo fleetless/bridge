@@ -16,6 +16,13 @@ harness.
 viewer asserts two independent things (a frame arrived, and it changed), and
 "no publisher at all" only breaks the first.
 
+`--encoder stand-in` hands the publisher the bridge's own encoder, the one a
+robot gets with `live.encoder` other than `software`, running over the
+software stand-in chain: the same class, the same GStreamer pipeline, with
+`x264enc` where a robot has its chip. The offer is then H.264 only, and the
+run fails if the encoder fell back to aiortc's libx264 on the way, because
+the proof is about the pipeline and a fallback would pass for it.
+
 The token is minted with `hmac`/`hashlib` rather than a JWT library so that
 nothing in the proof can be mistaken for a dependency of the package. The
 publisher itself imports nothing this harness added.
@@ -39,6 +46,11 @@ from aiortc import RTCPeerConnection, RTCRtpSender  # noqa: E402
 
 from fleetless_bridge import live  # noqa: E402
 from fleetless_bridge.camera import LatestFrameHolder  # noqa: E402
+from fleetless_bridge.live_encoder import (  # noqa: E402
+    STAND_IN,
+    ChainMemory,
+    HardwareH264Encoder,
+)
 
 
 def log(*args):
@@ -123,16 +135,23 @@ def codec_pinning_factory(codec):
 
 async def run(args):
     holder = LatestFrameHolder()
+    encoder = None
+    if args.encoder == "stand-in":
+        # A memory of its own: this run says what this run found.
+        encoder = HardwareH264Encoder("stand-in", (STAND_IN,), fps=args.fps, memory=ChainMemory())
     publisher = live.LivePublisher(
         holder=holder,
         width=args.width,
         height=args.height,
         fps=args.fps,
         bitrate_kbps=args.bitrate_kbps,
-        connection_factory=codec_pinning_factory(args.codec),
+        # With an encoder the publisher restricts the offer to H.264 itself;
+        # the pinning below is for the runs that leave the choice to aiortc.
+        connection_factory=codec_pinning_factory("all" if encoder is not None else args.codec),
         on_lost=lambda reason: log("LOST", reason),
         # Names this run in the publisher's own "ready in N ms" line.
         slug="proof",
+        encoder=encoder,
     )
     token = make_token(args.api_key, args.api_secret, args.room, args.identity)
     log("publishing into", args.url, "room", args.room, "codec", args.codec,
@@ -177,10 +196,19 @@ async def run(args):
     track = publisher._track
     log("frames handed to the encoder:",
         getattr(track, "frames_sent", "unknown"), "frames painted:", n)
+    # Read before the stop, which closes the encoder and its pipeline.
+    chain = encoder.chain if encoder is not None else None
+    fell_back = encoder.software if encoder is not None else False
     await publisher.stop()
     if connected_at is None:
         log("FAILED: never reached connected")
         return 3
+    if encoder is not None:
+        log("encoder:", chain.name if chain is not None else "none",
+            "| fell back to software:", fell_back)
+        if chain is None or fell_back:
+            log("FAILED: the bridge's own encoder did not carry the session")
+            return 4
     return 0
 
 
@@ -197,12 +225,18 @@ def main():
     parser.add_argument("--fps", type=int, default=15)
     parser.add_argument("--bitrate-kbps", type=int, default=800)
     parser.add_argument("--codec", default="vp8", choices=["vp8", "h264", "all"])
+    parser.add_argument("--encoder", default="aiortc", choices=["aiortc", "stand-in"],
+                        help="aiortc: its own software encoder for --codec (the default). "
+                             "stand-in: the bridge's own encoder over the software "
+                             "stand-in chain, H.264 only")
     parser.add_argument("--still", action="store_true",
                         help="freeze the pattern (a break test for the viewer's "
                              "movement assertion)")
     parser.add_argument("--quiet", action="store_true",
                         help="drop the package's own log output")
     args = parser.parse_args()
+    if args.encoder == "stand-in" and args.codec == "vp8":
+        parser.error("--encoder stand-in is H.264; give --codec h264")
     # Everything the bridge logs, at every level. A proof that hides the
     # publisher's own account of what it did can only report that the picture
     # was missing, never why.

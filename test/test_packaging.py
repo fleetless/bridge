@@ -99,7 +99,7 @@ def test_the_launch_file_and_the_readme_name_the_live_default_the_bridge_declare
         assert name in launch_source, name
 
 
-# --- GStreamer is not a dependency -------------------------------------------------
+# --- GStreamer is not a dependency, and the tools are not installed -----------------
 
 
 def test_no_manifest_names_gstreamer_or_gi():
@@ -119,3 +119,15 @@ def test_no_manifest_names_gstreamer_or_gi():
     for package in ("python3-gi", "gir1.2-gstreamer-1.0", "gir1.2-gst-plugins-base-1.0",
                     "gstreamer1.0-plugins-bad", "gstreamer1.0-plugins-ugly"):
         assert package in dockerfile, package
+
+
+def test_the_proof_and_sampling_tools_are_not_part_of_what_is_installed():
+    """`tools/` is for a checkout. Nothing of it is a package, package data
+    or a data file of the bridge."""
+    setup_text = (ROOT / "setup.py").read_text()
+    assert "packages=[package_name]" in setup_text
+    for name in ("encoder-proof", "encoder_proof", "cpu-sample", "cpu_sample", "live-proof"):
+        assert name not in setup_text, name
+    for tool in ("tools/encoder-proof/encoder_proof.py", "tools/encoder-proof/README.md",
+                 "tools/cpu-sample/cpu_sample.py", "tools/cpu-sample/README.md"):
+        assert (ROOT / tool).is_file(), tool
