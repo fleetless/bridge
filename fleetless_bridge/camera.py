@@ -187,23 +187,22 @@ class RawFrameHolder:
     adapters must decode on their own thread just to know a frame arrived).
 
     `take()` — unlike `LatestFrameHolder.get()` — clears the slot: the
-    frame is converted at most once, by the one path that consumes it.
-    Today that is exactly one caller, `RosRuntime._next_snapshot`'s dueness
-    walk, and nothing else in the package calls `take()` at all. Written
-    from the ROS subscription callback (the executor thread); `take()` runs
-    on that same thread (via `_submit_async`), so the lock here is
-    defensive rather than load-bearing for that one reader — it matters if
-    a second reader is ever added.
+    frame is converted at most once, by whichever path consumes it. There
+    are two, and both go through `RosRuntime._convert_due_raw_frame`: the
+    dueness walk of `_next_snapshot`, and a live start
+    (`RosRuntime.convert_newest_raw_frame`). Written from the ROS
+    subscription callback (the executor thread); `take()` runs on that same
+    thread for both readers, so the lock here is defensive rather than
+    load-bearing.
 
-    **What a live start does not do, since the obvious guess is wrong.**
-    Starting a live stream does *not* take the raw frame: `_on_source_frame`
-    starts eagerly converting into `entry.latest` the moment a stream is
-    live, and the publisher reads `entry.latest`. So the first live frames
-    a viewer sees come from whatever `latest` already held when the stream
-    started — up to one capture interval stale for a camera that was idle,
-    and `None` (nothing sent) for one that has never captured — until the
-    first eager conversion lands. That is the join-window cost of
-    converting lazily, named here rather than left to be rediscovered."""
+    **What a live start does with it.** It takes the raw frame once, as the
+    start begins, and converts it into `entry.latest`, where the publisher
+    reads. The first picture a viewer gets is therefore the newest message
+    the camera had sent when the start was asked for — at most one camera
+    interval old at that moment — and not the next one, which is up to a
+    whole interval away. Messages that arrive while the room is being joined
+    stay raw; from the moment the stream is live, `_on_source_frame` converts
+    every accepted frame as it arrives."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
