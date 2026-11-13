@@ -223,6 +223,73 @@ def test_what_comes_out_decodes_back_to_the_moving_pattern():
     assert worst < 12.0
 
 
+# --- a picture of any width ------------------------------------------------------------
+#
+# GStreamer reads a buffer by its caps: rows padded to four bytes. A picture
+# packed tightly is that layout only at widths that are a multiple of eight.
+
+
+@pytest.mark.parametrize(
+    "width, height",
+    [(642, 480), (854, 480), (900, 600), (1022, 768), (1026, 770), (1366, 768), (426, 240)],
+)
+def test_a_picture_whose_width_is_not_a_multiple_of_eight_decodes_back_to_the_pattern(width, height):
+    pipeline = _pipeline(width=width, height=height, bitrate_bps=3_000_000)
+    decoder = av.CodecContext.create("h264", "r")
+    worst = 0.0
+    try:
+        for index in range(6):
+            data = pipeline.encode(moving_frame(index, width, height), False)
+            (picture,) = decoder.decode(av.Packet(data))
+            shown = picture.to_ndarray(format="rgb24").astype(np.int16)
+            assert shown.shape == (height, width, 3)
+            worst = max(worst, float(np.abs(shown - moving_picture(index, width, height)).mean()))
+    finally:
+        pipeline.close()
+    # A row read from the wrong place shears the picture; this is far above it.
+    assert worst < 12.0
+
+
+def test_the_layout_is_the_one_gstreamer_reads_from_the_caps():
+    """Against `GstVideo.VideoInfo` of this distribution's GStreamer, which
+    is what an element maps a buffer without a layout of its own by. Odd
+    sizes too: the configuration allows any."""
+    Gst, GstVideo = live_encoder._load_gst()
+    for width in (1, 2, 3, 5, 16, 62, 320, 641, 642, 854, 900, 1022, 1024, 1026, 1366, 7680):
+        for height in (1, 2, 3, 48, 240, 479, 480, 600, 730, 768, 4320):
+            info = GstVideo.VideoInfo.new_from_caps(
+                Gst.Caps.from_string(
+                    "video/x-raw,format=I420,width={},height={},framerate=15/1".format(width, height)
+                )
+            )
+            assert live_encoder.gst_i420_layout(width, height) == (
+                tuple(info.stride[:3]), tuple(info.offset[:3]), info.size,
+            ), (width, height)
+
+
+def test_the_planes_are_copied_row_by_row_to_where_the_layout_puts_them():
+    """6x4: luma rows of 6 in a stride of 8, chroma rows of 3 in a stride of
+    4. Every sample has a value of its own, so a row that lands in the wrong
+    place shows."""
+    frame = av.VideoFrame(6, 4, "yuv420p")
+    luma = np.arange(1, 25, dtype=np.uint8).reshape(4, 6)
+    blue = np.arange(101, 107, dtype=np.uint8).reshape(2, 3)
+    red = np.arange(201, 207, dtype=np.uint8).reshape(2, 3)
+    for plane, samples in zip(frame.planes, (luma, blue, red)):
+        rows = np.frombuffer(plane, np.uint8).reshape(-1, plane.line_size)
+        rows[:samples.shape[0], :samples.shape[1]] = samples
+
+    packed = np.frombuffer(live_encoder.i420_for_gst(frame), np.uint8)
+    strides, offsets, size = live_encoder.gst_i420_layout(6, 4)
+    assert (strides, offsets, size) == ((8, 4, 4), (0, 32, 40), 48) and len(packed) == 48
+    assert (packed[0:32].reshape(4, 8)[:, :6] == luma).all()
+    assert (packed[32:40].reshape(2, 4)[:, :3] == blue).all()
+    assert (packed[40:48].reshape(2, 4)[:, :3] == red).all()
+    # The padding is zero, whatever libav left beside its rows.
+    assert not packed[0:32].reshape(4, 8)[:, 6:].any()
+    assert not packed[32:48].reshape(4, 4)[:, 3:].any()
+
+
 def test_a_bitrate_change_takes_effect_while_running():
     pipeline = _pipeline(bitrate_bps=2_000_000)
     try:

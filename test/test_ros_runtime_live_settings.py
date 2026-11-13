@@ -387,18 +387,23 @@ def test_a_change_of_the_encoder_forgets_what_was_learned_about_the_chains(publi
     rt = RosRuntime(node_name="test_live_encoder_memory")
     try:
         rt.set_live_settings(LiveSettings(max_packet_bytes=1200, encoder="nvenc"))
-        live_encoder.MEMORY.failed(jetson, "GStreamer has no element 'nvvidconv'")
+        live_encoder.MEMORY.cannot_be_built(jetson, "GStreamer has no element 'nvvidconv'")
+        live_encoder.MEMORY.did_not_encode(CHAINS["nvenc"][1], (1024, 768), "no access unit")
         # The same setting again, and a change of the other key: nothing is forgotten.
         rt.set_live_settings(LiveSettings(max_packet_bytes=1200, encoder="nvenc"))
         rt.set_live_settings(LiveSettings(max_packet_bytes=1000, encoder="nvenc"))
-        kept = live_encoder.MEMORY.candidates(CHAINS["nvenc"])[1]
+        kept = live_encoder.MEMORY.candidates(CHAINS["nvenc"], (1024, 768))[1]
         # Another encoder: the next start probes again.
         rt.set_live_settings(LiveSettings(max_packet_bytes=1000, encoder="auto"))
-        cleared = live_encoder.MEMORY.candidates(CHAINS["nvenc"])[1]
+        cleared = live_encoder.MEMORY.candidates(CHAINS["nvenc"], (1024, 768))[1]
     finally:
         from fleetless_bridge import live
 
         live.set_max_packet_bytes(LIVE_DEFAULTS["max_packet_bytes"])
         rt.stop()
-    assert kept == {"nvenc/jetson": "GStreamer has no element 'nvvidconv'"}
+    assert kept == {
+        "nvenc/jetson": "nvenc/jetson cannot be built: GStreamer has no element 'nvvidconv'",
+        "nvenc/desktop": "nvenc/desktop did not encode a 1024x768 picture: no access unit",
+    }
+    # Both kinds of finding go: what could not be built and what was refused.
     assert cleared == {}
