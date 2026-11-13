@@ -43,6 +43,27 @@ to leave — tears this session down and reports it through
 `_on_room_disconnected`. An ICE restart here would be a second recovery
 mechanism beside the one the cloud already runs, and the weaker of two always
 wins.
+
+**The encoder seam.** Left alone, aiortc builds its own software encoder on
+the first frame: VP8 or H.264, whichever the answer picked. A `LivePublisher`
+that is handed an `encoder` uses that object instead:
+
+- **What it is.** A subclass of `aiortc.codecs.h264.H264Encoder` that
+  overrides `_encode_frame(frame, force_keyframe)` and yields the NAL units of
+  one access unit, without start codes (`_split_bitstream` cuts an Annex-B
+  byte string into them). `encode()` stays aiortc's, so the packetization and
+  the packet cap do too. aiortc calls it in a worker thread, one frame at a
+  time, with the `av.VideoFrame` the track produced; `force_keyframe` is a
+  viewer's keyframe request. Yielding nothing sends nothing for that frame.
+- **How it gets in.** `LivePublisher(encoder=...)`, one encoder per
+  publisher. It is set on the sender right after `addTrack`, on the
+  connection made after a TURN failure as well, and the offer is restricted
+  to H.264: the codec is the encoder's, so it cannot be left to the answer.
+- **Who closes it.** The publisher, once, in every teardown: `stop()`, a
+  failed start, a lost session. aiortc never closes an encoder. `close()`
+  runs in a worker thread after the peer connection is closed. An `encode()`
+  that was already running may still be running then, so an encoder that
+  holds something keeps the two apart itself.
 """
 from __future__ import annotations
 
@@ -59,6 +80,7 @@ from aiortc import (
     RTCConfiguration,
     RTCIceServer,
     RTCPeerConnection,
+    RTCRtpSender,
     RTCSessionDescription,
 )
 from aiortc.mediastreams import (
@@ -122,6 +144,11 @@ ENCODER_CLAMP_BPS = {
     "Vp8Encoder": (250_000, 1_500_000),
     "H264Encoder": (500_000, 3_000_000),
 }
+
+#: How long a teardown waits for an encoder's `close()`. Closing can wait for
+#: a frame that is still being encoded; it cannot be allowed to hold a camera's
+#: stop for good, because the next start of that camera waits for the stop.
+ENCODER_CLOSE_TIMEOUT_S = 5.0
 
 
 #: The least time between two frames the track produces ahead of its pacing.
@@ -215,6 +242,14 @@ class LiveStartError(Exception):
     """Live could not be started. The message becomes `bridgeCameraState`'s
     `error.message` (ros_runtime.py) — a camera that cannot start must say
     so, not leave a viewer watching a black rectangle believing it is live."""
+
+
+class EncoderNotInstalled(Exception):
+    """The encoder a publisher was handed could not be put into aiortc's
+    sender, or the offer could not be restricted to its codec. The start
+    fails: carrying on would let aiortc encode with an encoder of its own,
+    which is a wrong picture for any encoder that does not encode the
+    track's frames itself. The reason is logged where it is raised."""
 
 
 class CameraTrack(VideoStreamTrack):
@@ -436,10 +471,31 @@ def _subscribed(payload: Any) -> Optional[bool]:
     )
 
 
+def _h264_codec_preferences() -> List[Any]:
+    """What this aiortc can send as H.264, with the retransmission entries.
+
+    aiortc offers every codec it has and lets the answer choose. With an
+    encoder of the bridge's own in the sender the choice is already made, and
+    an answer that picked VP8 would hand VP8's payload type to an H.264
+    stream. The retransmission entries are kept: aiortc pairs each with the
+    codec it belongs to and drops the ones whose codec is gone.
+    """
+    return [
+        codec
+        for codec in RTCRtpSender.getCapabilities("video").codecs
+        if codec.mimeType.lower() in ("video/h264", "video/rtx")
+    ]
+
+
 class LivePublisher:
     """One camera's live session: join, publish, feed frames until
     `stop()`. One instance per active `(slug, session)` — ros_runtime.py
-    owns the mapping from slug to instance."""
+    owns the mapping from slug to instance.
+
+    `encoder` is the seam the module docstring describes: an H.264 encoder
+    that replaces the one aiortc would build. `None` is aiortc's own, VP8 or
+    H.264 as negotiated. The publisher owns the encoder from here on and
+    closes it, also when `start()` fails or is never called."""
 
     def __init__(
         self,
@@ -452,6 +508,7 @@ class LivePublisher:
         connection_factory: Optional[Callable[..., RTCPeerConnection]] = None,
         track_factory: Optional[Callable[[int, int, int, int], Any]] = None,
         signal_factory: Optional[Callable[..., Any]] = None,
+        encoder: Optional[Any] = None,
         bitrate_interval_s: float = BITRATE_HOLD_INTERVAL_S,
         on_lost: Optional[Callable[[str], None]] = None,
         slug: Optional[str] = None,
@@ -465,6 +522,8 @@ class LivePublisher:
         self._connection_factory = connection_factory or _default_connection_factory
         self._track_factory = track_factory or _default_track_factory
         self._signal_factory = signal_factory or _default_signal_factory
+        # Ours to close from this line on; `_teardown` takes it exactly once.
+        self._encoder = encoder
         self._bitrate_interval_s = bitrate_interval_s
         # Called at most once, with a human-readable reason, when publishing
         # stops on its own — a transport loss (server restart, media
@@ -567,7 +626,7 @@ class LivePublisher:
                 self._width, self._height, self._fps, self._bitrate_kbps
             )
             self._track = track
-            self._sender = pc.addTrack(track)
+            self._sender = self._add_track(pc, track)
 
             published = await signal.add_track(
                 track.id, TRACK_NAME, self._width, self._height,
@@ -626,7 +685,7 @@ class LivePublisher:
                 pc = self._connection_factory(())
                 self._pc = pc
                 pc.on("connectionstatechange", lambda pc=pc: self._on_connection_state(pc))
-                self._sender = pc.addTrack(track)
+                self._sender = self._add_track(pc, track)
                 offer = await pc.createOffer()
                 await pc.setLocalDescription(offer)
             # Local candidates are not trickled: no aiortc version among the
@@ -656,6 +715,46 @@ class LivePublisher:
         )
         self._bitrate_task = asyncio.ensure_future(self._hold_bitrate_budget())
         self._feed_task = asyncio.ensure_future(self._feed_frames())
+
+    def _add_track(self, pc, track):
+        """`addTrack`, and with an encoder of our own: that encoder onto the
+        sender, and H.264 as the only codec of the offer.
+
+        **Right after `addTrack`, before anything is awaited.** aiortc builds
+        an encoder when it finds none, on the first frame, and keeps the one
+        it finds; set here, ours is the one it finds. Called for every
+        connection a start makes, so the one after a TURN failure carries the
+        same encoder: the first connection never sent a frame.
+
+        Without an encoder this is `addTrack` and nothing else.
+        """
+        sender = pc.addTrack(track)
+        encoder = self._encoder
+        if encoder is None:
+            return sender
+        if not hasattr(sender, SENDER_ENCODER_ATTR):
+            log.error(
+                "This aiortc keeps its encoder somewhere else than %s; the encoder "
+                "for this session cannot be installed, and live is not started",
+                SENDER_ENCODER_ATTR,
+            )
+            raise EncoderNotInstalled()
+        setattr(sender, SENDER_ENCODER_ATTR, encoder)
+        transceiver = next(
+            (candidate for candidate in pc.getTransceivers() if candidate.sender is sender),
+            None,
+        )
+        preferences = _h264_codec_preferences()
+        if transceiver is None or not any(
+            codec.mimeType.lower() == "video/h264" for codec in preferences
+        ):
+            log.error(
+                "This aiortc offers no way to restrict the offer to H.264; the "
+                "encoder for this session cannot be used, and live is not started"
+            )
+            raise EncoderNotInstalled()
+        transceiver.setCodecPreferences(preferences)
+        return sender
 
     async def stop(self) -> None:
         """Stops feeding and tears both halves down. Safe to call even if
@@ -720,12 +819,14 @@ class LivePublisher:
     async def _teardown(self) -> None:
         """Closes everything this session owns, in the order that leaves
         nothing waiting: the track first (so the sender's own loop stops
-        pulling), then the peer connection, then the signalling socket, which
-        is the only one that has anything to say to the server."""
+        pulling), then the peer connection, then the encoder the connection's
+        sender was calling, then the signalling socket, which is the only one
+        that has anything to say to the server."""
         self._cancel_bitrate()
         track, self._track = self._track, None
         pc, self._pc = self._pc, None
         signal, self._signal = self._signal, None
+        encoder, self._encoder = self._encoder, None
         self._sender = None
         if track is not None:
             try:
@@ -740,11 +841,42 @@ class LivePublisher:
                 # opened with a LiveKit token, so no exception on this path
                 # gets its raw message logged.
                 log.error("Error closing a live peer connection: %s", type(exc).__name__)
+        if encoder is not None:
+            await self._close_encoder(encoder)
         if signal is not None:
             try:
                 await signal.close()
             except Exception as exc:  # noqa: BLE001 - same
                 log.error("Error closing a live signalling socket: %s", type(exc).__name__)
+
+    async def _close_encoder(self, encoder) -> None:
+        """`encoder.close()`, in a worker thread, waited for at most
+        `ENCODER_CLOSE_TIMEOUT_S`.
+
+        A thread, because closing may wait for a frame that is still being
+        encoded, and the loop has other cameras to serve. A limit, because
+        `stop()` waits for this and the camera's next start waits for
+        `stop()`. Whatever goes wrong is logged by type name and goes no
+        further: an encoder can hold a camera URL, and nothing on this path
+        may print one. An encoder without a `close` has nothing to release.
+        """
+        close = getattr(encoder, "close", None)
+        if not callable(close):
+            return
+        closing = asyncio.get_running_loop().run_in_executor(None, close)
+        # Looked at even if nobody waits any longer, so a late failure is not
+        # reported by the garbage collector with its message.
+        closing.add_done_callback(lambda done: done.cancelled() or done.exception())
+        finished, _ = await asyncio.wait({closing}, timeout=ENCODER_CLOSE_TIMEOUT_S)
+        if not finished:
+            log.error(
+                "A live encoder did not finish closing within %g s; it is left behind",
+                ENCODER_CLOSE_TIMEOUT_S,
+            )
+            return
+        exc = closing.exception()
+        if exc is not None:
+            log.error("Error closing a live encoder: %s", type(exc).__name__)
 
     async def _cancel_feed(self) -> None:
         task, self._feed_task = self._feed_task, None
