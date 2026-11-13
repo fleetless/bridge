@@ -41,7 +41,9 @@ For each chain:
   viewer to assume, as the software encoder's does; the output says which it
   is;
 - the stream shrinks when the target bitrate is cut to a quarter and grows
-  when it is restored;
+  when it is restored. Each of the three stretches is two seconds of frames
+  and never fewer than thirty, so the check means the same at a camera's two
+  frames a second as at thirty;
 - the pipeline goes back to NULL.
 
 Then it runs the encoder class the bridge installs into a live session and

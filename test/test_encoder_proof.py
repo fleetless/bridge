@@ -230,6 +230,47 @@ def test_a_chain_that_does_not_follow_the_bitrate_fails_the_proof():
     assert "ok   45 frames in, 45 access units out" in said
 
 
+@pytest.mark.parametrize("bitrate", [[], ["--bitrate-kbps", "500"], ["--bitrate-kbps", "150"]],
+                         ids=["default-bitrate", "500-kbps", "150-kbps"])
+def test_the_command_for_a_robot_s_cameras_passes_the_stand_in(bitrate):
+    """The command the pull request gives for the first robot, with the
+    stand-in for its chip: 1024x768 at two frames a second. Two seconds of
+    that are four frames, which is where the encoder happens to be and not
+    where it settles; the bitrate check once failed a working encoder on
+    them."""
+    out = io.StringIO()
+    code = proof.main(
+        ["--backend", "stand-in", "--width", "1024", "--height", "768", "--fps", "2"] + bitrate,
+        out=out,
+    )
+    said = out.getvalue()
+    assert code == 0, said
+    assert "ok   the bitrate follows the target" in said
+    assert "VERDICT: PASS (stand-in/x264)" in said
+
+
+def test_a_stretch_of_the_bitrate_check_is_thirty_frames_at_least(monkeypatch):
+    """Counted, at a frame rate where two seconds are far fewer."""
+    pushed = []
+    real = proof.Pipeline.encode
+
+    def counting(self, frame, force_keyframe):
+        pushed.append(self.bitrate_bps)
+        return real(self, frame, force_keyframe)
+
+    monkeypatch.setattr(proof.Pipeline, "encode", counting)
+    result, said = _prove(STAND_IN, fps=2, frames=6, keyframe_every=3, bitrate_kbps=400)
+    assert result == "pass", said
+    # Six frames of the pattern and four of the bars at the target, then the
+    # three stretches.
+    assert pushed == [400_000] * (6 + 4 + 30) + [100_000] * 30 + [400_000] * 30
+    # And two seconds of frames where that is more.
+    pushed.clear()
+    result, said = _prove(STAND_IN, fps=20, frames=6, keyframe_every=3, bitrate_kbps=400)
+    assert result == "pass", said
+    assert pushed == [400_000] * (6 + 4 + 40) + [100_000] * 40 + [400_000] * 40
+
+
 def test_a_failing_chain_makes_the_verdict_fail_whatever_else_passes(monkeypatch):
     monkeypatch.setattr(
         proof, "chains_for",
