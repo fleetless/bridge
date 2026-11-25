@@ -36,7 +36,9 @@ bridge to introspect and subscribe to.
   which is what actually exercises encoding
   and timing rather than hiding problems behind a fake source. Degrades to
   "no camera" (logged once, no crash) when the device cannot be opened —
-  expected off the dev host.
+  expected off the dev host. `FAKE_CAMERA_SOURCE=pattern` publishes a moving
+  test picture instead (`tools/camera_pattern.py`), for a host with no camera
+  that still needs frames; unset, the device opens as before.
 
 Runs on a `MultiThreadedExecutor`, not a bare `rclpy.spin()`: a
 synchronous `execute_callback` (the Fibonacci action's) runs on whichever
@@ -68,6 +70,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState, Image, JointState
 
+from camera_pattern import camera_source, pattern_frame
+
 PUBLISH_HZ = 10.0
 BATTERY_PERIOD_S = 20.0
 JOINT_PERIOD_S = 4.0
@@ -78,6 +82,10 @@ JOINT_NAMES = ["shoulder_pan", "elbow"]
 # Overridable so a dev host with the webcam on a different node, or a human
 # running this outside Docker, is not stuck editing code.
 CAMERA_DEVICE = int(os.environ.get("FAKE_CAMERA_DEVICE", "0"))
+# Where /image_raw's frames come from: `device` (the default, the capture
+# device above) or `pattern` (the generated test picture). Read at start and
+# refused by name when it is neither, before any node exists.
+CAMERA_SOURCE = camera_source(os.environ.get("FAKE_CAMERA_SOURCE"))
 # A modest, fixed capture rate — this is a stand-in robot's own publish rate
 # (the source topic), not the bridge's configured
 # snapshot/live rate, which is what actually governs what the cloud sees.
@@ -137,26 +145,35 @@ class FakeRobot(Node):
         # the device can fail (no camera on this host, or run outside
         # --device /dev/video0) — logged once and degraded to "no camera",
         # not a crash, so the rest of the fake robot still comes up for
-        # whatever else a session needs it for.
+        # whatever else a session needs it for. With FAKE_CAMERA_SOURCE=pattern
+        # no device is opened at all: the generated test picture publishes
+        # instead, at the same rate.
         self._image_pub = self.create_publisher(Image, "/image_raw", 10)
         self._cv_bridge = CvBridge()
-        self._camera = cv2.VideoCapture(CAMERA_DEVICE)
-        if not self._camera.isOpened():
-            self.get_logger().warning(
-                "Could not open camera device {} — /image_raw will not "
-                "publish. Expected off the dev host; the camera checks "
-                "need the real webcam.".format(CAMERA_DEVICE)
-            )
-            self._camera = None
+        self._pattern_index = 0
+        self._camera = None
+        if CAMERA_SOURCE == "pattern":
+            self.create_timer(1.0 / CAMERA_HZ, self._publish_pattern)
         else:
-            self.create_timer(1.0 / CAMERA_HZ, self._publish_image)
+            self._camera = cv2.VideoCapture(CAMERA_DEVICE)
+            if not self._camera.isOpened():
+                self.get_logger().warning(
+                    "Could not open camera device {} — /image_raw will not "
+                    "publish. Expected off the dev host; the camera checks "
+                    "need the real webcam.".format(CAMERA_DEVICE)
+                )
+                self._camera = None
+            else:
+                self.create_timer(1.0 / CAMERA_HZ, self._publish_image)
 
         self.get_logger().info(
             "fake_robot publishing /battery and /joint_states at {:.0f} Hz, "
             "{}, subscribed to /cmd_vel, serving the 'count' action and "
             "/add_two_ints ({:.1f}s deliberate delay)".format(
                 PUBLISH_HZ,
-                "/image_raw at {:.0f} Hz from camera device {}".format(
+                "/image_raw at {:.0f} Hz from the test picture".format(CAMERA_HZ)
+                if CAMERA_SOURCE == "pattern"
+                else "/image_raw at {:.0f} Hz from camera device {}".format(
                     CAMERA_HZ, CAMERA_DEVICE
                 )
                 if self._camera is not None
@@ -282,6 +299,14 @@ class FakeRobot(Node):
         msg = self._cv_bridge.cv2_to_imgmsg(frame, encoding="bgr8")
         msg.header.frame_id = "camera"
         self._image_pub.publish(msg)
+
+    def _publish_pattern(self) -> None:
+        msg = self._cv_bridge.cv2_to_imgmsg(
+            pattern_frame(self._pattern_index), encoding="bgr8"
+        )
+        msg.header.frame_id = "camera"
+        self._image_pub.publish(msg)
+        self._pattern_index += 1
 
     def close_camera(self) -> None:
         """Releases the V4L2 device — called from `main`'s `finally`, so a
