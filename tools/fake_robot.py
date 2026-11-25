@@ -66,7 +66,8 @@ import cv2
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
+from rclpy.impl.implementation_singleton import rclpy_implementation as _rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import BatteryState, Image, JointState
 
@@ -316,6 +317,20 @@ class FakeRobot(Node):
             self._camera.release()
 
 
+def stops_quietly(error: BaseException, ros_ok: bool) -> bool:
+    """Whether `error`, raised out of `executor.spin()`, is how a stop looks.
+
+    `docker stop` sends SIGTERM, and rclpy's own handler shuts the context
+    down while the executor is still spinning. Depending on where spin was,
+    that surfaces as `ExternalShutdownException` or as an `RCLError` about the
+    context (seen once in sixteen stops: "context is not valid"); Ctrl-C is a
+    `KeyboardInterrupt`. Those end quietly. An `RCLError` while rclpy still
+    reports ok is a real failure, and so is everything else: it raises."""
+    if isinstance(error, (KeyboardInterrupt, ExternalShutdownException)):
+        return True
+    return isinstance(error, _rclpy.RCLError) and not ros_ok
+
+
 def main() -> None:
     rclpy.init()
     node = FakeRobot()
@@ -326,8 +341,9 @@ def main() -> None:
     executor.add_node(node)
     try:
         executor.spin()
-    except KeyboardInterrupt:
-        pass
+    except BaseException as error:
+        if not stops_quietly(error, rclpy.ok()):
+            raise
     finally:
         executor.shutdown()
         node.close_camera()
