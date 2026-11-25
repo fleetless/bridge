@@ -191,6 +191,24 @@ log = logging.getLogger(__name__)
 # executor, not compete with normal apply/introspect latency.
 WORK_TIMEOUT_S = 10.0
 
+# How often the work queue says, at INFO, what it did: the hour's triggers,
+# drains and jobs, the longest a job waited to be taken, and how many waits
+# timed out, by cause (`_classify_stall`). A stall explains itself in its own
+# WARNING line; this is the background it is read against.
+WORK_SUMMARY_INTERVAL_S = 3600.0
+
+# What a waiter that gave up on a job raises, by the layer that reported it.
+# Three classes on Python 3.10: `Future.result` raises
+# `concurrent.futures.TimeoutError`, and awaiting it through
+# `run_in_executor` turns that into `asyncio.TimeoutError`; neither is the
+# builtin. From 3.11 on all three are one class. The same tuple as
+# `client.py`'s `_PULL_TIMEOUT_ERRORS`, for the same reason.
+_WAIT_TIMEOUT_ERRORS = (
+    concurrent.futures.TimeoutError,
+    asyncio.TimeoutError,
+    TimeoutError,
+)
+
 DEFAULT_SAMPLE_QUEUE_SIZE = 1000
 
 # How often the shared failsafe watchdog re-checks every publisher.
@@ -1356,6 +1374,59 @@ def _done_future() -> "concurrent.futures.Future":
     return future
 
 
+class _WorkJob:
+    """One unit of work for the executor thread, with the three instants
+    that say where it spent its time (`time.monotonic()`): queued, taken by
+    a drain, finished. `looks_at_enqueue` is `RosRuntime._work_looks` at the
+    append, both read under `_work_lock`: a larger count later means a drain
+    looked at the queue while this job was in it.
+
+    Three clock reads and a few attribute writes per job, nothing else: what
+    a job did is only ever put into words when its waiter has timed out."""
+
+    __slots__ = ("fn", "future", "enqueued_at", "taken_at", "done_at", "looks_at_enqueue")
+
+    def __init__(self, fn, future: "concurrent.futures.Future", enqueued_at: float) -> None:
+        self.fn = fn
+        self.future = future
+        self.enqueued_at = enqueued_at
+        self.taken_at: Optional[float] = None
+        self.done_at: Optional[float] = None
+        self.looks_at_enqueue = 0
+
+
+def _raised_by_the_job(job: _WorkJob) -> bool:
+    """Whether a timeout a waiter saw is the job's own exception rather
+    than the waiter giving up: a job may itself raise a `TimeoutError`
+    (a socket's, a nested future's), and `Future.result` re-raises it as
+    it is. Only a job that is done can have raised one."""
+    future = job.future
+    return (
+        future.done()
+        and not future.cancelled()
+        and isinstance(future.exception(), _WAIT_TIMEOUT_ERRORS)
+    )
+
+
+def _work_kind(fn) -> str:
+    """What a job is, for a log line: the name of the function, never its
+    arguments. Most jobs are lambdas, whose `__name__` is `<lambda>`; the
+    method they were written in names them instead.
+    `RosRuntime.next_snapshot.<locals>.<lambda>` is `next_snapshot`,
+    `RosRuntime._rebuild_caps` is `_rebuild_caps`,
+    `RosRuntime.stop.<locals>.teardown` is `stop.teardown`. Asked only when
+    a line is written, never at enqueue."""
+    qualname = getattr(fn, "__qualname__", None) or getattr(fn, "__name__", None)
+    if not qualname:
+        return type(fn).__name__
+    parts = [part for part in qualname.split(".") if part != "<locals>"]
+    if len(parts) > 1 and parts[-1] == "<lambda>":
+        parts.pop()
+    if len(parts) > 1 and parts[0] == "RosRuntime":
+        parts.pop(0)
+    return ".".join(parts)
+
+
 #: The third camera type, known by name. Nothing here imports
 #: `foxglove_msgs`, and neither `package.xml` nor the test image names it: a
 #: robot that has the package can use the type, and one that has not reports
@@ -1691,7 +1762,29 @@ class RosRuntime:
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._work_lock = threading.Lock()
-        self._work_queue: "Deque[Tuple[object, concurrent.futures.Future]]" = deque()
+        self._work_queue: "Deque[_WorkJob]" = deque()
+        # The work queue's own account of itself (`_classify_stall`):
+        # every counter below is read and written under `_work_lock`, inside
+        # the lock regions `_enqueue` and `_drain_work` take anyway.
+        # `_work_running` is the job a drain is running right now;
+        # `_work_looks` counts every time a drain examined the queue, for
+        # the life of the runtime. The rest is the current period's, reset
+        # by `_log_work_summary`.
+        self._work_running: Optional[_WorkJob] = None
+        self._work_looks = 0
+        self._work_period_started_at = time.monotonic()
+        self._work_triggers = 0
+        self._work_drains = 0
+        self._work_drains_empty = 0
+        self._work_jobs_taken = 0
+        self._work_longest_wait = 0.0
+        self._work_stalls = {"H1": 0, "H2": 0, "H3": 0, "H4": 0}
+        self._work_record_failures = 0
+        self._work_record_error_logged = False
+        # The newest datapoint subscription callback, `time.monotonic()`:
+        # what a stall line holds against "the executor was stuck".
+        self._last_subscription_at: Optional[float] = None
+        self._work_summary_timer = None
         self._subscriptions: Dict[str, _Subscription] = {}
         self._actions: Dict[str, _ActionEntry] = {}
         self._services: Dict[str, _ServiceEntry] = {}
@@ -2065,6 +2158,11 @@ class RosRuntime:
         self._job_heartbeat_timer = self._node.create_timer(
             JOB_HEARTBEAT_INTERVAL_MS / 1000.0, self._emit_job_heartbeats
         )
+        # The work queue's hourly summary: a timer of its own, not a line in
+        # `_emit_job_heartbeats`, whose timer is the heartbeat's.
+        self._work_summary_timer = self._node.create_timer(
+            WORK_SUMMARY_INTERVAL_S, self._log_work_summary
+        )
         # URDF availability detection — permanent for the
         # life of the node, independent of `_apply_*`/exposed configuration
         # entirely: unlike a datapoint, this isn't a configured slug, it's
@@ -2168,19 +2266,37 @@ class RosRuntime:
     # --- the work queue: everything below runs ON the executor thread -----
 
     def _drain_work(self) -> None:
+        first = True
         while True:
             with self._work_lock:
+                self._work_looks += 1
+                if first:
+                    first = False
+                    self._work_drains += 1
+                    if not self._work_queue:
+                        self._work_drains_empty += 1
                 if not self._work_queue:
                     return
-                fn, future = self._work_queue.popleft()
-            if not future.set_running_or_notify_cancel():
-                continue
+                job = self._work_queue.popleft()
+                job.taken_at = time.monotonic()
+                self._work_jobs_taken += 1
+                wait = job.taken_at - job.enqueued_at
+                if wait > self._work_longest_wait:
+                    self._work_longest_wait = wait
+                self._work_running = job
+            future = job.future
             try:
-                result = fn()
-            except Exception as exc:  # noqa: BLE001 - reported to the caller, not raised here
-                future.set_exception(exc)
-            else:
-                future.set_result(result)
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    result = job.fn()
+                except Exception as exc:  # noqa: BLE001 - reported to the caller, not raised here
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+            finally:
+                job.done_at = time.monotonic()
+                self._work_running = None
 
     def _enqueue(self, fn) -> "concurrent.futures.Future":
         """Queue `fn` to run on the executor thread; returns immediately with
@@ -2204,11 +2320,25 @@ class RosRuntime:
         real gap because the first worker's append (a lock + append, not
         meaningfully slow) had already finished long before the second
         dispatch even happened."""
-        future: "concurrent.futures.Future" = concurrent.futures.Future()
+        return self._enqueue_job(fn).future
+
+    def _enqueue_job(self, fn) -> _WorkJob:
+        """`_enqueue`, returning the job rather than its future: for the two
+        waiters, which have to say what became of the job when they give up
+        on it (`_report_stall`)."""
+        job = _WorkJob(fn, concurrent.futures.Future(), time.monotonic())
         with self._work_lock:
-            self._work_queue.append((fn, future))
+            job.looks_at_enqueue = self._work_looks
+            self._work_queue.append(job)
+            self._work_triggers += 1
+        self._trigger_guard()
+        return job
+
+    def _trigger_guard(self) -> None:
+        """Wakes the executor for the queue: the guard condition whose
+        callback is `_drain_work`. A method of its own so that a test can
+        lose one wake-up on purpose."""
         self._guard.trigger()
-        return future
 
     def _submit(self, fn, timeout: float = WORK_TIMEOUT_S):
         """Enqueue `fn` and block the calling thread for its result.
@@ -2221,16 +2351,154 @@ class RosRuntime:
         there is no other caller for it to race. Everything else goes
         through `_submit_async` instead, specifically to keep the enqueue on
         the *dispatching* thread and offload only the wait."""
-        return self._enqueue(fn).result(timeout=timeout)
+        job = self._enqueue_job(fn)
+        try:
+            return job.future.result(timeout=timeout)
+        except _WAIT_TIMEOUT_ERRORS:
+            if not _raised_by_the_job(job):
+                self._report_stall(job, timeout)
+            raise
 
     async def _submit_async(self, fn, timeout: float = WORK_TIMEOUT_S):
         """Enqueue `fn` synchronously (preserving the caller's dispatch
         order into `_work_queue`; see `_enqueue`) and await its result
         without blocking the event loop — the async counterpart to
-        `_submit`, and what every asyncio-facing method below uses."""
-        future = self._enqueue(fn)
+        `_submit`, and what every asyncio-facing method below uses.
+
+        A wait that times out says why before it raises (`_report_stall`);
+        what the caller sees is unchanged. On Python 3.10 the
+        timeout arrives here as `asyncio.TimeoutError`, converted from
+        `Future.result`'s own class (`_WAIT_TIMEOUT_ERRORS`)."""
+        job = self._enqueue_job(fn)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, future.result, timeout)
+        try:
+            return await loop.run_in_executor(None, job.future.result, timeout)
+        except _WAIT_TIMEOUT_ERRORS:
+            if not _raised_by_the_job(job):
+                self._report_stall(job, timeout)
+            raise
+
+    # --- the work queue's account of itself (fleetless/fleetless#1238) ------
+
+    def _classify_stall(self, job: _WorkJob, timeout: float) -> Tuple[str, str]:
+        """Why a waiter gave up on `job`: one of four causes, each with the
+        evidence for it in one line.
+
+        - **H4**: the job finished within the timeout, and the waiter did
+          not see it.
+        - **H3**: a drain took it, and it was still running at the
+          timeout (or finished after it): the job is slow.
+        - **H2**: still queued behind a job a drain was running, or a drain
+          looked at the queue after its enqueue: head-of-line.
+        - **H1**: still queued, nothing running, and no drain looked at the
+          queue after its enqueue: the wake-up was lost. The age of the
+          newest subscription callback says whether the executor was serving
+          other callbacks all the while.
+
+        Read under `_work_lock`, so a drain cannot move between the
+        reads."""
+        with self._work_lock:
+            now = time.monotonic()
+            taken_at = job.taken_at
+            done_at = job.done_at
+            running = self._work_running
+            running_taken_at = running.taken_at if running is not None else None
+            looks_since = self._work_looks - job.looks_at_enqueue
+            queued = len(self._work_queue)
+            last_subscription_at = self._last_subscription_at
+        enqueued_at = job.enqueued_at
+        if done_at is not None and done_at - enqueued_at <= timeout:
+            return "H4", "done after {:.3f} s; the waiter did not see it".format(
+                done_at - enqueued_at
+            )
+        if taken_at is not None:
+            if done_at is None:
+                return "H3", "taken after {:.3f} s, running for {:.1f} s".format(
+                    taken_at - enqueued_at, now - taken_at
+                )
+            return "H3", "taken after {:.3f} s, done after {:.1f} s".format(
+                taken_at - enqueued_at, done_at - enqueued_at
+            )
+        if running is not None and running is not job:
+            return "H2", "behind {} running for {:.1f} s, {} jobs queued".format(
+                _work_kind(running.fn),
+                now - running_taken_at if running_taken_at is not None else 0.0,
+                queued,
+            )
+        if looks_since > 0:
+            return "H2", "a drain looked {} times since its enqueue, {} jobs queued".format(
+                looks_since, queued
+            )
+        if last_subscription_at is None:
+            callback = "no subscription callback yet"
+        else:
+            callback = "newest subscription callback {:.1f} s ago".format(
+                now - last_subscription_at
+            )
+        return "H1", "no drain since its enqueue, {} jobs queued, {}".format(queued, callback)
+
+    def _report_stall(self, job: _WorkJob, timeout: float) -> None:
+        """The WARNING line for one job whose waiter timed out, and its
+        count for the summary. Never raises: the caller is on its way to
+        raising the timeout, which is what it has to say."""
+        try:
+            kind = _work_kind(job.fn)
+            waited = time.monotonic() - job.enqueued_at
+            cause, reason = self._classify_stall(job, timeout)
+            with self._work_lock:
+                self._work_stalls[cause] += 1
+            log.warning("work queue: job %s waited %.1f s: %s (%s)", kind, waited, cause, reason)
+        except Exception:  # noqa: BLE001 - the measurement must never raise into a job
+            self._work_record_failed()
+
+    def _work_record_failed(self) -> None:
+        """A failure of the work queue's own bookkeeping: counted for the
+        summary, at ERROR once per process with the trace, then only
+        counted."""
+        with self._work_lock:
+            self._work_record_failures += 1
+            first = not self._work_record_error_logged
+            self._work_record_error_logged = True
+        if first:
+            log.error(
+                "work queue: a stall could not be recorded; it is counted in the hourly "
+                "summary from now on, not logged again",
+                exc_info=True,
+            )
+
+    def _log_work_summary(self) -> None:
+        """The hourly INFO line (`WORK_SUMMARY_INTERVAL_S`): the period's
+        triggers, drains (and how many found the queue empty), jobs taken,
+        the longest wait from enqueue to taken, and the stalls by cause.
+        Runs on the executor thread, from its own timer; the period starts
+        again after it."""
+        try:
+            with self._work_lock:
+                now = time.monotonic()
+                minutes = (now - self._work_period_started_at) / 60.0
+                line = (
+                    "work queue, last {:.0f} min: {} triggers, {} drains ({} empty), "
+                    "{} jobs taken, longest wait to be taken {:.3f} s, "
+                    "stalls H1 {}, H2 {}, H3 {}, H4 {}"
+                ).format(
+                    minutes, self._work_triggers, self._work_drains, self._work_drains_empty,
+                    self._work_jobs_taken, self._work_longest_wait,
+                    self._work_stalls["H1"], self._work_stalls["H2"],
+                    self._work_stalls["H3"], self._work_stalls["H4"],
+                )
+                if self._work_record_failures:
+                    line += ", {} recording failures".format(self._work_record_failures)
+                self._work_period_started_at = now
+                self._work_triggers = 0
+                self._work_drains = 0
+                self._work_drains_empty = 0
+                self._work_jobs_taken = 0
+                self._work_longest_wait = 0.0
+                self._work_stalls = {"H1": 0, "H2": 0, "H3": 0, "H4": 0}
+                self._work_record_failures = 0
+            log.info("%s", line)
+        except Exception:  # noqa: BLE001 - a summary that fails must not take the timer down
+            self._work_record_failed()
 
     # --- asyncio-facing API -------------------------------------------------
 
@@ -3383,6 +3651,9 @@ class RosRuntime:
     # --- sampling: runs on the executor thread, as a subscription callback -
 
     def _on_message(self, slug: str, msg) -> None:
+        # The executor is serving subscriptions: what a work-queue stall line
+        # holds against "the executor was stuck" (`_classify_stall`).
+        self._last_subscription_at = time.monotonic()
         # The capture instant, read before any conversion work — this is the
         # bridge capture time the wire protocol promises.
         timestamp_ms = sampling.capture_timestamp_ms()
