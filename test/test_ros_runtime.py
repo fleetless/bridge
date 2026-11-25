@@ -5228,7 +5228,12 @@ def test_removing_an_armed_publisher_fires_its_failsafe_before_teardown():
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) == 1, timeout=DELIVERY_TIMEOUT_S)
             await rt.apply_publishers(by_slug([]))  # removed well before the timeout would elapse
-            await asyncio.sleep(0.2)
+            # The parting failsafe reaches the witness through its own context
+            # and executor, so it lands when that thread runs, not within a
+            # fixed 0.2 s: on a busy runner it came later and the count below
+            # read 1 (fleetless/fleetless#1128). Waited for, bounded by how long
+            # the retiring handle waits for its acknowledgement.
+            wait_until(lambda: len(received) >= 2, timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S)
         finally:
             witness.stop()
         return received
