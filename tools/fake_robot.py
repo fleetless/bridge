@@ -332,7 +332,10 @@ def main() -> None:
         executor.shutdown()
         node.close_camera()
         node.destroy_node()
-        rclpy.shutdown()
+        # A SIGTERM (`docker stop`) is handled by rclpy itself, which shuts
+        # the context down before spin returns; a second shutdown raises.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
