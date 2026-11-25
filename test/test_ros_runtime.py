@@ -2070,10 +2070,17 @@ def test_a_cancel_on_an_action_whose_server_is_gone_answers_action_server_lost()
     """Gone is what the liveness check already holds: the server was seen
     unreachable (`liveness_since`) and the cancel service is not matched.
     Nothing can be sent, so the cloud hears why instead of waiting on
-    answers that cannot come."""
+    answers that cannot come.
+
+    The liveness check itself is held still. With no goal on the action it
+    resets `liveness_since` on every 10 ms watchdog tick, so a tick that
+    falls between the line that sets it and the cancel's turn on the
+    executor answered `error=None`: 6 runs of 21 on `main`, on a machine
+    with a load of 20 to 30."""
 
     async def body(rt):
         await rt.apply_actions(by_slug([_action_cfg("count", ros_name="/nobody_serves_this")]))
+        rt._check_action_server_liveness = lambda: None
         rt._actions["count"].liveness_since = time.monotonic()
         return await rt.cancel_job("count", None)
 
