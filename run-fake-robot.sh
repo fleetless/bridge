@@ -8,6 +8,8 @@
 #   ./run-fake-robot.sh
 #   FLEETLESS_VIDEO_DEVICE=/dev/video2 ./run-fake-robot.sh   # a different camera
 #   FLEETLESS_VIDEO_DEVICE=none ./run-fake-robot.sh          # no camera at all
+#   FLEETLESS_VIDEO_DEVICE=none FAKE_CAMERA_SOURCE=pattern ./run-fake-robot.sh
+#                                                     # no camera, a test picture
 #   FLEETLESS_FAKEROBOT_CONTAINER_NAME=fleetless-fakerobot-2 ./run-fake-robot.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -64,6 +66,15 @@ if [ -n "${ROS_DOMAIN_ID:-}" ]; then
     domain_flags=(-e "ROS_DOMAIN_ID=${ROS_DOMAIN_ID}")
 fi
 
+# FAKE_CAMERA_SOURCE: `pattern` makes fake_robot.py publish a generated test
+# picture on /image_raw instead of opening a device, for a host with no camera
+# that still needs frames. Passed through only when set, so the default stays
+# the real webcam.
+camera_flags=()
+if [ -n "${FAKE_CAMERA_SOURCE:-}" ]; then
+    camera_flags=(-e "FAKE_CAMERA_SOURCE=${FAKE_CAMERA_SOURCE}")
+fi
+
 # CONTAINER_NAME: see run-bridge.sh's own comment on
 # FLEETLESS_BRIDGE_CONTAINER_NAME for the incident this fixes — this script
 # used to pass no --name either, and it is exactly this container
@@ -75,6 +86,7 @@ CONTAINER_NAME="${FLEETLESS_FAKEROBOT_CONTAINER_NAME:-fleetless-fakerobot}"
 exec $DOCKER run --rm --name "$CONTAINER_NAME" "${tty_flags[@]}" --network host \
     -e FASTRTPS_DEFAULT_PROFILES_FILE=/dev-udp-only.xml \
     "${domain_flags[@]}" \
+    "${camera_flags[@]}" \
     "${device_flags[@]}" \
     -v "$PWD":/ws -v "$PWD/tools/dev-udp-only.xml":/dev-udp-only.xml \
     -w /ws "$IMAGE" \
