@@ -61,7 +61,7 @@ import ctypes
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import av
 import numpy as np
@@ -92,6 +92,12 @@ BITRATE_CHANGE_SHARE = 0.1
 #: needs longer is not a low-latency encoder, or is not encoding at all.
 FRAME_TIMEOUT_S = 1.0
 
+#: How long the plugins of a chain may take to load, the first time in a
+#: process. Loading one runs its `plugin_init`, which may read a slow disk or
+#: probe devices; that is not the device opening, so it has a bound of its own
+#: and the start's begins after it (`load_factories`).
+LOAD_TIMEOUT_S = 30.0
+
 #: How long a pipeline may take to start. Starting one opens the encoder
 #: device, and a driver call that does not return must not keep the thread
 #: that asked.
@@ -100,6 +106,11 @@ START_TIMEOUT_S = 5.0
 #: How long a pipeline may take to stop. One that takes longer has a thread
 #: inside an element that does not return; its chain is not built again.
 STOP_TIMEOUT_S = 2.0
+
+#: How long the side that waited in vain for a stop waits for the other side
+#: to finish writing it down (`HardwareH264Encoder._shut_down`): a write to
+#: the memory and a log line.
+_RECORDED_WAIT_S = 1.0
 
 #: Frames between two keyframes nobody asked for. Viewers ask when they need
 #: one, so this is the backstop, at libx264's own default.
@@ -437,6 +448,91 @@ def _load_gst() -> Tuple[Any, Any]:
         return _gst
 
 
+# --- the plugins of a chain, loaded before its start --------------------------------
+
+#: The chains whose plugins are in this process. Under `_gst_lock`.
+_loaded_chains: Set[Chain] = set()
+
+
+class _PluginLoad:
+    """One load of a chain's plugins, on its thread. `done` is set when the
+    thread is through; `error` is then what failed, or `None`.
+    `given_up_after` is the bound of the first caller whose wait ran out."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.error: Optional[str] = None
+        self.given_up_after: Optional[float] = None
+
+
+#: The loads still running, or given up and still running. Under `_gst_lock`.
+_loading: Dict[Chain, _PluginLoad] = {}
+
+
+def _load_plugins(Gst: Any, chain: Chain, load: _PluginLoad) -> None:
+    """Find and load every element a pipeline of `chain` is made of, on the
+    thread `load_factories` started for it."""
+    try:
+        for element in ("appsrc", "h264parse", "appsink") + chain.elements:
+            factory = Gst.ElementFactory.find(element)
+            if factory is None:
+                load.error = "GStreamer has no element {!r}".format(element)
+                return
+            if factory.load() is None:
+                load.error = "GStreamer could not load the plugin of {!r}".format(element)
+                return
+    except Exception as exc:  # noqa: BLE001 - reported by the thread that waits
+        load.error = _reason(exc)
+    finally:
+        with _gst_lock:
+            if _loading.get(chain) is load:
+                del _loading[chain]
+            if load.error is None:
+                _loaded_chains.add(chain)
+        load.done.set()
+
+
+def load_factories(chain: Chain) -> None:
+    """Load the plugins of every element of `chain` into this process, and
+    wait `LOAD_TIMEOUT_S` for it.
+
+    Creating an element loads its plugin the first time in a process, and
+    the plugin's `plugin_init` runs then: in the start, where it would count
+    against `START_TIMEOUT_S`, which is the device's. So the plugins are
+    loaded here first, in a thread of their own (`live-plugin-load`). Once
+    loaded, a chain is not loaded again; a caller who comes while a load runs
+    waits for that one.
+
+    Raises `ChainFailed` when an element is missing, a plugin does not load,
+    or the load does not come back in time. A load that did not come back is
+    not waited for again: every later call for the chain says so at once. If
+    it does return after all, the chain counts as loaded from then on."""
+    Gst, _ = _load_gst()
+    with _gst_lock:
+        if chain in _loaded_chains:
+            return
+        load = _loading.get(chain)
+        if load is None:
+            load = _loading[chain] = _PluginLoad()
+            threading.Thread(
+                target=_load_plugins, args=(Gst, chain, load), name="live-plugin-load", daemon=True
+            ).start()
+        given_up_after = load.given_up_after
+    if given_up_after is None:
+        timeout_s = LOAD_TIMEOUT_S
+        if not load.done.wait(timeout_s):
+            with _gst_lock:
+                if load.given_up_after is None:
+                    load.given_up_after = timeout_s
+                given_up_after = load.given_up_after
+    if given_up_after is not None and not load.done.is_set():
+        raise ChainFailed(
+            "the plugins of {} did not load within {:g} s".format(chain.name, given_up_after)
+        )
+    if load.error is not None:
+        raise ChainFailed(load.error)
+
+
 # --- a picture, laid out the way GStreamer reads it ----------------------------------
 
 
@@ -496,9 +592,14 @@ class Pipeline:
 
     Built and used from one thread at a time; `HardwareH264Encoder` holds a
     lock around every call. Raises `ChainFailed` from the constructor when
-    the chain cannot be built or does not start, and from `encode` when it
-    stops delivering.
+    the chain cannot be built or does not start, and from `encode` and
+    `set_bitrate` when it stops delivering or does not take a call within
+    `frame_timeout_s`.
     """
+
+    #: The plugins of a chain, loaded before a pipeline of it is started:
+    #: what `HardwareH264Encoder` asks its pipeline factory for.
+    load_factories = staticmethod(load_factories)
 
     def __init__(
         self,
@@ -526,9 +627,9 @@ class Pipeline:
         self._keyframes_asked = 0
         self._pipeline = None
 
-        for element in ("appsrc", "h264parse", "appsink") + chain.elements:
-            if Gst.ElementFactory.find(element) is None:
-                raise ChainFailed("GStreamer has no element {!r}".format(element))
+        # At once in the encoder's start, which has loaded them before; for
+        # whoever builds a pipeline by itself, this is where the plugins load.
+        load_factories(chain)
 
         launch = (
             "appsrc name=src ! {convert} ! {encoder} name=enc ! {caps} ! "
@@ -607,9 +708,35 @@ class Pipeline:
         self._Gst.util_set_object_arg(self._enc, name, value)
 
     def set_bitrate(self, bitrate_bps: int) -> None:
-        """Re-target the running encoder."""
+        """Re-target the running encoder, within `frame_timeout_s`."""
         self.bitrate_bps = bitrate_bps
-        self._set(*self.chain.bitrate)
+        self._control(lambda: self._set(*self.chain.bitrate), "a bitrate change")
+
+    def _control(self, call: Callable[[], None], what: str) -> None:
+        """`call`, a call into the running encoder element, in a thread of
+        its own (`live-pipeline-control`), waited `frame_timeout_s` as a
+        frame is. Raises what it raised, or `ChainFailed` when it did not
+        return in time. A call that does not return is left behind in that
+        daemon thread, inside the element: the encoder stopped answering,
+        and the pipeline is given up."""
+        returned = threading.Event()
+        outcome: Dict[str, BaseException] = {}
+
+        def run() -> None:
+            try:
+                call()
+            except BaseException as exc:  # noqa: BLE001 - raised again by the thread that waits
+                outcome["error"] = exc
+            finally:
+                returned.set()
+
+        threading.Thread(target=run, name="live-pipeline-control", daemon=True).start()
+        if not returned.wait(self._frame_timeout_s):
+            raise ChainFailed(
+                "the encoder did not take {} within {:g} s".format(what, self._frame_timeout_s)
+            )
+        if "error" in outcome:
+            raise outcome["error"]
 
     def _ask_for_keyframe(self) -> None:
         if self.chain.keyframe == "event":
@@ -636,7 +763,7 @@ class Pipeline:
         buffer.pts = self._pts_ns(frame)
         buffer.duration = self._frame_ns
         if force_keyframe:
-            self._ask_for_keyframe()
+            self._control(self._ask_for_keyframe, "a keyframe request")
         flow = self._src.emit("push-buffer", buffer)
         if flow != Gst.FlowReturn.OK:
             raise ChainFailed(
@@ -868,17 +995,21 @@ class HardwareH264Encoder(H264Encoder):
     did not encode the picture is not tried again for pictures of that
     size.
 
-    **A pipeline is started and stopped in threads of its own.** Both are
-    calls into the encoder element's driver, and one that does not return is
-    the failure the time limit of a frame exists for. aiortc calls this
-    class on a worker of the event loop's default executor, which the name
-    resolution of every reconnect, the bridge's ROS calls and every other
-    camera's encoder share: a worker lost at every live start is a bridge
-    that stops answering. So a start is waited for `START_TIMEOUT_S` and a
-    stop is not waited for at all where a frame is due; whatever does not
-    come back is left behind in a daemon thread, and its chain is not built
-    again. What failed is recorded before the pipeline is closed, never
-    after.
+    **A pipeline is started and stopped in threads of its own**, and so are
+    the load of its plugins, a keyframe request and a bitrate change. All of
+    them are calls into the encoder element or its driver, and one that does
+    not return is the failure the time limit of a frame exists for. aiortc
+    calls this class on a worker of the event loop's default executor, which
+    the name resolution of every reconnect, the bridge's ROS calls and every
+    other camera's encoder share: a worker lost at every live start is a
+    bridge that stops answering. So the load of a chain's plugins is waited
+    for `LOAD_TIMEOUT_S`, once per process; a start `START_TIMEOUT_S`; a
+    keyframe request or a bitrate change `frame_timeout_s`, as a frame is;
+    and a stop is not waited for at all where a frame is due. Whatever does
+    not come back is left behind in a daemon thread: a chain whose load or
+    start did not is not built again, and a session whose keyframe request
+    or bitrate change did not goes on in software. What failed is recorded
+    before the pipeline is closed, never after.
 
     **The fallback is the same object.** The offer said H.264 and the
     sender holds this encoder; when no chain works, or the one in use
@@ -913,6 +1044,13 @@ class HardwareH264Encoder(H264Encoder):
         self._memory = memory if memory is not None else MEMORY
         self._frame_timeout_s = frame_timeout_s
         self._pipeline_factory = pipeline_factory
+        # The plugins of a chain are loaded before its start, by the factory
+        # that knows what its pipelines are made of: `Pipeline` does. A
+        # factory without it builds pipelines that load nothing, as the
+        # suite's stand-ins for the hardware do.
+        self._load_factories: Optional[Callable[[Chain], None]] = getattr(
+            pipeline_factory, "load_factories", None
+        )
         self._lock = threading.Lock()
         self._bitrate_bps = DEFAULT_BITRATE_BPS
         self._pipeline: Optional[Pipeline] = None
@@ -1052,8 +1190,13 @@ class HardwareH264Encoder(H264Encoder):
             try:
                 # On this thread and without a bound: the first time, this
                 # is GStreamer scanning its plugins, which takes what it
-                # takes and is no device. The bound is for the pipeline.
+                # takes and is no device.
                 _load_gst()
+                # Then the plugins of this chain, bounded by `LOAD_TIMEOUT_S`;
+                # then the pipeline, bounded by `START_TIMEOUT_S`, which is
+                # left to the device.
+                if self._load_factories is not None:
+                    self._load_factories(chain)
                 pipeline = self._start(chain, frame)
             except GstUnavailable as unavailable:
                 # Not this chain's failure: none of them can be built.
@@ -1189,22 +1332,31 @@ class HardwareH264Encoder(H264Encoder):
         its probe: every further start would leave another thread there.
         That is recorded and said once, at WARNING, by whoever's wait runs
         out first: the watcher here, or a caller that waited itself and is
-        about to probe. What goes wrong in a close that does return is
-        logged by type name and goes no further.
+        about to probe. The other one waits until that is written, so a
+        caller about to probe reads it, whichever of the two came first.
+        What goes wrong in a close that does return is logged by type name
+        and goes no further.
         """
         closed = threading.Event()
         once = threading.Lock()
+        recorded = threading.Event()
         chain, memory, backend = pipeline.chain, self._memory, self._backend
 
         def overdue() -> None:
             if not once.acquire(blocking=False):
+                # The other side is writing it: whoever goes on from here
+                # reads the memory after that, not before.
+                recorded.wait(_RECORDED_WAIT_S)
                 return
-            memory.did_not_shut_down(chain, STOP_TIMEOUT_S)
-            log.warning(
-                "live.encoder=%s: %s. A thread of its pipeline is left behind, and the "
-                "chain is not built again until live.encoder changes or the bridge restarts.",
-                backend, did_not_shut_down(chain, STOP_TIMEOUT_S),
-            )
+            try:
+                memory.did_not_shut_down(chain, STOP_TIMEOUT_S)
+                log.warning(
+                    "live.encoder=%s: %s. A thread of its pipeline is left behind, and the "
+                    "chain is not built again until live.encoder changes or the bridge restarts.",
+                    backend, did_not_shut_down(chain, STOP_TIMEOUT_S),
+                )
+            finally:
+                recorded.set()
 
         def close() -> None:
             try:
@@ -1231,7 +1383,7 @@ class HardwareH264Encoder(H264Encoder):
         and starts a moment later, so whoever goes on to probe after this
         would read the memory before the watcher had written it, and build
         the chain again. Whichever of the two is first records it and logs
-        the one WARNING; the other finds it done."""
+        the one WARNING; the other waits until that is done."""
         closed, overdue = self._shut_down(pipeline)
         if closed.wait(STOP_TIMEOUT_S):
             return True
@@ -1241,9 +1393,10 @@ class HardwareH264Encoder(H264Encoder):
     def close(self) -> None:
         """Release the pipeline and the codec. Called once by the publisher,
         in a thread of its own; waits for a frame that is still being
-        encoded, which is at most `START_TIMEOUT_S` and `frame_timeout_s`
-        for each chain a probe still has to try, and then `STOP_TIMEOUT_S`
-        for the pipeline to stop. After it, `encode()` returns nothing."""
+        encoded, which is at most `LOAD_TIMEOUT_S`, `START_TIMEOUT_S` and
+        twice `frame_timeout_s` (a keyframe request, then the frame) for
+        each chain a probe still has to try, and then `STOP_TIMEOUT_S` for
+        the pipeline to stop. After it, `encode()` returns nothing."""
         with self._lock:
             self._closed = True
             pipeline, self._pipeline = self._pipeline, None

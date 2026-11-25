@@ -1076,6 +1076,257 @@ def test_wedged_encoders_do_not_use_up_the_executor_or_hold_the_process_at_exit(
     assert took < 60.0
 
 
+# --- the plugins of a chain, loaded before its start --------------------------------
+#
+# Creating an element loads its plugin's shared object the first time in a
+# process, and the plugin's own `plugin_init` runs then: on a slow disk, or in
+# a plugin that probes devices, that can take longer than a device takes to
+# open. It is a step of its own, bounded by itself, so the start's bound
+# measures the device and nothing else.
+#
+# The suite's stand-in loads in no time, so the lookup of an element's factory
+# stands in for the load here: it is the first thing the bridge asks of an
+# element, before and inside the start alike.
+
+
+@pytest.fixture
+def no_plugins_loaded_yet(monkeypatch):
+    """A process that has loaded no chain's plugins: what the encoder
+    remembers about loads is put aside for the test and given back after."""
+    monkeypatch.setattr(live_encoder, "_loaded_chains", set(), raising=False)
+    monkeypatch.setattr(live_encoder, "_loading", {}, raising=False)
+
+
+def _slow_lookup(monkeypatch, element, hold):
+    """Wrap `Gst.ElementFactory.find` so the first lookup of `element` calls
+    `hold()` before it answers. Returns the names of the threads it was
+    held on."""
+    Gst, _ = live_encoder._load_gst()
+    real = Gst.ElementFactory.find
+    held_on = []
+
+    def find(name):
+        if name == element and not held_on:
+            held_on.append(threading.current_thread().name)
+            hold()
+        return real(name)
+
+    monkeypatch.setattr(Gst.ElementFactory, "find", staticmethod(find))
+    return held_on
+
+
+def test_a_plugin_that_loads_slowly_costs_its_own_bound_and_not_the_start_s(
+    short_bounds, no_plugins_loaded_yet, monkeypatch, logged
+):
+    monkeypatch.setattr(live_encoder, "LOAD_TIMEOUT_S", 2.0, raising=False)
+    # Longer than the start may take (0.4 s), well inside the load's own bound.
+    held_on = _slow_lookup(monkeypatch, STAND_IN.encoder, lambda: time.sleep(0.6))
+    encoder = _stand_in(pipeline_factory=Pipeline)
+    try:
+        payloads, _ = encoder.encode(moving_frame(0), False)
+        assert payloads
+        assert encoder.chain is STAND_IN and not encoder.software, logged.at(logging.WARNING)
+        assert held_on == ["live-plugin-load"]
+        assert logged.at(logging.WARNING) == []
+    finally:
+        encoder.close()
+
+
+def test_a_plugin_that_never_loads_is_a_chain_that_cannot_be_built_after_its_bound_once(
+    short_bounds, no_plugins_loaded_yet, monkeypatch, logged
+):
+    monkeypatch.setattr(live_encoder, "LOAD_TIMEOUT_S", 0.3, raising=False)
+    stuck = _variant(
+        name="stand-in/stuck",
+        elements=("videoconvert", "identity", "x264enc"),
+        convert="videoconvert ! identity",
+    )
+    release = threading.Event()
+    _slow_lookup(monkeypatch, "identity", lambda: release.wait(300))
+    said = "stand-in/stuck cannot be built: the plugins of stand-in/stuck did not load within 0.3 s"
+    memory = ChainMemory()
+    encoder = _stand_in(chains=(stuck, STAND_IN), pipeline_factory=Pipeline, memory=memory)
+    again = _stand_in(chains=(stuck,), pipeline_factory=Pipeline, memory=ChainMemory())
+    try:
+        began = time.monotonic()
+        payloads, _ = encoder.encode(moving_frame(0), False)
+        took = time.monotonic() - began
+        # The next chain carries the session.
+        assert payloads and encoder.chain is STAND_IN and not encoder.software
+        assert 0.3 <= took < 2.0
+        assert memory.candidates((stuck,), (1024, 768)) == ([], {stuck.name: said})
+
+        # A camera that learned nothing yet, or a start after live.encoder
+        # changed: the load that never came back is not waited for again.
+        began = time.monotonic()
+        payloads, _ = again.encode(moving_frame(0), False)
+        assert payloads and again.software
+        assert time.monotonic() - began < 0.25
+        assert said in logged.at(logging.WARNING)[-1]
+    finally:
+        release.set()
+        encoder.close()
+        again.close()
+
+
+# --- a keyframe request or a bitrate change that does not return -----------------
+#
+# Both are calls into the encoder element while it runs, on the thread that
+# encodes. One that hangs in a driver is the encoder that stopped answering:
+# one late frame, and the rest of the session in software.
+
+
+class _HeldCall:
+    """A pipeline factory over the real `Pipeline` whose pipelines, once
+    `armed` is set, hold one kind of call inside GStreamer until `release`
+    is set: `keyframe`, the force-key-unit event on its way up to the
+    encoder, or `bitrate`, the encoder's bitrate property being set."""
+
+    def __init__(self, call):
+        self.call = call
+        self.armed = threading.Event()
+        self.release = threading.Event()
+        self.held = threading.Event()
+        self.built = []
+
+    def __call__(self, chain, **kwargs):
+        pipeline = Pipeline(chain, **kwargs)
+        Gst = pipeline._Gst
+        if self.call == "keyframe":
+            def hold_the_event(pad, info):
+                event = info.get_event()
+                if self.armed.is_set() and event is not None and event.type == Gst.EventType.CUSTOM_UPSTREAM:
+                    self._hold()
+                return Gst.PadProbeReturn.OK
+
+            pipeline._enc.get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_UPSTREAM, hold_the_event)
+        else:
+            pipeline._enc.connect("notify::bitrate", lambda *_: self.armed.is_set() and self._hold())
+        self.built.append(pipeline)
+        return pipeline
+
+    def _hold(self):
+        self.held.set()
+        self.release.wait(300)
+
+
+def _on_a_thread_of_its_own(call, seconds):
+    """`call()` on a thread of the test's, waited `seconds`: `(returned,
+    what it returned)`. A call that does not return in time is left
+    running."""
+    outcome = []
+    thread = threading.Thread(target=lambda: outcome.append(call()), daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return (not thread.is_alive()), (outcome[0] if outcome else None)
+
+
+@pytest.mark.parametrize(
+    "call, what",
+    [("keyframe", "a keyframe request"), ("bitrate", "a bitrate change")],
+)
+def test_a_control_call_that_does_not_return_costs_one_late_frame(call, what, logged):
+    held = _HeldCall(call)
+    memory = ChainMemory()
+    encoder = _stand_in(pipeline_factory=held, memory=memory, frame_timeout_s=0.3)
+    try:
+        for index in range(3):
+            assert encoder.encode(moving_frame(index), False)[0]
+        held.armed.set()
+        if call == "bitrate":
+            encoder.target_bitrate = 2 * held.built[0].bitrate_bps
+        began = time.monotonic()
+        returned, result = _on_a_thread_of_its_own(
+            lambda: encoder.encode(moving_frame(3), call == "keyframe"), 0.3 + 1.5
+        )
+        took = time.monotonic() - began
+        assert held.held.is_set()
+        assert returned, "the frame is still inside the " + call + " call"
+        payloads, _ = result
+        assert payloads and encoder.software
+        assert 0.3 <= took < 1.8
+        assert {NAL_SPS, NAL_PPS, NAL_IDR} <= set(encoder.calls[3][1])
+        assert logged.at(logging.WARNING) == [
+            "live.encoder=nvenc: stand-in/x264 stopped working (the encoder did not take "
+            + what + " within 0.3 s). The rest of this session is encoded in software H.264."
+        ]
+        # And the stream goes on, in software.
+        assert encoder.encode(moving_frame(4), False)[0]
+        assert _decodes(encoder.units[3:]) == [1, 1]
+    finally:
+        held.release.set()
+        encoder.close()
+    assert _soon(lambda: held.built[0].final_state == "null")
+
+
+# --- the stop's watcher and the side that waited ---------------------------------
+
+
+class _SlowToWrite(ChainMemory):
+    """A memory whose record of a pipeline that did not shut down takes a
+    while to be written: up to half a second, or until the next probe has
+    read the memory, whichever comes first. What each probe read is kept."""
+
+    def __init__(self):
+        super().__init__()
+        self.writing = threading.Event()
+        self.read = threading.Event()
+        self.what_the_probes_read = []
+
+    def did_not_shut_down(self, chain, seconds):
+        self.writing.set()
+        self.read.wait(0.5)
+        super().did_not_shut_down(chain, seconds)
+
+    def candidates(self, chains, size):
+        found = super().candidates(chains, size)
+        self.what_the_probes_read.append((size, found))
+        self.read.set()
+        return found
+
+
+class _LosesToTheWatcher(_Recording):
+    """The encoder, with the side that waits for a stop always second: it
+    gives up on the pipeline only once the watcher is inside the write."""
+
+    def _shut_down(self, pipeline):
+        closed, overdue = super()._shut_down(pipeline)
+
+        def after_the_watcher():
+            assert self._memory.writing.wait(5)
+            overdue()
+
+        return closed, after_the_watcher
+
+
+def test_the_side_that_lost_the_race_to_the_watcher_probes_with_what_the_watcher_recorded(
+    short_bounds, logged
+):
+    wedge = _Wedge(good=2)
+    memory = _SlowToWrite()
+    encoder = _stand_in(cls=_LosesToTheWatcher, pipeline_factory=wedge, memory=memory,
+                        frame_timeout_s=1.0)
+    try:
+        assert encoder.encode(moving_frame(0), False)[0]
+        assert encoder.encode(moving_frame(1), False)[0]
+        # A third buffer is held inside the element, and nobody waits for it.
+        first = wedge.built[0]
+        first._src.emit("push-buffer", first._Gst.Buffer.new_wrapped(b"\0" * 115200))
+        assert _soon(lambda: wedge.seen == 3)
+        memory.read.clear()
+
+        payloads, _ = encoder.encode(moving_frame(2, width=160, height=120), False)
+        assert payloads and encoder.software
+        said = "stand-in/x264 did not shut down within 0.4 s"
+        assert memory.what_the_probes_read[-1] == ((160, 120), ([], {STAND_IN.name: said}))
+        assert len(wedge.built) == 1
+        assert len(_left_behind(logged)) == 1
+    finally:
+        wedge.release.set()
+        encoder.close()
+    assert _soon(lambda: wedge.built[0].final_state == "null")
+
+
 def test_when_software_cannot_encode_either_the_frame_is_dropped_and_the_next_one_is_a_keyframe(
     monkeypatch, logged
 ):

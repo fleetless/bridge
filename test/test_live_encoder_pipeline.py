@@ -420,6 +420,30 @@ def test_a_chain_whose_element_is_missing_says_which():
         assert failed.value.reason.split("'")[1] in chain.elements, chain.name
 
 
+def test_the_plugins_of_a_chain_are_loaded_once_per_process(monkeypatch):
+    """The load runs once, and a pipeline of a loaded chain loads nothing:
+    the start's bound is left to the device."""
+    monkeypatch.setattr(live_encoder, "_loaded_chains", set())
+    monkeypatch.setattr(live_encoder, "_loading", {})
+    loads = []
+    real = live_encoder._load_plugins
+
+    def counted(Gst, chain, load):
+        loads.append(chain.name)
+        real(Gst, chain, load)
+
+    monkeypatch.setattr(live_encoder, "_load_plugins", counted)
+    live_encoder.load_factories(STAND_IN)
+    live_encoder.load_factories(STAND_IN)
+    _pipeline().close()
+    assert loads == [STAND_IN.name]
+    # A missing element is not remembered as loaded: asked again, it says so again.
+    for _ in range(2):
+        with pytest.raises(ChainFailed, match="GStreamer has no element 'nvvidconv'"):
+            live_encoder.load_factories(CHAINS["nvenc"][0])
+    assert loads == [STAND_IN.name, "nvenc/jetson", "nvenc/jetson"]
+
+
 def test_a_chain_that_cannot_be_put_together_fails_at_construction():
     with pytest.raises(ChainFailed) as failed:
         _pipeline(_variant(caps="video/x-h264 ! nonsense-property-here=1 !"))
