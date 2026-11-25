@@ -450,6 +450,9 @@ def _load_gst() -> Tuple[Any, Any]:
 
 # --- the plugins of a chain, loaded before its start --------------------------------
 
+#: The elements of every pipeline, besides those of its chain.
+_PIPELINE_ELEMENTS = ("appsrc", "capsfilter", "h264parse", "appsink")
+
 #: The chains whose plugins are in this process. Under `_gst_lock`.
 _loaded_chains: Set[Chain] = set()
 
@@ -471,9 +474,10 @@ _loading: Dict[Chain, _PluginLoad] = {}
 
 def _load_plugins(Gst: Any, chain: Chain, load: _PluginLoad) -> None:
     """Find and load every element a pipeline of `chain` is made of, on the
-    thread `load_factories` started for it."""
+    thread `load_factories` started for it. `capsfilter` is one of them:
+    `parse_launch` makes one of every caps in the description."""
     try:
-        for element in ("appsrc", "h264parse", "appsink") + chain.elements:
+        for element in _PIPELINE_ELEMENTS + chain.elements:
             factory = Gst.ElementFactory.find(element)
             if factory is None:
                 load.error = "GStreamer has no element {!r}".format(element)
@@ -485,7 +489,11 @@ def _load_plugins(Gst: Any, chain: Chain, load: _PluginLoad) -> None:
         load.error = _reason(exc)
     finally:
         with _gst_lock:
-            if _loading.get(chain) is load:
+            # A load nobody waited for to the end stays, with what it found:
+            # a later call answers from it at once.
+            if _loading.get(chain) is load and (
+                load.error is None or load.given_up_after is None
+            ):
                 del _loading[chain]
             if load.error is None:
                 _loaded_chains.add(chain)
@@ -506,17 +514,19 @@ def load_factories(chain: Chain) -> None:
     Raises `ChainFailed` when an element is missing, a plugin does not load,
     or the load does not come back in time. A load that did not come back is
     not waited for again: every later call for the chain says so at once. If
-    it does return after all, the chain counts as loaded from then on."""
+    it does return after all, the chain counts as loaded from then on, or
+    every later call says at once why it did not load."""
     Gst, _ = _load_gst()
     with _gst_lock:
         if chain in _loaded_chains:
             return
         load = _loading.get(chain)
         if load is None:
-            load = _loading[chain] = _PluginLoad()
+            load = _PluginLoad()
             threading.Thread(
                 target=_load_plugins, args=(Gst, chain, load), name="live-plugin-load", daemon=True
             ).start()
+            _loading[chain] = load
         given_up_after = load.given_up_after
     if given_up_after is None:
         timeout_s = LOAD_TIMEOUT_S
@@ -1376,7 +1386,8 @@ class HardwareH264Encoder(H264Encoder):
 
     def _stopped(self, pipeline: Pipeline) -> bool:
         """Shut a pipeline down and wait `STOP_TIMEOUT_S` for it: whether it
-        stopped.
+        stopped. One that did not costs up to `_RECORDED_WAIT_S` more, while
+        the watcher finishes writing it down.
 
         One that did not is recorded here, by the side that waited, and not
         left to the watcher in `_shut_down`. The watcher waits the same time
@@ -1393,10 +1404,13 @@ class HardwareH264Encoder(H264Encoder):
     def close(self) -> None:
         """Release the pipeline and the codec. Called once by the publisher,
         in a thread of its own; waits for a frame that is still being
-        encoded, which is at most `LOAD_TIMEOUT_S`, `START_TIMEOUT_S` and
-        twice `frame_timeout_s` (a keyframe request, then the frame) for
-        each chain a probe still has to try, and then `STOP_TIMEOUT_S` for
-        the pipeline to stop. After it, `encode()` returns nothing."""
+        encoded, and then for the pipeline to stop (`_stopped`). A frame
+        that runs takes at most three times `frame_timeout_s`: a bitrate
+        change, a keyframe request and the frame. A frame that probes
+        takes, for each chain it still has to try, at most `LOAD_TIMEOUT_S`,
+        `START_TIMEOUT_S` and twice `frame_timeout_s`, after the stop of a
+        pipeline of another picture size. After it, `encode()` returns
+        nothing."""
         with self._lock:
             self._closed = True
             pipeline, self._pipeline = self._pipeline, None

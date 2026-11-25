@@ -1159,14 +1159,50 @@ def test_a_plugin_that_never_loads_is_a_chain_that_cannot_be_built_after_its_bou
         # A camera that learned nothing yet, or a start after live.encoder
         # changed: the load that never came back is not waited for again.
         began = time.monotonic()
+        with pytest.raises(ChainFailed) as failed:
+            live_encoder.load_factories(stuck)
+        assert time.monotonic() - began < 0.1
+        assert failed.value.reason == "the plugins of stand-in/stuck did not load within 0.3 s"
         payloads, _ = again.encode(moving_frame(0), False)
         assert payloads and again.software
-        assert time.monotonic() - began < 0.25
         assert said in logged.at(logging.WARNING)[-1]
     finally:
         release.set()
         encoder.close()
         again.close()
+
+
+def test_a_load_given_up_on_that_fails_later_is_answered_from_what_it_found(
+    no_plugins_loaded_yet, monkeypatch
+):
+    """Not waited for again either: after it comes back, every call says why
+    at once, and none starts another load."""
+    monkeypatch.setattr(live_encoder, "LOAD_TIMEOUT_S", 0.2, raising=False)
+    late = _variant(
+        name="stand-in/late",
+        elements=("videoconvert", "identity", "nosuchelement1147"),
+        convert="videoconvert ! identity",
+    )
+    release = threading.Event()
+    _slow_lookup(monkeypatch, "identity", lambda: release.wait(300))
+    started = []
+    real = live_encoder._load_plugins
+    monkeypatch.setattr(
+        live_encoder, "_load_plugins", lambda *args: (started.append(1), real(*args))
+    )
+    try:
+        with pytest.raises(ChainFailed, match="did not load within 0.2 s"):
+            live_encoder.load_factories(late)
+    finally:
+        release.set()
+    assert _soon(lambda: live_encoder._loading[late].done.is_set())
+    for _ in range(2):
+        began = time.monotonic()
+        with pytest.raises(ChainFailed) as failed:
+            live_encoder.load_factories(late)
+        assert time.monotonic() - began < 0.1
+        assert failed.value.reason == "GStreamer has no element 'nosuchelement1147'"
+    assert started == [1]
 
 
 # --- a keyframe request or a bitrate change that does not return -----------------
