@@ -65,3 +65,11 @@ def test_fake_robot_reads_the_source_from_the_pattern_module():
     source = (ROOT / "tools" / "fake_robot.py").read_text()
     assert "from camera_pattern import camera_source, pattern_frame" in source
     assert 'CAMERA_SOURCE = camera_source(os.environ.get("FAKE_CAMERA_SOURCE"))' in source
+
+
+def test_fake_robot_shuts_ros_down_only_when_rclpy_has_not_already():
+    # `docker stop` sends SIGTERM; rclpy's own handler shuts the context down,
+    # and an unconditional second shutdown ended every stop in a traceback.
+    source = (ROOT / "tools" / "fake_robot.py").read_text()
+    assert "        if rclpy.ok():\n            rclpy.shutdown()\n" in source
+    assert "        node.destroy_node()\n        rclpy.shutdown()\n" not in source
