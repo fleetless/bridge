@@ -1,10 +1,10 @@
 # Vendored contract schemas
 
-`schema/` holds copies of the JSON Schema artifacts for the twenty-eight wire
+`schema/` holds copies of the JSON Schema artifacts for the twenty-nine wire
 messages the bridge speaks: the handshake (hello, hello_ok, hello_error,
 ping, pong), configuration and introspection (config, config_applied,
 introspect_request, introspect, type_request, type_definitions), telemetry
-(datapoint), link state (link_mode), jobs (invoke, cancel, cancel_result,
+(datapoint, datapoint_dropped), link state (link_mode), jobs (invoke, cancel, cancel_result,
 publish, job_update, job_lost, job_query, job_status), cameras (snapshot
 [binary frame header], camera_start, camera_stop, camera_state) and assets
 (assets_available, asset_request, asset_progress).
@@ -14,9 +14,10 @@ reported on; `link_mode` took its place in the count, which is a
 coincidence of arithmetic and not a replacement — the two say different
 things. `job_query`/`job_status` (protocol 5) are the pair added so the
 cloud can ask about a specific job while connected instead of guessing;
-`cancel_result` is the newest, the bridge's answer to a `cancel` with each
-goal's `CancelGoal` return code, correlated by the `request_id` `cancel`
-now carries.
+`cancel_result` is the bridge's answer to a `cancel` with each goal's
+`CancelGoal` return code, correlated by the `request_id` `cancel` now
+carries. `datapoint_dropped` is the newest: the report of a datapoint value
+the bridge did not send because its frame was over `BRIDGE_FRAME_MAX_BYTES`.
 
 The count and the list are both here on purpose, and they have to agree: the
 list said twenty-four and named twenty-four while twenty-five files sat in the
@@ -54,6 +55,11 @@ bridge sends. `protocol.py` reads both. The ROS parameter is declared with the
 default and refused outside the bounds, which are the two numbers the cloud
 refuses a published document by.
 
+Since 18.2.0 it carries `BRIDGE_FRAME_MAX_BYTES`, the largest text frame the
+bridge sends (1.5 MiB against the cloud's 2 MiB socket limit). `protocol.py`
+reads it; every frame that can grow past it is shaped to fit, and the writer
+refuses the rest.
+
 Since 1.3.0 it also carries the **protocol version window**:
 `PROTOCOL_VERSION`, `PROTOCOL_VERSIONS` (which bridge version first spoke
 each protocol version, and when that version was deprecated),
@@ -83,7 +89,7 @@ embeds the whole `robot-config-doc` tree (and everything nested under it,
 `bridge-type-definitions` embed the graph/field-tree shapes.
 
 **`schema-outgoing/` is a second copy of exactly
-fifteen of the twenty-eight — the ones `protocol.py` sends, never
+sixteen of the twenty-nine — the ones `protocol.py` sends, never
 receives — in zod's *output* mode instead of `schema/`'s input mode.**
 Input mode is the right description of the wire contract (a `.default()`ed
 field reads optional, matching the real cloud's own lenient `zod.parse()`),
@@ -94,24 +100,26 @@ required and keeps `additionalProperties: false`, so `schemas.py`'s
 `validate_frame` checks an outgoing frame (`OUTGOING_FRAME_NAMES`) against
 this stricter copy by default, catching a missing or misspelled field here
 instead of letting it reach the cloud's own parser, which would just
-silently drop it. `schema/`'s copies of the same fifteen stay in service
+silently drop it. `schema/`'s copies of the same sixteen stay in service
 too, for the rarer test that deliberately proves what the *contract*
 tolerates rather than what this bridge's own serializer produces
 (`strict=False`).
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@15.4.0
+    Source: @fleetless/contracts@18.2.0-next.2
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-Diffed file by file against the copies the previous pin (15.3.0) carried; one
-vendored file changed, in descriptions only. `schema/cloud-config.schema.json`:
-the descriptions of a camera's `width` and `height` and of `live.encoder` say
-that with any `live.encoder` but `software` the size must be even, and the
-description of `vaapi` names `vah264enc`, `vah264lpenc` and `vaapih264enc` in
-that order. The rule itself is a refinement on the document and is not in the
-JSON Schema, so no shape the bridge validates against changed. `constants.json`
-and every other vendored schema are byte-identical.
+A prerelease, pinned while the contracts change of fleetless/fleetless#1222 is
+unreleased; the release replaces this line. Diffed file by file against the
+copies the previous pin (15.4.0) carried. New: `bridge-datapoint-dropped` in
+both directories. Changed, in both directories: `bridge-job-update` and
+`bridge-job-status` (an optional `result_omitted` on the frame and on each
+entry: `reason` `too_large`, `bytes`, `limit_bytes`) and `bridge-introspect`
+(an optional `graph.omitted`: `topics`, `services`, `actions`).
+`constants.json` gains `BRIDGE_FRAME_MAX_BYTES`. Every other vendored file is
+byte-identical; nothing that moved between 15.4.0 and 18.1.0 touched a file
+the bridge vendors.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a

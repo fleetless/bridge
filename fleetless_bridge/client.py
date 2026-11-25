@@ -61,9 +61,10 @@ import concurrent.futures
 import enum
 import logging
 import random
+import re
 import time
-from collections import deque
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
+from collections import OrderedDict, deque
+from typing import Any, Awaitable, Callable, Collection, Deque, Dict, List, Optional, Tuple
 
 import aiohttp
 
@@ -81,11 +82,13 @@ from fleetless_bridge.protocol import (
     APPLY_ERROR_KIND_LOW_BANDWIDTH,
     APPLY_ERROR_KIND_PUBLISHER,
     APPLY_ERROR_KIND_SERVICE,
+    BRIDGE_FRAME_MAX_BYTES,
     CLOSE_CODE_ROBOT_DELETED,
     CLOSE_CODE_SUPERSEDED,
     CLOSE_CODE_TOKEN_ROTATED,
     PROTOCOL_VERSION,
     VERSION_REFUSED_CODE,
+    RosSource,
     ApplyError,
     CancelResultEntry,
     CloudAssetRequest,
@@ -107,11 +110,14 @@ from fleetless_bridge.protocol import (
     bridge_camera_state_message,
     cancel_result_message,
     config_applied_message,
+    JobFrameShrink,
+    datapoint_dropped_message,
     datapoint_message,
+    fit_introspect_message,
+    fit_job_status,
+    fit_job_update,
+    frame_bytes,
     hello_message,
-    introspect_message,
-    job_status_message,
-    job_update_message,
     link_mode_message,
     parse_cloud_message,
     pong_message,
@@ -238,9 +244,26 @@ _PULL_TIMEOUT_ERRORS = (
 # `buffer.max_values`, already enforced drop-oldest per slug.
 _TIER_SESSION = 0     # pong, hello
 _TIER_OUTCOME = 1     # config_applied, job_update
-_TIER_TELEMETRY = 2   # datapoint (live), camera_state
+_TIER_TELEMETRY = 2   # datapoint (live), datapoint_dropped, camera_state
 _TIER_TOOLING = 3     # introspect, type_definitions, assets_available, asset_progress
 _TIER_BACKFILL = 4    # datapoint (backfill)
+
+# How often one slug may log a dropped value, and how often it may report one
+# (`datapoint_dropped`): a whole map at 10 Hz is ten drops a second, and the
+# fact they share does not change between the second and the sixtieth. The
+# same window bounds the "feedback did not fit" warning of a job frame.
+FRAME_DROP_WINDOW_S = 60.0
+
+# How many job ids `_JobFrameLog` remembers having logged an omitted result
+# for, so a job queried again does not log again. A bound, not a window: the
+# fact is per job and final, and a long-running bridge must not keep every
+# id it ever omitted a result for.
+_OMITTED_RESULT_IDS_MAX = 1024
+
+# The `type` of a frame this bridge built, for the writer guard's log line.
+# `json.dumps` writes keys in insertion order and every builder in
+# `protocol.py` puts `type` first, so the head of the payload is enough.
+_FRAME_TYPE_RE = re.compile(r'^\{"type": "([a-z_]+)"')
 
 # How often the low-bandwidth controller is asked to decide. Its timers
 # advance only inside `evaluate`, so this is the resolution of `enter_after_s`
@@ -546,7 +569,15 @@ class PrioritizedWriter:
     `max_occupancy_s` at the current rate is sent anyway, with a `log.warning`
     naming the bytes, the rate and the projected seconds — refusing it would
     break introspection on exactly the slow links this design exists for —
-    a large `type_definitions` reply is the case. Tier 5 is the only tier
+    a large `type_definitions` reply is the case.
+
+    **Must-deliver is about occupancy, not size.** A text payload over
+    `BRIDGE_FRAME_MAX_BYTES` is not sent at all (`_send`): the cloud would
+    close the socket with 1009, and the reconnect would produce the same
+    frame. The three frames that can grow that large on their own —
+    datapoints, job frames, the graph — are shaped before they get here; the
+    guard is the last line for the rest (`type_definitions`, until the cloud
+    batches its requests). Tier 5 is the only tier
     ever shaped to fit: `snapshot_source` is trusted to respect what
     `snapshot_max_bytes()` told it, and nothing here adds a second gate on
     the bytes it returns: two policies for one decision, and the newer one
@@ -880,7 +911,30 @@ class PrioritizedWriter:
 
     async def _send(self, tier: int, payload, source) -> bool:
         """Sends one payload, timing it into the rate estimate. Returns
-        whether the socket is still usable — `False` ends `run()`."""
+        whether the socket is still usable — `False` ends `run()`.
+
+        A text payload over `BRIDGE_FRAME_MAX_BYTES` is refused here, the
+        last line of defence for every text frame: logged at `error` with its
+        type and size, not sent, and the socket stays usable. The source is
+        told through `on_dropped` when it has one, and through `on_sent` when
+        it has no notion of failure for the frame — never `on_send_failure`,
+        whose put-back would hand the same frame straight back."""
+        if isinstance(payload, str):
+            size = frame_bytes(payload)
+            if size > BRIDGE_FRAME_MAX_BYTES:
+                match = _FRAME_TYPE_RE.match(payload[:64])
+                log.error(
+                    "Did not send a %d-byte %s frame: over the %d-byte frame "
+                    "limit the cloud enforces. The connection stays up",
+                    size, match.group(1) if match else "unknown", BRIDGE_FRAME_MAX_BYTES,
+                )
+                if source is not None:
+                    on_dropped = getattr(source, "on_dropped", None)
+                    if on_dropped is not None:
+                        on_dropped(payload)
+                    else:
+                        source.on_sent(payload)
+                return True
         if tier < _SNAPSHOT_TIER and self._rate_bps:
             projected = len(payload) / self._rate_bps
             if projected > self._max_occupancy_s:
@@ -961,6 +1015,132 @@ class _GatedSource:
     def on_send_failure(self, item) -> None:
         self._inner.on_send_failure(item)
 
+    def on_dropped(self, item) -> None:
+        # The writer guard refused the frame: tell the inner source by its
+        # own `on_dropped`, or by `on_sent` when it has no notion of failure
+        # for it (`PrioritizedWriter._send`).
+        inner = getattr(self._inner, "on_dropped", None)
+        if inner is not None:
+            inner(item)
+        else:
+            self._inner.on_sent(item)
+
+
+class _Window:
+    """At most once per `FRAME_DROP_WINDOW_S` per key, on a monotonic
+    clock: the shared shape of every rate-limited log line and report this
+    file emits about a frame that did not fit."""
+
+    def __init__(self, now: Callable[[], float], window_s: float = FRAME_DROP_WINDOW_S) -> None:
+        self._now = now
+        self._window_s = window_s
+        self._last: Dict[str, float] = {}
+
+    def due(self, key: str) -> bool:
+        at = self._now()
+        last = self._last.get(key)
+        if last is not None and at - last < self._window_s:
+            return False
+        self._last[key] = at
+        return True
+
+    def keep_only(self, keys: Collection[str]) -> None:
+        for key in [k for k in self._last if k not in keys]:
+            del self._last[key]
+
+
+class DatapointDropGuard:
+    """What happens to a datapoint value whose frame is over
+    `BRIDGE_FRAME_MAX_BYTES`: it is not sent, it is logged at most once a
+    minute per slug, and it is reported to the cloud (`datapoint_dropped`)
+    at most once a minute per slug.
+
+    One per client, not per session: a reconnect does not make the cloud
+    forget a drop it was told about, and a robot reconnecting every few
+    seconds must not log once per session. A config apply prunes both
+    windows to the slugs it still has (`keep_only`), so a slug removed and
+    added back starts afresh.
+
+    The reports wait here until `_DropReportSource` hands them to the
+    writer, on the telemetry tier — never behind buffered history."""
+
+    def __init__(self, now: Callable[[], float] = time.monotonic) -> None:
+        self._logged = _Window(now)
+        self._reported = _Window(now)
+        self._pending: Deque[Tuple[str, str]] = deque()
+
+    def dropped(self, slug: str, size: int, timestamp_ms: int) -> None:
+        if self._logged.due(slug):
+            log.warning(
+                "Dropped a %d-byte value of datapoint '%s': over the %d-byte "
+                "frame limit. Expose one field instead of the whole message.",
+                size, slug, BRIDGE_FRAME_MAX_BYTES,
+            )
+        if self._reported.due(slug):
+            self._pending.append(
+                (slug, datapoint_dropped_message(slug, size, BRIDGE_FRAME_MAX_BYTES, timestamp_ms))
+            )
+
+    def next_report(self) -> Optional[str]:
+        return self._pending.popleft()[1] if self._pending else None
+
+    def keep_only(self, slugs: Collection[str]) -> None:
+        self._logged.keep_only(slugs)
+        self._reported.keep_only(slugs)
+        self._pending = deque(item for item in self._pending if item[0] in slugs)
+
+
+def _fits(payload: str) -> Tuple[bool, int]:
+    size = frame_bytes(payload)
+    return size <= BRIDGE_FRAME_MAX_BYTES, size
+
+
+class _DropReportSource:
+    """Tier 2: the `datapoint_dropped` reports `DatapointDropGuard` holds.
+    Registered ahead of the camera states and the samples: a report is rare
+    — once a minute per slug at most — and the sample stream that causes it
+    must not be what keeps it off the wire. Nothing to track: a report lost
+    to a dropped connection is made good by the next drop."""
+
+    def __init__(self, guard: DatapointDropGuard) -> None:
+        self._guard = guard
+
+    def try_next(self):
+        return self._guard.next_report()
+
+    def on_sent(self, payload) -> None:
+        pass
+
+    def on_send_failure(self, payload) -> None:
+        pass
+
+
+class _JobFrameLog:
+    """The warnings a shrunk job frame earns (`fit_job_update`,
+    `fit_job_status`): feedback dropped, at most once a minute per slug (or
+    per job id for a `job_status` entry, which carries no slug), and an
+    omitted result once per job."""
+
+    def __init__(self, now: Callable[[], float] = time.monotonic) -> None:
+        self._feedback = _Window(now)
+        self._results: "OrderedDict[str, None]" = OrderedDict()
+
+    def shrunk(self, job_id: str, feedback_key: str, shrink: JobFrameShrink) -> None:
+        if shrink.feedback_dropped and self._feedback.due(feedback_key):
+            log.warning(
+                "Sent job %s without its feedback: the frame was over the "
+                "%d-byte frame limit", job_id, BRIDGE_FRAME_MAX_BYTES,
+            )
+        if shrink.result_omitted is not None and job_id not in self._results:
+            self._results[job_id] = None
+            while len(self._results) > _OMITTED_RESULT_IDS_MAX:
+                self._results.popitem(last=False)
+            log.warning(
+                "Sent job %s without its %d-byte result: over the %d-byte "
+                "frame limit. The job keeps its state; the result is not kept",
+                job_id, shrink.result_omitted["bytes"], BRIDGE_FRAME_MAX_BYTES,
+            )
+
 
 class _JobSource:
     """Tier 1: `ros.jobs.updates` as job_update frames — what `_pump_jobs`
@@ -987,16 +1167,17 @@ class _JobSource:
     the object. At most one can be outstanding: the writer sends what
     `try_next` returned before it scans any source again."""
 
-    def __init__(self, ros) -> None:
+    def __init__(self, ros, frame_log: Optional[_JobFrameLog] = None) -> None:
         self._ros = ros
         self._inflight = None
+        self._frame_log = frame_log if frame_log is not None else _JobFrameLog()
 
     def try_next(self):
         update = self._ros.jobs.updates.try_get()
         if update is None:
             return None
         self._inflight = update
-        return job_update_message(
+        payload, shrink = fit_job_update(
             update.job_id,
             update.slug,
             update.state,
@@ -1009,11 +1190,21 @@ class _JobSource:
             error=update.error,
             details=update.details,
         )
+        if shrink.shrunk:
+            self._frame_log.shrunk(update.job_id, update.slug, shrink)
+        return payload
 
     def on_sent(self, payload) -> None:
         update, self._inflight = self._inflight, None
         if update is not None:
             self._ros.jobs.mark_delivered(update)
+
+    def on_dropped(self, payload) -> None:
+        # The writer refused the frame — only an absurd `error.details` gets
+        # it past `fit_job_update`. Retired like a sent one: putting it back
+        # would hand the writer the same frame again, for ever, and the
+        # bridge keeps nothing it did not send.
+        self.on_sent(payload)
 
     def on_send_failure(self, payload) -> None:
         update, self._inflight = self._inflight, None
@@ -1041,18 +1232,28 @@ class _SampleSource:
     hands the callbacks the payload, not the sample, and at most one can be
     outstanding."""
 
-    def __init__(self, ros, tier: int, on_dwell=None) -> None:
+    def __init__(self, ros, tier: int, on_dwell=None, drops: Optional[DatapointDropGuard] = None) -> None:
         self._ros = ros
         self._tier = tier
         self._on_dwell = on_dwell
         self._inflight_ms = None
+        self._drops = drops if drops is not None else DatapointDropGuard()
 
     def try_next(self):
-        sample = self._ros.samples.try_get()
-        if sample is None:
-            return None
-        self._inflight_ms = sample.timestamp_ms
-        return datapoint_message(sample.slug, sample.value, sample.timestamp_ms)
+        # A value whose frame is over the limit is dropped and the next one
+        # taken in the same call, so one oversized value never costs the tier
+        # a tick (`DatapointDropGuard`).
+        while True:
+            sample = self._ros.samples.try_get()
+            if sample is None:
+                return None
+            payload = datapoint_message(sample.slug, sample.value, sample.timestamp_ms)
+            fits, size = _fits(payload)
+            if not fits:
+                self._drops.dropped(sample.slug, size, sample.timestamp_ms)
+                continue
+            self._inflight_ms = sample.timestamp_ms
+            return payload
 
     def on_sent(self, payload) -> None:
         captured_ms, self._inflight_ms = self._inflight_ms, None
@@ -1062,6 +1263,11 @@ class _SampleSource:
     def on_send_failure(self, payload) -> None:
         # A send that failed measures nothing: the session is ending, and the
         # time it took says more about the socket dying than about the link.
+        self._inflight_ms = None
+
+    def on_dropped(self, payload) -> None:
+        # Unreachable while `try_next` drops oversized values itself; a frame
+        # that was never sent measured nothing either.
         self._inflight_ms = None
 
 
@@ -1151,21 +1357,30 @@ class _BackfillSource:
     (a config apply calling `backlog.remove()` races it); returning `None`
     is the right answer then, and the writer simply asks again."""
 
-    def __init__(self, ros) -> None:
+    def __init__(self, ros, drops: Optional[DatapointDropGuard] = None) -> None:
         self._ros = ros
+        self._drops = drops if drops is not None else DatapointDropGuard()
 
     def try_next(self):
-        sample = self._ros.backlog.pop_any()
-        if sample is None:
-            return None
-        # `backfill=True` is this tier's whole distinguishing fact on the
-        # wire: the cloud measures its datapoint lag from what arrives
-        # live, and a replayed buffer carries capture timestamps from
-        # before the outage. Without the flag a reconnect after an hour
-        # offline reads as an hour of lag — on a link that is fine.
-        return datapoint_message(
-            sample.slug, sample.value, sample.timestamp_ms, backfill=True
-        )
+        # Same drop rule as `_SampleSource`: a buffered value over the frame
+        # limit is a gap, reported once, and the next one goes in this call.
+        while True:
+            sample = self._ros.backlog.pop_any()
+            if sample is None:
+                return None
+            # `backfill=True` is this tier's whole distinguishing fact on the
+            # wire: the cloud measures its datapoint lag from what arrives
+            # live, and a replayed buffer carries capture timestamps from
+            # before the outage. Without the flag a reconnect after an hour
+            # offline reads as an hour of lag — on a link that is fine.
+            payload = datapoint_message(
+                sample.slug, sample.value, sample.timestamp_ms, backfill=True
+            )
+            fits, size = _fits(payload)
+            if not fits:
+                self._drops.dropped(sample.slug, size, sample.timestamp_ms)
+                continue
+            return payload
 
     def on_sent(self, payload) -> None:
         pass
@@ -1210,6 +1425,23 @@ def _drain_one(queue: "asyncio.Queue"):
         return queue.get_nowait()
     except asyncio.QueueEmpty:
         return None
+
+
+def _referenced_names(message: Config) -> Dict[str, Collection[str]]:
+    """The ROS names a config references, per `ros graph` list: datapoint,
+    publisher and ROS-camera topics, service and action `ros_name`s. What a
+    graph cut to fit must keep, so validation against the published config
+    stays exact."""
+    topics = {d.topic for d in message.datapoints.values()}
+    topics.update(p.topic for p in message.publishers.values())
+    topics.update(
+        c.source.topic for c in message.cameras.values() if isinstance(c.source, RosSource)
+    )
+    return {
+        "topics": topics,
+        "services": {s.ros_name for s in message.services.values()},
+        "actions": {a.ros_name for a in message.actions.values()},
+    }
 
 
 class BridgeClient:
@@ -1325,6 +1557,13 @@ class BridgeClient:
         self._param_live: Dict[str, Any] = {}
         self._yaml_live: Dict[str, Any] = {}
         self._live_settings = LiveSettings.resolve({}, {})
+        # Per client, for `DatapointDropGuard`'s reason: the windows outlive
+        # a reconnect.
+        self._datapoint_drops = DatapointDropGuard()
+        self._job_frame_log = _JobFrameLog()
+        # The ROS names the last applied config references, per graph list,
+        # so a graph cut to fit keeps them (`fit_introspect_message`).
+        self._referenced_names: Dict[str, Collection[str]] = {}
         if self._ros is not None:
             self._ros.on_low_bandwidth_params(self._on_low_bandwidth_params)
             self._ros.on_live_params(self._on_live_params)
@@ -1759,14 +1998,19 @@ class BridgeClient:
 
             camera_states = _CameraStateSource(self._ros, _TIER_TELEMETRY)
             samples = _SampleSource(
-                self._ros, _TIER_TELEMETRY, on_dwell=self._observe_dwell
+                self._ros, _TIER_TELEMETRY, on_dwell=self._observe_dwell,
+                drops=self._datapoint_drops,
             )
             sources = [
-                (_TIER_OUTCOME, _GatedSource(is_open, _JobSource(self._ros))),
+                (_TIER_OUTCOME, _GatedSource(is_open, _JobSource(self._ros, self._job_frame_log))),
+                (_TIER_TELEMETRY, _GatedSource(is_open, _DropReportSource(self._datapoint_drops))),
                 (_TIER_TELEMETRY, _GatedSource(is_open, camera_states)),
                 (_TIER_TELEMETRY, _GatedSource(is_open, samples)),
                 (_TIER_TOOLING, _GatedSource(is_open, _AssetSource(self._ros))),
-                (_TIER_BACKFILL, _GatedSource(backfill_open, _BackfillSource(self._ros))),
+                (
+                    _TIER_BACKFILL,
+                    _GatedSource(backfill_open, _BackfillSource(self._ros, self._datapoint_drops)),
+                ),
             ]
             snapshot_source = _SnapshotSource(is_open, self._ros)
         writer = PrioritizedWriter(
@@ -2250,6 +2494,8 @@ class BridgeClient:
         the config landed keeps re-sending it, which is a session-level
         cost, not a telemetry one."""
         errors: List[ApplyError] = []
+        self._datapoint_drops.keep_only(set(message.datapoints))
+        self._referenced_names = _referenced_names(message)
         # First, because the mode's ceiling is what the datapoint apply below
         # builds each subscription's cap against.
         errors.extend(await self._apply_low_bandwidth_section(message))
@@ -2402,7 +2648,19 @@ class BridgeClient:
             graph = await self._ros.graph_snapshot()
         else:
             graph = {"topics": [], "services": [], "actions": [], "captured_at_ms": 0}
-        writer.enqueue(_TIER_TOOLING, introspect_message(message.request_id, graph))
+        # A graph over the frame limit is cut to fit, keeping every name the
+        # applied config references, and says what it left out.
+        payload, omitted = fit_introspect_message(
+            message.request_id, graph, self._referenced_names
+        )
+        if omitted is not None:
+            log.warning(
+                "The ROS graph was over the %d-byte frame limit: sent it "
+                "without %d topics, %d services and %d actions",
+                BRIDGE_FRAME_MAX_BYTES, omitted["topics"], omitted["services"],
+                omitted["actions"],
+            )
+        writer.enqueue(_TIER_TOOLING, payload)
 
     async def _handle_type_request(
         self, writer: PrioritizedWriter, message: TypeRequest
@@ -2433,10 +2691,10 @@ class BridgeClient:
             jobs, unknown_job_ids = await self._ros.job_query(message.job_ids)
         else:
             jobs, unknown_job_ids = [], list(message.job_ids)
-        writer.enqueue(
-            _TIER_OUTCOME,
-            job_status_message(message.request_id, jobs, unknown_job_ids),
-        )
+        payload, shrinks = fit_job_status(message.request_id, jobs, unknown_job_ids)
+        for job_id, shrink in shrinks:
+            self._job_frame_log.shrunk(job_id, job_id, shrink)
+        writer.enqueue(_TIER_OUTCOME, payload)
 
     def _reason_for_close(self, code: Optional[int]) -> Optional[StopReason]:
         if code == CLOSE_CODE_SUPERSEDED:

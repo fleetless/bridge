@@ -63,7 +63,7 @@ import pathlib
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, TypedDict, Union
+from typing import Any, Callable, Collection, Dict, List, NamedTuple, Optional, Sequence, Tuple, TypedDict, Union
 
 
 class FileLimit(TypedDict):
@@ -105,6 +105,21 @@ LIVE_DEFAULTS: Dict[str, Any] = _CONSTANTS["LIVE_DEFAULTS"]
 #: when it is published; the bridge refuses a ROS parameter outside them with
 #: the same numbers and the same list, read and not typed.
 LIVE_BOUNDS: Dict[str, Dict[str, Any]] = _CONSTANTS["LIVE_BOUNDS"]
+#: The largest text frame this bridge sends, in serialised UTF-8 bytes: the
+#: cloud closes the socket at 2 MiB with 1009, and the bridge would reconnect
+#: into the same frame. A datapoint value over it is dropped and reported
+#: (`datapoint_dropped_message`), a job frame sheds feedback and then its
+#: result (`fit_job_update`, `fit_job_status`), a graph is cut to fit
+#: (`fit_introspect_message`), and the writer refuses anything else over it.
+BRIDGE_FRAME_MAX_BYTES: int = _CONSTANTS["BRIDGE_FRAME_MAX_BYTES"]
+
+
+def frame_bytes(payload: str) -> int:
+    """The size the cloud's socket limit counts: the frame's UTF-8 bytes.
+    `json.dumps` escapes to ASCII by default, so this equals `len(payload)`
+    for every frame built here; it is measured anyway, because the limit is
+    a byte limit and a frame built some other way need not be ASCII."""
+    return len(payload.encode("utf-8"))
 
 # The `fleetless.yaml` format version — `doc.fleetless`. Still a hand-kept
 # literal on both sides of the wire, which `PROTOCOL_VERSION` above stopped
@@ -853,6 +868,66 @@ def introspect_message(request_id: str, graph: dict) -> str:
     return json.dumps({"type": "introspect", "request_id": request_id, "graph": graph})
 
 
+#: The three lists of a `ros graph`, in the order a cut graph is filled.
+GRAPH_LISTS = ("topics", "services", "actions")
+
+
+def fit_introspect_message(
+    request_id: str,
+    graph: dict,
+    referenced: Dict[str, Collection[str]],
+    limit: int = BRIDGE_FRAME_MAX_BYTES,
+) -> Tuple[str, Optional[Dict[str, int]]]:
+    """`introspect_message`, made to fit `limit`, and the counts it left
+    out (`None` when the graph went out whole).
+
+    A graph that does not fit keeps first every entry whose name
+    `referenced` lists for its list — the names the applied configuration
+    uses, so validation against the published config stays exact — then
+    adds the rest in name order, topics, then services, then actions, and
+    stops at the first entry that would not fit. `graph.omitted` says how
+    many each list lost. Each list goes out sorted by name.
+
+    Sizes are summed, not re-serialised per entry: an entry costs its own
+    JSON plus the `", "` that separates it, counted for every entry (six
+    bytes too many at most), and the skeleton is measured once with the
+    largest counts `omitted` can hold, so the frame built at the end is
+    never larger than the sum. If the referenced entries alone do not fit,
+    the frame is returned over the limit and the writer refuses it."""
+    payload = introspect_message(request_id, graph)
+    if frame_bytes(payload) <= limit:
+        return payload, None
+
+    skeleton = {key: value for key, value in graph.items() if key not in GRAPH_LISTS}
+    skeleton.update({key: [] for key in GRAPH_LISTS})
+    skeleton["omitted"] = {key: len(graph.get(key, [])) for key in GRAPH_LISTS}
+    used = frame_bytes(introspect_message(request_id, skeleton))
+
+    kept: Dict[str, List[dict]] = {key: [] for key in GRAPH_LISTS}
+    rest: List[Tuple[str, dict]] = []
+    for key in GRAPH_LISTS:
+        names = referenced.get(key, ())
+        for entry in sorted(graph.get(key, []), key=lambda e: e["name"]):
+            if entry["name"] in names:
+                kept[key].append(entry)
+                used += frame_bytes(json.dumps(entry)) + 2
+            else:
+                rest.append((key, entry))
+    for key, entry in rest:
+        cost = frame_bytes(json.dumps(entry)) + 2
+        if used + cost > limit:
+            break
+        kept[key].append(entry)
+        used += cost
+
+    cut = {key: value for key, value in graph.items() if key not in GRAPH_LISTS}
+    for key in GRAPH_LISTS:
+        cut[key] = sorted(kept[key], key=lambda e: e["name"])
+    omitted = {key: len(graph.get(key, [])) - len(kept[key]) for key in GRAPH_LISTS}
+    cut["omitted"] = omitted
+    return introspect_message(request_id, cut), omitted
+
+
 def type_definitions_message(
     request_id: str, definitions: Sequence[dict], unresolved: Sequence[str]
 ) -> str:
@@ -892,6 +967,126 @@ def datapoint_message(
     return json.dumps(payload)
 
 
+def datapoint_dropped_message(
+    slug: str, bytes_: int, limit_bytes: int, timestamp_ms: int
+) -> str:
+    """A datapoint value the bridge did not send, because its `datapoint`
+    frame was `bytes_` long against `limit_bytes`. `timestamp_ms` is the
+    capture time of the dropped sample."""
+    return json.dumps(
+        {
+            "type": "datapoint_dropped",
+            "slug": slug,
+            "reason": "too_large",
+            "bytes": bytes_,
+            "limit_bytes": limit_bytes,
+            "timestamp_ms": timestamp_ms,
+        }
+    )
+
+
+class JobFrameShrink(NamedTuple):
+    """What `fit_job_update` / `fit_job_status` left out of one job to make
+    its frame fit. `result_omitted` is the wire object (`resultOmitted`), or
+    `None` when the result went out whole."""
+
+    feedback_dropped: bool = False
+    result_omitted: Optional[Dict[str, Any]] = None
+
+    @property
+    def shrunk(self) -> bool:
+        return self.feedback_dropped or self.result_omitted is not None
+
+
+def _job_error_object(error: Optional[Tuple[str, str]], details: Any) -> Optional[Dict[str, Any]]:
+    if error is None:
+        return None
+    error_obj = {"code": error[0], "message": error[1]}
+    if details is not None:
+        error_obj["details"] = details
+    return error_obj
+
+
+def _shrink_job_fields(fields: Dict[str, Any], step: int, limit: int) -> Optional[JobFrameShrink]:
+    """One shrink step on a `job_update` dict or a `job_status` entry, in
+    place: the first drops `feedback`, the second omits `result`. Returns what it
+    did, or `None` when the step had nothing to drop. **The state is never
+    touched**: a goal that succeeded stays `succeeded`, a failed one stays
+    `failed` with its error."""
+    if step == 1:
+        if fields.get("feedback") is None:
+            return None
+        fields["feedback"] = None
+        return JobFrameShrink(feedback_dropped=True)
+    if fields.get("result") is None:
+        return None
+    omitted = {
+        "reason": "too_large",
+        "bytes": frame_bytes(json.dumps(fields["result"])),
+        "limit_bytes": limit,
+    }
+    fields["result"] = None
+    fields["result_omitted"] = omitted
+    return JobFrameShrink(result_omitted=omitted)
+
+
+def _merge_shrink(a: JobFrameShrink, b: Optional[JobFrameShrink]) -> JobFrameShrink:
+    if b is None:
+        return a
+    return JobFrameShrink(
+        feedback_dropped=a.feedback_dropped or b.feedback_dropped,
+        result_omitted=b.result_omitted if b.result_omitted is not None else a.result_omitted,
+    )
+
+
+def fit_job_update(
+    job_id: str,
+    slug: str,
+    state: str,
+    *,
+    timestamp_ms: int,
+    origin: str = "fleetless",
+    goal_id: Optional[str] = None,
+    feedback: Any = None,
+    progress: Optional[float] = None,
+    result: Any = None,
+    error: Optional[Tuple[str, str]] = None,
+    details: Any = None,
+    limit: int = BRIDGE_FRAME_MAX_BYTES,
+) -> Tuple[str, JobFrameShrink]:
+    """`job_update_message`, made to fit `limit`, and what it left out.
+
+    Over the limit, the frame sheds in this order and is rebuilt after each
+    step: `feedback` (a running report; the next one may fit, and state,
+    progress and result matter more), then `result`, which becomes `null`
+    with `result_omitted` beside it. If it still does not fit — only an
+    absurd `error.details` can do that — it is returned as it is, and the
+    writer refuses it."""
+    fields: Dict[str, Any] = {
+        "type": "job_update",
+        "job_id": job_id,
+        "slug": slug,
+        "state": state,
+        "origin": origin,
+        "goal_id": goal_id,
+        "feedback": feedback,
+        "progress": progress,
+        "result": result,
+        "error": _job_error_object(error, details),
+        "timestamp_ms": timestamp_ms,
+    }
+    payload = json.dumps(fields)
+    shrink = JobFrameShrink()
+    for step in (1, 2):
+        if frame_bytes(payload) <= limit:
+            break
+        done = _shrink_job_fields(fields, step, limit)
+        if done is not None:
+            shrink = _merge_shrink(shrink, done)
+            payload = json.dumps(fields)
+    return payload, shrink
+
+
 def job_update_message(
     job_id: str,
     slug: str,
@@ -928,27 +1123,16 @@ def job_update_message(
     `"details": null` would claim there was something to say and it was
     nothing, which is not the same claim as never having the field).
     Ignored when `error` is `None` — details about no error is not a shape
-    that means anything."""
-    error_obj = None
-    if error is not None:
-        error_obj = {"code": error[0], "message": error[1]}
-        if details is not None:
-            error_obj["details"] = details
-    return json.dumps(
-        {
-            "type": "job_update",
-            "job_id": job_id,
-            "slug": slug,
-            "state": state,
-            "origin": origin,
-            "goal_id": goal_id,
-            "feedback": feedback,
-            "progress": progress,
-            "result": result,
-            "error": error_obj,
-            "timestamp_ms": timestamp_ms,
-        }
-    )
+    that means anything.
+
+    Never longer than `BRIDGE_FRAME_MAX_BYTES` when feedback and result are
+    what made it long: see `fit_job_update`, which this is the frame half
+    of."""
+    return fit_job_update(
+        job_id, slug, state, timestamp_ms=timestamp_ms, origin=origin,
+        goal_id=goal_id, feedback=feedback, progress=progress, result=result,
+        error=error, details=details,
+    )[0]
 
 
 def job_lost_message(job_ids: Sequence[str]) -> str:
@@ -974,6 +1158,59 @@ class JobStatusEntry(NamedTuple):
     error: Optional[Tuple[str, str]] = None
 
 
+def fit_job_status(
+    request_id: str,
+    jobs: Sequence[JobStatusEntry],
+    unknown_job_ids: Sequence[str],
+    limit: int = BRIDGE_FRAME_MAX_BYTES,
+) -> Tuple[str, List[Tuple[str, JobFrameShrink]]]:
+    """`job_status_message`, made to fit `limit`, and which jobs it shrank.
+
+    `fit_job_update`'s two steps, applied per entry, largest entry first,
+    until the frame fits: an answer with one huge result and three small
+    ones sheds only the huge one. Each shrunk job appears once in the list,
+    with everything that was left out of it."""
+    entries: List[Dict[str, Any]] = [
+        {
+            "job_id": j.job_id,
+            "state": j.state,
+            "feedback": j.feedback,
+            "progress": j.progress,
+            "result": j.result,
+            "error": _job_error_object(j.error, None),
+        }
+        for j in jobs
+    ]
+
+    def build() -> str:
+        return json.dumps(
+            {
+                "type": "job_status",
+                "request_id": request_id,
+                "jobs": entries,
+                "unknown_job_ids": list(unknown_job_ids),
+            }
+        )
+
+    payload = build()
+    shrinks: Dict[str, JobFrameShrink] = {}
+    if frame_bytes(payload) > limit:
+        by_size = sorted(entries, key=lambda e: frame_bytes(json.dumps(e)), reverse=True)
+        for entry in by_size:
+            for step in (1, 2):
+                if frame_bytes(payload) <= limit:
+                    break
+                done = _shrink_job_fields(entry, step, limit)
+                if done is not None:
+                    shrinks[entry["job_id"]] = _merge_shrink(
+                        shrinks.get(entry["job_id"], JobFrameShrink()), done
+                    )
+                    payload = build()
+            if frame_bytes(payload) <= limit:
+                break
+    return payload, list(shrinks.items())
+
+
 def job_status_message(
     request_id: str, jobs: Sequence[JobStatusEntry], unknown_job_ids: Sequence[str]
 ) -> str:
@@ -983,27 +1220,9 @@ def job_status_message(
     all — never sent, not in the persisted mapping, and not an active
     external goal — disjoint from `jobs`, which carries the ids this
     process does recognise, each with its own error shaped exactly like
-    `job_update_message`'s."""
-    return json.dumps(
-        {
-            "type": "job_status",
-            "request_id": request_id,
-            "jobs": [
-                {
-                    "job_id": j.job_id,
-                    "state": j.state,
-                    "feedback": j.feedback,
-                    "progress": j.progress,
-                    "result": j.result,
-                    "error": (
-                        {"code": j.error[0], "message": j.error[1]} if j.error is not None else None
-                    ),
-                }
-                for j in jobs
-            ],
-            "unknown_job_ids": list(unknown_job_ids),
-        }
-    )
+    `job_update_message`'s. Made to fit `BRIDGE_FRAME_MAX_BYTES` by
+    `fit_job_status`."""
+    return fit_job_status(request_id, jobs, unknown_job_ids)[0]
 
 
 class CancelResultEntry(NamedTuple):

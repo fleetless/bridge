@@ -15,6 +15,7 @@
   "JOB_HEARTBEAT_INTERVAL_MS": 1000,
   "JOB_HEARTBEAT_TIMEOUT_MS": 5000,
   "JOB_OFFLINE_GRACE_MS": 300000,
+  "BRIDGE_FRAME_MAX_BYTES": 1572864,
   "ASSET_UPLOAD_HEADERS": {
     "kind": "x-fleetless-asset-kind",
     "name": "x-fleetless-asset-name",

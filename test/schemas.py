@@ -11,7 +11,7 @@ wire contract, wrong for the one other thing this module uses it for:
 outgoing messages in `protocol.py` are hand-typed dict literals
 (`{"type": "hello", ...}`), so a typo in a key name gets no static
 protection — a dataclass attribute access would raise, this wouldn't.
-`schema-outgoing/` is output-mode, for exactly the fifteen frames
+`schema-outgoing/` is output-mode, for exactly the sixteen frames
 `protocol.py` builds (`OUTGOING_FRAME_NAMES` below): `.default()`ed fields
 are required and `additionalProperties: false` is back, so a missing or
 misspelled field fails loudly here instead of being silently dropped by the
@@ -43,10 +43,10 @@ except ImportError:
 SCHEMA_DIR = pathlib.Path(__file__).parent / "contracts" / "schema"
 SCHEMA_OUTGOING_DIR = pathlib.Path(__file__).parent / "contracts" / "schema-outgoing"
 
-# The fifteen frames protocol.py builds and sends — see hello_message,
+# The sixteen frames protocol.py builds and sends — see hello_message,
 # pong_message, link_mode_message, config_applied_message,
 # introspect_message, type_definitions_message, datapoint_message,
-# job_update_message, job_lost_message, job_status_message,
+# datapoint_dropped_message, job_update_message, job_lost_message, job_status_message,
 # cancel_result_message, snapshot_frame,
 # bridge_camera_state_message, bridge_assets_available_message,
 # bridge_asset_progress_message.
@@ -61,6 +61,7 @@ OUTGOING_FRAME_NAMES = frozenset(
         "bridge-introspect",
         "bridge-type-definitions",
         "datapoint-frame",
+        "bridge-datapoint-dropped",
         "bridge-job-update",
         "bridge-job-lost",
         "bridge-job-status",

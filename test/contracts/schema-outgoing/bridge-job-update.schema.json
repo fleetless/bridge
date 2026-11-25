@@ -73,6 +73,37 @@
         }
       ]
     },
+    "result_omitted": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "enum": [
+            "too_large"
+          ],
+          "description": "Why the result was left out. `too_large`: its frame would have exceeded the robot's frame limit."
+        },
+        "bytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The size of the result alone, serialised as JSON, in bytes."
+        },
+        "limit_bytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "description": "The frame limit the robot applied, in bytes (`BRIDGE_FRAME_MAX_BYTES`, 1.5 MiB)."
+        }
+      },
+      "required": [
+        "reason",
+        "bytes",
+        "limit_bytes"
+      ],
+      "additionalProperties": false,
+      "description": "The robot had a result and did not send it because it was too large; `result` is `null`. The state is unchanged, and the result cannot be fetched later."
+    },
     "error": {
       "anyOf": [
         {
