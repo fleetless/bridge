@@ -14,21 +14,33 @@ robot would end on the command. One writer keeps the failsafe after every
 command before it. So the bridge builds a client's message, serializes it and
 sends it here, and publishing it is what re-arms the deadline.
 
-One thread, no executor. It waits in `conn.poll` until the earliest thing that
-is due and fires what is due before it reads the next message. Reports go back
-through a sender thread, so a parent that stops reading never blocks a fire.
+One thread, no executor. It waits in `select` until the earliest thing that
+is due and fires what is due before it handles the next message. It never
+waits for the rest of a message: it reads what has arrived into a buffer of
+its own and handles a message once all of it is there. A large publish (a
+`Path`, a `PointCloud2`) arrives in pieces, each written only once the
+bridge's busy GIL lets its sender run again, and a blocking read of the rest
+would hold every deadline that falls due meanwhile. Reports go back through a
+sender thread, so a parent that stops reading never blocks a fire.
 Nothing here imports `ros_runtime`: the child loads rclpy, the message types
 and `params`, nothing else.
 
 If the pipe closes, the bridge is gone: it froze, crashed or was `kill -9`'d.
 The process then fires every armed failsafe and exits once those are
-acknowledged. SIGTERM does the same. SIGINT is the bridge's to hear.
+acknowledged. SIGTERM does the same, after it said `terminating`, so the
+supervisor knows it heard. The signal handler only sets a flag and wakes the
+loop, which acts on it between messages: a handler that raised could land
+between a client's publish and the line that makes its failsafe owed, and the
+topic would end on the command. SIGINT is the bridge's to hear.
 """
 from __future__ import annotations
 
 import os
+import pickle
 import queue
+import select
 import signal
+import struct
 import threading
 import time
 import traceback
@@ -68,9 +80,13 @@ OWED_MATCH_WAIT_S = 2.0
 
 QOS_DEPTH = 10
 
+#: The most read from the pipe at once. Between two reads, what is due fires.
+READ_CHUNK_BYTES = 64 * 1024
 
-class _Terminated(Exception):
-    """SIGTERM: handled like a closed pipe."""
+
+class _Terminated(BaseException):
+    """SIGTERM: handled like a closed pipe. A `BaseException`, so that no
+    `except Exception` around a publish can swallow it."""
 
 
 @dataclass
@@ -105,9 +121,16 @@ class FailsafeProcess:
     it in-process; `main` is what the spawned process runs."""
 
     def __init__(self, node, conn, options: Optional[Dict[str, Any]] = None,
-                 clock=time.monotonic) -> None:
+                 clock=time.monotonic, wakeup_fd: Optional[int] = None) -> None:
         self._node = node
         self._conn = conn
+        self._fd = conn.fileno()
+        # What arrived of the messages not handled yet: `Connection` frames.
+        self._inbox = bytearray()
+        # Readable once a signal came (`signal.set_wakeup_fd`).
+        self._wakeup_fd = wakeup_fd
+        #: Set by the SIGTERM handler; the loop acts on it between messages.
+        self.terminated = False
         self._options = dict(options or {})
         self._clock = clock
         self._writers: Dict[str, _Writer] = {}
@@ -155,8 +178,11 @@ class FailsafeProcess:
             self._outbox.put(None)
 
     def _turn(self) -> bool:
-        """One pass: fire what is due, then wait for the next message or the
-        next thing due. `False` once `stop` was handled."""
+        """One pass: fire what is due, then handle one message, or wait for
+        more of one or for the next thing due. `False` once `stop` was
+        handled."""
+        if self.terminated:
+            raise _Terminated()
         now = self._clock()
         self._fire_due(now)
         if self._self_test_at is not None and now >= self._self_test_at:
@@ -168,13 +194,54 @@ class FailsafeProcess:
             self._next_alive = now + ALIVE_INTERVAL_S
         self._create_pending(now)
         self._reap_retiring(now)
-        wake = self._next_wake(now)
-        if self._conn.poll(max(0.0, wake - self._clock())):
-            # Due first, read second: a publish that arrives at the deadline
-            # comes after the failsafe it was too late for.
+        message = self._take_message()
+        if message is not None:
+            # Due first, handled second: a publish that arrives at the
+            # deadline comes after the failsafe it was too late for.
             self._fire_due(self._clock())
-            return self._handle(self._conn.recv())
+            return self._handle(message)
+        wake = self._next_wake(now)
+        fds = [self._fd] if self._wakeup_fd is None else [self._fd, self._wakeup_fd]
+        readable, _, _ = select.select(fds, [], [], max(0.0, wake - self._clock()))
+        if self._wakeup_fd is not None and self._wakeup_fd in readable:
+            self._drain_wakeup()
+        if self._fd in readable:
+            self._fire_due(self._clock())
+            # Readable, so this returns what has arrived and does not wait.
+            data = os.read(self._fd, READ_CHUNK_BYTES)
+            if not data:
+                raise EOFError("the bridge closed the pipe")
+            self._inbox += data
         return True
+
+    def _take_message(self):
+        """The next whole message in the inbox, or `None` while it is still
+        arriving. The framing is `multiprocessing.connection.Connection`'s: a
+        signed 4-byte big-endian length, -1 followed by an 8-byte one for a
+        message of 2 GiB and more, then the pickle."""
+        inbox = self._inbox
+        if len(inbox) < 4:
+            return None
+        (size,) = struct.unpack_from("!i", inbox, 0)
+        start = 4
+        if size == -1:
+            if len(inbox) < 12:
+                return None
+            (size,) = struct.unpack_from("!Q", inbox, 4)
+            start = 12
+        end = start + size
+        if len(inbox) < end:
+            return None
+        payload = bytes(inbox[start:end])
+        del inbox[:end]
+        return pickle.loads(payload)
+
+    def _drain_wakeup(self) -> None:
+        try:
+            while os.read(self._wakeup_fd, 512):
+                pass
+        except (BlockingIOError, InterruptedError):
+            pass
 
     def _next_wake(self, now: float) -> float:
         wake = self._next_alive
@@ -196,12 +263,13 @@ class FailsafeProcess:
             deadline = writer.touched_at + writer.timeout_s
             if now < deadline:
                 continue
-            writer.fired = True
             try:
                 writer.publisher.publish(writer.failsafe)
             except Exception:  # noqa: BLE001 - counted as fired; said loudly
+                writer.fired = True
                 self._report("fire_failed", writer.slug, traceback.format_exc())
                 continue
+            writer.fired = True
             lateness_ms = (self._clock() - deadline) * 1000.0
             self._report("fired", writer.slug, int(writer.timeout_s * 1000), lateness_ms)
         for writer in self._writers.values():
@@ -210,7 +278,7 @@ class FailsafeProcess:
             matched = writer.publisher.get_subscription_count() > 0
             if matched or now - writer.owed_since >= OWED_MATCH_WAIT_S:
                 writer.owed_since = None
-                self._publish_parting(writer)
+                self._publish_parting(writer, report="owed")
 
     # --- messages from the bridge ---------------------------------------------
 
@@ -222,10 +290,12 @@ class FailsafeProcess:
             if writer is None or writer.publisher is None:
                 self._report("dropped", slug)
                 return True
-            writer.publisher.publish(data)
+            # Owed before it leaves: whatever stops this process from here
+            # on finds the command's failsafe owed.
             writer.touched_at = self._clock()
             writer.fired = False
             writer.owed_since = None
+            writer.publisher.publish(data)
         elif kind == "arm":
             _, slug, topic, type_name, body, timeout_ms, owed = message
             self._arm(slug, topic, type_name, body, timeout_ms, owed)
@@ -247,8 +317,10 @@ class FailsafeProcess:
             count = writer.publisher.get_subscription_count() if writer and writer.publisher else -1
             self._report("count", request_id, count)
         elif kind == "stop":
+            # The runtime's teardown disarmed every publisher first, so
+            # nothing is owed here, unless that teardown did not run.
             for slug in list(self._writers):
-                self._disarm(slug, parting=False)
+                self._disarm(slug, parting=True)
             self._wait_retiring()
             return False
         return True
@@ -310,14 +382,18 @@ class FailsafeProcess:
             publisher=writer.publisher, deadline=self._clock() + PARTING_FAILSAFE_ACK_TIMEOUT_S,
         ))
 
-    def _publish_parting(self, writer: _Writer) -> None:
-        writer.fired = True
+    def _publish_parting(self, writer: _Writer, report: str = "parting") -> None:
+        """A failsafe now, outside its deadline: `parting` for a writer that
+        goes (removed, or the bridge gone), `owed` for one a previous
+        process owed."""
         try:
             writer.publisher.publish(writer.failsafe)
         except Exception:  # noqa: BLE001 - said loudly; nothing else to do
+            writer.fired = True
             self._report("fire_failed", writer.slug, traceback.format_exc())
             return
-        self._report("parting", writer.slug)
+        writer.fired = True
+        self._report(report, writer.slug)
 
     # --- retiring writers -------------------------------------------------------
 
@@ -358,7 +434,10 @@ class FailsafeProcess:
 
     def _bridge_gone(self) -> None:
         """The pipe closed or SIGTERM came: every armed failsafe goes out
-        now, and the process waits for its acknowledgement before it exits."""
+        now, and the process waits for its acknowledgement before it exits.
+        `terminating` first: the supervisor waits for the acknowledgements
+        only for a process that answered its SIGTERM."""
+        self._report("terminating")
         for writer in list(self._writers.values()):
             if writer.publisher is None:
                 continue
@@ -385,18 +464,21 @@ def main(conn, node_name: str, options: Optional[Dict[str, Any]] = None) -> None
 
     rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
     node = rclpy.create_node(node_name)
-    terminated = []
+    wakeup_r, wakeup_w = os.pipe()
+    os.set_blocking(wakeup_r, False)
+    os.set_blocking(wakeup_w, False)
+    process = FailsafeProcess(node, conn, options, wakeup_fd=wakeup_r)
 
     def _on_term(signum, frame):
         # From here on a SIGTERM fires every armed failsafe, like a closed
-        # pipe. Once: a second one must not cut the first one's firing short.
-        if not terminated:
-            terminated.append(signum)
-            raise _Terminated()
+        # pipe. Only a flag: the loop acts on it between messages. A second
+        # SIGTERM sets it again and cuts nothing short.
+        process.terminated = True
 
     signal.signal(signal.SIGTERM, _on_term)
+    signal.set_wakeup_fd(wakeup_w)
     try:
-        FailsafeProcess(node, conn, options).run()
+        process.run()
     finally:
         try:
             node.destroy_node()

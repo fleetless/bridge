@@ -20,15 +20,19 @@ The **supervisor thread** reads the process's reports and watches three things.
 Any of them makes the watchdog `failed`:
 
 - a fire later than the bound (`late_fire`);
-- a second minute without an `alive` (`not_alive`; one is sent every 0.25 s);
+- a second without an `alive` (`not_alive`; one is sent every 0.25 s);
 - the process ending, or two loop errors within 60 s (`crashed`).
 
 It does not run on the executor's heartbeat timer, for one reason: the
-executor's own send to a stuck process is what could block it. On a failure the supervisor stops taking publishes, logs an ERROR and tells
-the runtime (`on_state`, which becomes the `failsafe_watchdog` frame). It
-terminates the old process by its PID; that process fires every armed failsafe
-on SIGTERM. Then it starts a new one, re-arms it and self-tests it, and retries
-every second until a self-test passes.
+executor's own send to a stuck process is what could block it. On a failure
+the supervisor stops taking publishes, logs an ERROR and tells the runtime
+(`on_state`, which becomes the `failsafe_watchdog` frame). It terminates the
+old process by its PID. A process that answers the SIGTERM within
+`TERM_ANSWER_TIMEOUT_S` fires every armed failsafe and gets the time its
+readers need to acknowledge them; one that does not answer (stopped, or stuck
+in C) is SIGKILLed, and the new process fires what it owed. Then the
+supervisor starts a new one, re-arms it and self-tests it, and retries every
+second until a self-test passes.
 """
 from __future__ import annotations
 
@@ -47,11 +51,19 @@ from fleetless_bridge.failsafe_process import LATENESS_BOUND_MS, PARTING_FAILSAF
 
 log = logging.getLogger(__name__)
 
+#: Where `fleetless_bridge` was loaded from: the failsafe process starts there.
+_PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 #: No word from the process for this long is a dead watchdog.
 ALIVE_TIMEOUT_S = 1.0
 
 #: Spawning a Python with rclpy on a slow robot; a fast machine takes about a second.
 START_TIMEOUT_S = 20.0
+
+#: How long a SIGTERM'd process has to say `terminating`. One that did not
+#: is SIGKILLed: a frozen process runs no handler, and every second it is
+#: waited for is a second the robot stays on its last command.
+TERM_ANSWER_TIMEOUT_S = 1.0
 
 #: How long the self-test's answer may take, beyond its own 50 ms.
 SELF_TEST_TIMEOUT_S = 5.0
@@ -240,8 +252,10 @@ class FailsafeWatchdog:
         return answer[1]
 
     def stop(self) -> None:
-        """Disarms everything without a parting failsafe (the runtime's
-        teardown disarmed its publishers first) and waits for the process."""
+        """Tells the process to stop and waits for it. The process disarms
+        everything with the parting failsafe of any writer still owed one:
+        none, when the runtime's teardown disarmed its publishers first, as
+        it does unless that teardown timed out."""
         with self._lock:
             # Under the lock the supervisor spawns under: no process starts
             # after this line, and the one that did is in `_process`.
@@ -271,7 +285,9 @@ class FailsafeWatchdog:
                 self._send(("stop",))
             if process is not None:
                 process.join(PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
-                self._end(process)
+                # Not read here: the supervisor may still be reading. A
+                # process still there after the stop's own wait is stuck.
+                self._end(process, None)
         if self._supervisor is not None:
             self._supervisor.join(2.0)
 
@@ -279,14 +295,18 @@ class FailsafeWatchdog:
 
     def _send(self, message) -> bool:
         with self._send_lock:
-            conn = self._conn
-            if conn is None:
-                return False
-            try:
-                conn.send(message)
-                return True
-            except (OSError, EOFError, ValueError):
-                return False  # the supervisor sees the process gone on its own read
+            return self._send_locked(message)
+
+    def _send_locked(self, message) -> bool:
+        """`_send` for a caller that holds `_send_lock`."""
+        conn = self._conn
+        if conn is None:
+            return False
+        try:
+            conn.send(message)
+            return True
+        except (OSError, EOFError, ValueError):
+            return False  # the supervisor sees the process gone on its own read
 
     def _spawn_and_test(self) -> float:
         """A new process, re-armed and self-tested; returns the self-test's
@@ -306,12 +326,24 @@ class FailsafeWatchdog:
             self._ready = False
             # An argument list, no shell: this interpreter, the module, its
             # end of the socket pair. The environment is the bridge's own, so
-            # the process finds the same ROS and the same domain.
+            # the process finds the same ROS and the same domain. `-m` puts
+            # the working directory first on `sys.path`, where a `queue.py`
+            # or a `fleetless_bridge/` checkout would shadow what the child
+            # imports: it starts in `/`, with `PYTHONSAFEPATH` (Python 3.11
+            # and later) keeping even that off the path, and with the
+            # directory this package was loaded from first on it.
+            env = dict(os.environ)
+            env["PYTHONSAFEPATH"] = "1"
+            env["PYTHONPATH"] = os.pathsep.join(
+                p for p in (_PACKAGE_PARENT, env.get("PYTHONPATH", "")) if p
+            )
             process = _Process(subprocess.Popen(
                 [sys.executable, "-m", "fleetless_bridge.failsafe_process",
                  str(child_fd), self._node_name + "_failsafe", json.dumps(options)],
                 pass_fds=(child_fd,),
                 stdin=subprocess.DEVNULL,
+                cwd="/",
+                env=env,
             ))
             self._process = process
         finally:
@@ -321,11 +353,16 @@ class FailsafeWatchdog:
             self._conn = parent_conn
         self._await(parent_conn, "ready", START_TIMEOUT_S)
         self._ready = True
-        with self._lock:
-            arms = [(slug, arm, self._owed.get(slug, False)) for slug, arm in self._armed.items()]
-        for slug, (topic, type_name, body, timeout_ms), owed in arms:
-            self._send(("arm", slug, topic, type_name, body, timeout_ms, owed))
-        self._send(("self_test",))
+        # The snapshot and its resend under one hold of the send lock: an
+        # `arm` or `disarm` from the executor goes out before the snapshot
+        # (and is in it) or after the resend, never between them, where the
+        # older arm would overwrite it.
+        with self._send_lock:
+            with self._lock:
+                arms = [(slug, arm, self._owed.get(slug, False)) for slug, arm in self._armed.items()]
+            for slug, (topic, type_name, body, timeout_ms), owed in arms:
+                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, owed))
+            self._send_locked(("self_test",))
         reply = self._await(parent_conn, "self_test", SELF_TEST_TIMEOUT_S)
         return float(reply[1])
 
@@ -348,15 +385,43 @@ class FailsafeWatchdog:
                 return message
             self._handle(message)
 
-    def _end(self, process) -> None:
-        """Ends one process of ours by its PID: SIGTERM first (it fires every
-        armed failsafe), SIGKILL when it does not go."""
+    def _end(self, process, conn) -> None:
+        """Ends one process of ours by its PID. SIGTERM first: a process that
+        answers fires every armed failsafe and is waited for until its
+        readers acknowledged them. One that does not answer within
+        `TERM_ANSWER_TIMEOUT_S` is SIGKILLed. `conn` is read for the answer,
+        so only its one reader passes it; without it the process gets only
+        `TERM_ANSWER_TIMEOUT_S`."""
         if process.is_alive():
             process.terminate()
-            process.join(PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
+            if self._answered_term(process, conn):
+                process.join(PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
         if process.is_alive():
             process.kill()
             process.join(1.0)
+
+    def _answered_term(self, process, conn) -> bool:
+        """Whether the process said `terminating`, or ended, within
+        `TERM_ANSWER_TIMEOUT_S`. Its other reports on the way are handled."""
+        deadline = self._clock() + TERM_ANSWER_TIMEOUT_S
+        if conn is None:
+            process.join(TERM_ANSWER_TIMEOUT_S)
+            return False
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return False
+            try:
+                if not conn.poll(min(remaining, SUPERVISE_INTERVAL_S)):
+                    if not process.is_alive():
+                        return True
+                    continue
+                message = conn.recv()
+            except (OSError, EOFError):
+                return True  # its end closed: it is exiting
+            if message[0] == "terminating":
+                return True
+            self._handle(message)
 
     # --- the supervisor ------------------------------------------------------------
 
@@ -419,6 +484,12 @@ class FailsafeWatchdog:
                     self._owed[message[1]] = False
             log.warning("Publisher slug %r: removed while driven — the bridge published its failsafe",
                         message[1])
+        elif kind == "owed":
+            with self._lock:
+                if message[1] in self._owed:
+                    self._owed[message[1]] = False
+            log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
+                        "replaced — the bridge published it", message[1])
         elif kind == "fire_failed":
             log.error(
                 "Publisher slug %r: its failsafe could not be published — nothing was sent, "
@@ -448,6 +519,8 @@ class FailsafeWatchdog:
                 answer[0].set()
         elif kind == "self_test":
             pass  # a late answer to a test already judged
+        elif kind == "terminating":
+            pass  # a SIGTERM this process did not send, or one already judged
         # "alive" and "ready" only refresh `_last_word_at`.
 
     def _limited(self, slug: str, what: str, level: int, fmt: str, *args) -> None:
@@ -491,7 +564,7 @@ class FailsafeWatchdog:
         # and only then can the send lock be taken.
         process, self._process = self._process, None
         if process is not None:
-            self._end(process)
+            self._end(process, self._conn)
         with self._send_lock:
             conn, self._conn = self._conn, None
         if conn is not None:
