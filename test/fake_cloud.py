@@ -155,7 +155,9 @@ class Session:
     def _record_failsafe_watchdog(self, payload: dict) -> dict:
         """`failsafe_watchdog` is stepped over by `recv` and `recv_raw` for
         the reason `link_mode` is: unsolicited, once after `hello_ok` and on
-        every change. Kept in `cloud.failsafe_watchdogs`."""
+        every change. Validated against the vendored schema and kept in
+        `cloud.failsafe_watchdogs`."""
+        validate_frame("bridge-failsafe-watchdog", payload)
         self._cloud.failsafe_watchdogs.append(payload)
         return payload
 
