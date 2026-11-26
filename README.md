@@ -326,6 +326,9 @@ change, and the bridge runs no server: no HTTP listener, no debug port, no
 control channel other than the WebSocket it opened itself. The one exception
 is the media path of a live video session, which is WebRTC and therefore binds
 by construction; [SECURITY.md](SECURITY.md) states precisely when it exists.
+The bridge starts its own failsafe process, and starts it again after the
+failsafe watchdog fails, which a cloud message can bring about. That command
+line is fixed: this interpreter, the bridge's own module, a file descriptor.
 
 A robot that needs local limits, such as a speed cap or a keep-out area, sets
 them robot-side in ROS, in a node its owner controls. The bridge is not where
