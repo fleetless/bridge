@@ -1868,6 +1868,27 @@ def test_a_mixed_transport_fleet_keeps_same_transport_parallel_and_cross_transpo
     delay_s = 0.3
 
     fleet = [("tcp", "a"), ("tcp", "b"), ("tcp", "c"), ("udp", "x"), ("udp", "y")]
+
+    # "All started together" has to hold where it matters, at the gate. Each
+    # adapter's thread runs its own RTSP preflight before it opens, and on a
+    # busy runner those arrivals spread out by more than one open's
+    # `delay_s`: a `udp` camera that reaches the gate after the other has
+    # finished opens alone, and there is no overlap to see (Lyrical, CI run
+    # 45894259260; fleetless/fleetless#1128). Each first open waits here for
+    # the other four, then goes to the gate.
+    arrived = threading.Barrier(len(fleet))
+
+    def arriving_together(factory):
+        waited = []
+
+        def capture_factory(url, transport):
+            if not waited:
+                waited.append(True)
+                arrived.wait(timeout=10.0)
+            return factory(url, transport)
+
+        return capture_factory
+
     adapters = []
     recs = []
     for transport, key in fleet:
@@ -1880,7 +1901,9 @@ def test_a_mixed_transport_fleet_keeps_same_transport_parallel_and_cross_transpo
                 credentials=None,
                 on_frame=rec.on_frame,
                 on_error=rec.on_error,
-                capture_factory=_rtsp_capture_factory_with_timing(key, starts, finishes, bookkeeping_lock, delay_s),
+                capture_factory=arriving_together(
+                    _rtsp_capture_factory_with_timing(key, starts, finishes, bookkeeping_lock, delay_s)
+                ),
                 socket_factory=_socket_factory(_RTSP_200),
             )
         )
