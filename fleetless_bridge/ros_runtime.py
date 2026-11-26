@@ -2391,9 +2391,12 @@ class RosRuntime:
         - **H2**: still queued behind a job a drain was running, or a drain
           looked at the queue after its enqueue: head-of-line.
         - **H1**: still queued, nothing running, and no drain looked at the
-          queue after its enqueue: the wake-up was lost. The age of the
-          newest subscription callback says whether the executor was serving
-          other callbacks all the while.
+          queue after its enqueue: the wake-up was lost.
+
+        Every reason ends the same way: the jobs queued, the drain looks
+        since its enqueue, and the age of the newest subscription callback,
+        which says whether the executor was serving other callbacks all the
+        while.
 
         Read under `_work_lock`, so a drain cannot move between the
         reads."""
@@ -2408,34 +2411,35 @@ class RosRuntime:
             last_subscription_at = self._last_subscription_at
         enqueued_at = job.enqueued_at
         if done_at is not None and done_at - enqueued_at <= timeout:
-            return "H4", "done after {:.3f} s; the waiter did not see it".format(
+            cause, reason = "H4", "done after {:.3f} s; the waiter did not see it".format(
                 done_at - enqueued_at
             )
-        if taken_at is not None:
-            if done_at is None:
-                return "H3", "taken after {:.3f} s, running for {:.1f} s".format(
-                    taken_at - enqueued_at, now - taken_at
-                )
-            return "H3", "taken after {:.3f} s, done after {:.1f} s".format(
+        elif taken_at is not None and done_at is None:
+            cause, reason = "H3", "taken after {:.3f} s, running for {:.1f} s".format(
+                taken_at - enqueued_at, now - taken_at
+            )
+        elif taken_at is not None:
+            cause, reason = "H3", "taken after {:.3f} s, done after {:.1f} s".format(
                 taken_at - enqueued_at, done_at - enqueued_at
             )
-        if running is not None and running is not job:
-            return "H2", "behind {} running for {:.1f} s, {} jobs queued".format(
+        elif running is not None and running is not job:
+            cause, reason = "H2", "behind {} running for {:.1f} s".format(
                 _work_kind(running.fn),
                 now - running_taken_at if running_taken_at is not None else 0.0,
-                queued,
             )
-        if looks_since > 0:
-            return "H2", "a drain looked {} times since its enqueue, {} jobs queued".format(
-                looks_since, queued
-            )
+        elif looks_since > 0:
+            cause, reason = "H2", "a drain looked at the queue since its enqueue"
+        else:
+            cause, reason = "H1", "no drain since its enqueue"
         if last_subscription_at is None:
             callback = "no subscription callback yet"
         else:
             callback = "newest subscription callback {:.1f} s ago".format(
                 now - last_subscription_at
             )
-        return "H1", "no drain since its enqueue, {} jobs queued, {}".format(queued, callback)
+        return cause, "{}, {} jobs queued, {} drain looks since its enqueue, {}".format(
+            reason, queued, looks_since, callback
+        )
 
     def _report_stall(self, job: _WorkJob, timeout: float) -> None:
         """The WARNING line for one job whose waiter timed out, and its
