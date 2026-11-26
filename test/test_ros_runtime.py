@@ -63,6 +63,7 @@ from fleetless_bridge.protocol import (
     RtspSource,
     ServiceConfig,
     bridge_asset_progress_message,
+    parse_cloud_message,
 )
 from fleetless_bridge import ros_runtime
 from fleetless_bridge.ros_runtime import (
@@ -88,7 +89,7 @@ from fleetless_bridge import sampling
 from fleetless_bridge.goal_state import (
     load_mapping, load_terminal_observations, mapping_path, save_mapping,
 )
-from schemas import validate_frame
+from schemas import SCHEMA_DIR, validate_frame
 
 FIBONACCI_TYPE = "example_interfaces/action/Fibonacci"
 TRIGGER_TYPE = "std_srvs/srv/Trigger"
@@ -1106,6 +1107,131 @@ def test_switching_retention_back_on_starts_from_an_empty_buffer():
         return collected
 
     assert [round(s.value, 1) for s in run(body)] == [0.2]
+
+
+# --- the datapoint fields the runtime acts on -------------------------------
+
+#: Every attribute of a parsed datapoint, as the schema path it came from.
+#: `slug` is the key `doc.datapoints` is read under, not a field of the entry,
+#: so a read of it says nothing about which fields the robot acts on.
+_DATAPOINT_SCHEMA_PATHS = {
+    "slug": None,
+    "topic": "topic",
+    "type": "type",
+    "field": "field",
+    "rate_throttle_hz": "rate_throttle_hz",
+    "low_bandwidth_keep": "low_bandwidth",
+    "numeric.scale": "numeric.scale",
+    "numeric.offset": "numeric.offset",
+    "numeric.unit": "numeric.unit",
+    "retention.enabled": "retention.enabled",
+    "retention.interval_seconds": "retention.interval_seconds",
+    "retention.max_buffer_values": "retention.max_buffer_values",
+}
+
+#: The groups whose members are recorded one by one.
+_DATAPOINT_GROUPS = ("numeric", "retention")
+
+
+class _RecordingDatapoint:
+    """Stands in for a parsed datapoint and records each attribute read, as a
+    dotted path. `numeric` and `retention` come back wrapped as well, so
+    `dp.retention.enabled` is recorded as `retention.enabled`, also when the
+    group is handed on to a helper such as `_backlog_depth`."""
+
+    def __init__(self, target, reads, prefix=""):
+        # Set past `__getattr__`, which sees only what the instance lacks.
+        object.__setattr__(self, "_target", target)
+        object.__setattr__(self, "_reads", reads)
+        object.__setattr__(self, "_prefix", prefix)
+
+    def __getattr__(self, name):
+        value = getattr(self._target, name)
+        if not self._prefix and name in _DATAPOINT_GROUPS:
+            return _RecordingDatapoint(value, self._reads, name + ".")
+        self._reads.append(self._prefix + name)
+        return value
+
+    def __setattr__(self, name, value):
+        raise AttributeError("a parsed datapoint is frozen; something set {!r}".format(name))
+
+
+def _every_field_datapoint():
+    """A datapoint that sets every field the format has, so nothing the
+    runtime could read is left at its default."""
+    return {
+        "topic": "/battery",
+        "type": "sensor_msgs/msg/BatteryState",
+        "field": "percentage",
+        "rate_throttle_hz": 5,
+        "low_bandwidth": "keep",
+        "numeric": {"scale": 100, "offset": 0.5, "unit": "%", "decimals": 1},
+        "retention": {"enabled": True, "interval_seconds": 60, "max_buffer_values": 100},
+        "description": "How full the battery is.",
+        "chart": {"y_min": 0, "y_max": 100, "style": "line", "default_window_minutes": 60},
+        "alerts": {"battery_low": {"condition": {"fire_at": 10, "resolve_at": 15}}},
+        "role": "observe",
+    }
+
+
+def test_the_datapoint_fields_the_runtime_reads_are_the_contracts_robot_fields():
+    """Contracts' `ROBOT_DATAPOINT_FIELDS` names the datapoint fields the
+    bridge acts on, and the cloud pushes a publish that changes any of them.
+    This checks the list where it is true or not: at what the config apply
+    reads. A field the runtime starts to read is red here until contracts
+    lists it, and then red in the cloud until a publish of it is pushed.
+
+    Parsing is not counted: `numeric.unit` and `retention.interval_seconds`
+    are parsed and never used, and the apply is what acts. Both apply paths
+    run, `_create` and then `_update_sampler`, and the union counts."""
+    schema = json.loads((SCHEMA_DIR / "cloud-config.schema.json").read_text())
+    datapoint_schema = schema["properties"]["doc"]["properties"]["datapoints"]["additionalProperties"]
+    payload = _every_field_datapoint()
+    assert sorted(payload) == sorted(datapoint_schema["properties"])
+    for group in _DATAPOINT_GROUPS:
+        assert sorted(payload[group]) == sorted(datapoint_schema["properties"][group]["properties"])
+    frame = {"type": "config", "version": 1, "doc": {"fleetless": 1, "datapoints": {"battery": payload}}}
+    validate_frame("cloud-config", frame)
+    parsed = parse_cloud_message(json.dumps(frame)).datapoints["battery"]
+
+    # The table knows every attribute a parsed datapoint has, so one added
+    # later is placed there before a read of it can be judged.
+    attributes = [f.name for f in dataclasses.fields(parsed) if f.name not in _DATAPOINT_GROUPS] + [
+        "{}.{}".format(group, f.name)
+        for group in _DATAPOINT_GROUPS
+        for f in dataclasses.fields(getattr(parsed, group))
+    ]
+    assert sorted(attributes) == sorted(_DATAPOINT_SCHEMA_PATHS)
+
+    reads = []
+    recorded = _RecordingDatapoint(parsed, reads)
+    paths = []
+
+    async def body(rt):
+        # Which apply path each run took, so "both paths count" is checked
+        # and not assumed: an apply that learned to skip an unchanged
+        # datapoint would leave `_update_sampler` out of this test unseen.
+        for name in ("_create", "_update_sampler"):
+            def spy(slug, dp, original=getattr(rt, name), name=name):
+                paths.append(name)
+                return original(slug, dp)
+
+            setattr(rt, name, spy)
+        created = await rt.apply_config({"battery": recorded})
+        # The same topic and type again: the sampler is updated in place.
+        updated = await rt.apply_config({"battery": recorded})
+        return created, updated
+
+    assert run(body) == ([], [])
+    assert paths == ["_create", "_update_sampler"]
+
+    unknown = sorted({read for read in reads if read not in _DATAPOINT_SCHEMA_PATHS})
+    assert unknown == [], "the runtime reads {} of a datapoint; add it to _DATAPOINT_SCHEMA_PATHS".format(unknown)
+    read = {_DATAPOINT_SCHEMA_PATHS[attribute] for attribute in reads} - {None}
+    constants = json.loads(pathlib.Path(ros_runtime.__file__).with_name("contracts_constants.json").read_text())
+    listed = set(constants["ROBOT_DATAPOINT_FIELDS"])
+    assert sorted(read - listed) == [], "read by the runtime, not in contracts' ROBOT_DATAPOINT_FIELDS"
+    assert sorted(listed - read) == [], "in contracts' ROBOT_DATAPOINT_FIELDS, never read by the runtime"
 
 
 # --- actions: apply_actions, the diff ------------------------------------------
