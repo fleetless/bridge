@@ -107,12 +107,13 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@18.2.0-next.2
+    Source: @fleetless/contracts@18.2.0
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-A prerelease, pinned while the contracts change of fleetless/fleetless#1222 is
-unreleased; the release replaces this line. Diffed file by file against the
-copies the previous pin (15.4.0) carried. New: `bridge-datapoint-dropped` in
+The release of the contracts change of fleetless/fleetless#1222; every
+vendored file is byte-identical to the 18.2.0-next.2 prerelease it replaces.
+Diffed file by file against the copies the previous pin (15.4.0) carried.
+New: `bridge-datapoint-dropped` in
 both directories. Changed, in both directories: `bridge-job-update` and
 `bridge-job-status` (an optional `result_omitted` on the frame and on each
 entry: `reason` `too_large`, `bytes`, `limit_bytes`) and `bridge-introspect`
