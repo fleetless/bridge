@@ -131,6 +131,43 @@ def _writable(conn, timeout_s: float) -> bool:
     return bool(writable)
 
 
+#: Fast DDS's choice of built-in transports, read from the environment.
+TRANSPORTS_VARIABLE = "FASTDDS_BUILTIN_TRANSPORTS"
+
+#: The failsafe process's transports. Fast DDS 2.x shared memory sleeps up
+#: to 333 ms in `Port::healthy_check` the first time a process sends to a
+#: port more than about a second old whose listener looks idle, and it does
+#: so under a lock every send of that participant waits on. A new failsafe
+#: process opens the bridge's own long-lived port that way, so a fire could
+#: wait a third of a second (fleetless/fleetless#1124). Over UDP the process
+#: opens no shared-memory port at all.
+CHILD_TRANSPORTS = "UDPv4"
+
+
+def child_environment(environ) -> Dict[str, str]:
+    """The failsafe process's environment: the bridge's own, so it finds
+    the same ROS and the same domain, with three changes.
+
+    - `-m` puts the working directory first on `sys.path`, where a
+      `queue.py` or a `fleetless_bridge/` checkout would shadow what the
+      child imports. It starts in `/`, with `PYTHONSAFEPATH` (Python 3.11
+      and later) keeping even that off the path, and with the directory
+      this package was loaded from first on it.
+    - `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` (`CHILD_TRANSPORTS`), unless the
+      robot set the variable to something other than `DEFAULT`: an explicit
+      choice is kept, and the bridge says what it costs. A Fast DDS profile
+      that defines its own transports overrides the variable in either case.
+    """
+    env = dict(environ)
+    env["PYTHONSAFEPATH"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        p for p in (_PACKAGE_PARENT, env.get("PYTHONPATH", "")) if p
+    )
+    if env.get(TRANSPORTS_VARIABLE, "").strip().upper() in ("", "DEFAULT"):
+        env[TRANSPORTS_VARIABLE] = CHILD_TRANSPORTS
+    return env
+
+
 class _Gone(Exception):
     """The process ended or did not answer in time."""
 
@@ -174,6 +211,7 @@ class FailsafeWatchdog:
         self._log_limit: Dict[Tuple[str, str], float] = {}
         self._request_seq = 0
         self._requests: Dict[int, list] = {}
+        self._transports_warned = False
 
     # --- what the runtime asks -------------------------------------------------
 
@@ -325,18 +363,10 @@ class FailsafeWatchdog:
                 raise _Gone("the bridge is stopping")
             self._ready = False
             # An argument list, no shell: this interpreter, the module, its
-            # end of the socket pair. The environment is the bridge's own, so
-            # the process finds the same ROS and the same domain. `-m` puts
-            # the working directory first on `sys.path`, where a `queue.py`
-            # or a `fleetless_bridge/` checkout would shadow what the child
-            # imports: it starts in `/`, with `PYTHONSAFEPATH` (Python 3.11
-            # and later) keeping even that off the path, and with the
-            # directory this package was loaded from first on it.
-            env = dict(os.environ)
-            env["PYTHONSAFEPATH"] = "1"
-            env["PYTHONPATH"] = os.pathsep.join(
-                p for p in (_PACKAGE_PARENT, env.get("PYTHONPATH", "")) if p
-            )
+            # end of the socket pair, and `child_environment`.
+            env = child_environment(os.environ)
+            if env.get(TRANSPORTS_VARIABLE) != CHILD_TRANSPORTS:
+                self._warn_transports_once(env.get(TRANSPORTS_VARIABLE))
             process = _Process(subprocess.Popen(
                 [sys.executable, "-m", "fleetless_bridge.failsafe_process",
                  str(child_fd), self._node_name + "_failsafe", json.dumps(options)],
@@ -365,6 +395,17 @@ class FailsafeWatchdog:
             self._send_locked(("self_test",))
         reply = self._await(parent_conn, "self_test", SELF_TEST_TIMEOUT_S)
         return float(reply[1])
+
+    def _warn_transports_once(self, value: Optional[str]) -> None:
+        if self._transports_warned:
+            return
+        self._transports_warned = True
+        log.warning(
+            "Failsafe watchdog: %s=%s is kept for the failsafe process, which otherwise uses "
+            "%s. With shared memory, a failsafe right after the process is restarted can go "
+            "out up to 333 ms late (Fast DDS port health check); the watchdog then reports "
+            "late_fire.", TRANSPORTS_VARIABLE, value, CHILD_TRANSPORTS,
+        )
 
     def _await(self, conn, kind: str, timeout_s: float):
         deadline = self._clock() + timeout_s

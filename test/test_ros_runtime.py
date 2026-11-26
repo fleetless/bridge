@@ -692,14 +692,24 @@ def _start_witness_process(topic):
     Started with `sys.executable` and this process's environment, so it is in
     the same ROS domain and uses the same RMW and Fast DDS as the bridge under
     test. Does not wait for it: `wait_for("ready", ...)` does. Every caller
-    calls `stop()` in `finally`."""
+    calls `stop()` in `finally`.
+
+    On UDP, as the failsafe process is (`failsafe.CHILD_TRANSPORTS`): every
+    sample it measures comes from that process over UDP either way. With
+    shared memory the witness would only add a stall of its own. Fast DDS 2.x
+    sleeps up to 333 ms the first time it sends to the bridge's main process's
+    port once that port is more than a second old, and the samples it is
+    receiving wait too. That is a limit of the subscriber's Fast DDS, recorded
+    in the spec, not lateness of the bridge."""
+    env = os.environ.copy()
+    env["FASTDDS_BUILTIN_TRANSPORTS"] = "UDPv4"
     process = subprocess.Popen(
         [sys.executable, str(WITNESS_PROCESS), topic],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=os.environ.copy(),
+        env=env,
     )
     return _WitnessProcess(topic, process)
 

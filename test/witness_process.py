@@ -14,6 +14,9 @@ robot's node would use, and writes one JSON object per line to stdout:
 
   {"ev": "ready", "t": ...}            once the subscription exists
   {"ev": "matched", "t": ...}          when its side first sees a publisher
+  {"ev": "publishers", "t": ..., "n": ..., "prev": ...}
+                                       whenever the number of publishers it
+                                       has matched changes
   {"ev": "rx", "t": ..., "x": ...}     for every sample; x is linear.x
 
 `t` is `time.monotonic()`. Both processes run on one kernel, so the test's
@@ -35,6 +38,10 @@ from rclpy.executors import ExternalShutdownException
 #: the poll has to be finer than the gap it is meant to resolve.
 MATCH_POLL_S = 0.001
 
+#: How often it counts its publishers afterwards, for `publishers`: a
+#: replaced failsafe process brings a new writer to a witness that stays.
+COUNT_POLL_S = 0.005
+
 
 def emit(ev, **fields):
     fields["ev"] = ev
@@ -52,18 +59,27 @@ def main(argv):
     node = rclpy.create_node("test_witness_process_{}".format(os.getpid()))
     subscription = node.create_subscription(Twist, topic, lambda msg: emit("rx", x=msg.linear.x), 10)
 
-    def matched():
+    def publishers():
         # The same rule as `_wait_until_matched`: the subscription's own count
         # where rclpy has one (rclpy 7 and later), the node's graph on rclpy 3.
         count = getattr(subscription, "get_publisher_count", None)
         if count is not None:
-            return count() > 0
-        return node.count_publishers(topic) > 0
+            return count()
+        return node.count_publishers(topic)
+
+    last = [0]
+
+    def count_poll():
+        n = publishers()
+        if n != last[0]:
+            emit("publishers", n=n, prev=last[0])
+            last[0] = n
 
     def poll():
-        if matched():
+        if publishers() > 0:
             emit("matched")
             timer.cancel()
+            node.create_timer(COUNT_POLL_S, count_poll)
 
     timer = node.create_timer(MATCH_POLL_S, poll)
     emit("ready")

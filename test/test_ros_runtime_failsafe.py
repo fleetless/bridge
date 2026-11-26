@@ -476,24 +476,82 @@ def test_a_killed_failsafe_process_s_owed_failsafe_comes_from_its_replacement():
     assert rx[1][0] - killed_at <= 10.0  # the restart and a match, not the minute
 
 
+#: Kill-and-replace cycles in the killed-process test.
+KILL_CYCLES = 4
+
+
+def _publisher_joined_since(witness, since):
+    """Whether the witness matched one more publisher after `since`: the
+    replacement's new writer. A killed process's writer only ever leaves."""
+    return any(e["ev"] == "publishers" and e["t"] >= since and e["n"] > e["prev"]
+               for e in list(witness.events))
+
+
 def test_a_killed_failsafe_process_is_failed_and_replaced():
+    """SIGKILL, `crashed`, a new process, and the bound again, for a witness
+    that was already running, as a robot's subscriber is: four cycles of
+    three silences each.
+
+    The witness starts before the first kill, and that is deliberate (André,
+    2026-11-26). A subscriber that first discovers a bridge process older
+    than about a second can stall once for up to 333 ms around that
+    discovery, on its own side: Fast DDS 2.x shared memory sleeps in
+    `Port::healthy_check` the first time it sends to such a port (fixed
+    upstream in 3.6.x). That is the subscriber's Fast DDS, not the bridge;
+    the spec records the limit."""
+
     async def body(rt):
         assert await rt.apply_publishers(_cfg()) == []
-        pid = rt._failsafe.pid
-        os.kill(pid, signal.SIGKILL)  # our own child, by its PID
-        wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
-        reason = rt.failsafe_state()[1]
-        wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
         witness = await _matched_witness(rt)
+        reasons, lateness = [], []
         try:
-            lateness = await _silences(rt, witness, 3)
+            for _ in range(KILL_CYCLES):
+                killed_at = time.monotonic()
+                os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+                wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+                reasons.append(rt.failsafe_state()[1])
+                wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+                # Both sides of the new writer: the process's count, and the
+                # witness's own publishers going up.
+                wait_until(lambda: rt._failsafe.subscription_count("drive") > 0,
+                           timeout=WITNESS_PROCESS_READY_TIMEOUT_S)
+                wait_until(lambda: _publisher_joined_since(witness, killed_at),
+                           timeout=WITNESS_PROCESS_READY_TIMEOUT_S)
+                lateness += await _silences(rt, witness, 3)
         finally:
             witness.stop()
-        return reason, lateness
+        return reasons, lateness
 
-    reason, lateness = run(body)
-    assert reason == REASON_CRASHED
+    reasons, lateness = run(body)
+    _report("after SIGKILL and replacement ({} cycles)".format(KILL_CYCLES), lateness)
+    assert reasons == [REASON_CRASHED] * KILL_CYCLES
+    assert len(lateness) == 3 * KILL_CYCLES
     assert max(lateness) <= LATENESS_BOUND_MS
+
+
+def test_the_failsafe_process_opens_no_shared_memory_port():
+    """It runs on UDP (`failsafe.CHILD_TRANSPORTS`): after a full exchange
+    with a subscriber in another process, it has mapped no Fast DDS
+    shared-memory port, whose first open can stall every send of the
+    process for a third of a second."""
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg()) == []
+        witness = await _matched_witness(rt)
+        try:
+            await _silences(rt, witness, 2)
+            pid = rt._failsafe.pid
+            with open("/proc/{}/environ".format(pid), "rb") as f:
+                environ = f.read().split(b"\0")
+            with open("/proc/{}/maps".format(pid)) as f:
+                ports = sorted({line.split()[-1] for line in f if "fastrtps_port" in line})
+            return environ, ports
+        finally:
+            witness.stop()
+
+    environ, ports = run(body)
+    assert b"FASTDDS_BUILTIN_TRANSPORTS=UDPv4" in environ
+    assert ports == []
 
 
 def test_the_failsafe_process_fires_when_the_bridge_is_gone():
