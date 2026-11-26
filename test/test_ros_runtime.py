@@ -3055,7 +3055,7 @@ def test_an_aborted_external_goal_fails_as_aborted_without_a_result():
 def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job():
     """"server_is_ready() raising: treated as not-ready for the debounce,
     and logged once per job" (spec, "Error handling") — not once per tick,
-    which at `FAILSAFE_CHECK_INTERVAL_S` would be hundreds of log lines for
+    which at `WATCHDOG_INTERVAL_S` would be hundreds of log lines for
     one outage. `server_is_ready` is monkey-patched on the real
     `ActionClient` instance `apply_actions` already created — an instance
     attribute shadows the bound method for this object alone, so nothing

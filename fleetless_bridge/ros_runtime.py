@@ -6416,7 +6416,7 @@ class RosRuntime:
     def _on_robot_description(self, msg: StringMsg) -> None:
         """The subscription callback for `DEFAULT_URDF_TOPIC` — runs on the
         executor thread, for the life of the node, independent of any
-        session being connected (same as `_check_failsafes`). Availability
+        session being connected (same as the failsafe watchdog). Availability
         only: this queues a report, never bytes.
 
         Dedupes by content hash: this is the *change* channel, queueing a
