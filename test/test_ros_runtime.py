@@ -777,7 +777,7 @@ async def _drain_until_terminal(rt, timeout=5.0):
             return updates
 
 
-async def _with_runtime(body, **runtime_kwargs):
+async def _with_runtime(body, wait_for_failsafe=True, **runtime_kwargs):
     # B3: every test gets its own, empty persisted-goal-mapping directory
     # unless it names its own — countless tests below reuse the same
     # slugs and job ids ("count"/"job-1"), and without this they would all
@@ -789,8 +789,17 @@ async def _with_runtime(body, **runtime_kwargs):
     rt = RosRuntime(node_name="test_runtime_{}".format(id(body)), **runtime_kwargs)
     rt.start(asyncio.get_event_loop())
     # The failsafe process starts beside the runtime; until its self-test
-    # passed no publish is taken. Most tests here are not about that.
-    wait_until(lambda: rt.failsafe_state()[0] != "starting", timeout=30.0)
+    # passed no publish is taken. Most tests here are not about that, so they
+    # wait for `ok`: a first self-test late on a loaded machine fails, and the
+    # supervisor retries it every second. A test that makes the self-test
+    # late on purpose waits only for the first verdict.
+    late_on_purpose = (runtime_kwargs.get("failsafe_options") or {}).get("block_before_self_test_s")
+    if not wait_for_failsafe:
+        pass
+    elif late_on_purpose:
+        wait_until(lambda: rt.failsafe_state()[0] != "starting", timeout=30.0)
+    else:
+        wait_until(lambda: rt.failsafe_state()[0] == "ok", timeout=30.0)
     # Tests default to "a session is connected", matching what every test
     # here already assumed before samples had a connected/disconnected
     # distinction. Buffering tests below call rt.set_connected(False)
@@ -4474,18 +4483,64 @@ def test_a_service_that_never_responds_times_out_and_frees_the_slug():
     assert update.error[0] == "service_timeout"
 
 
+#: How much later than one interval a tick may start after the one before
+#: it: the timer's wake-up jitter, measured in microseconds on orca.
+TICK_JITTER_MS = 1.0
+
+
+class _Settled(dict):
+    """Job id -> the start of the watchdog tick that settled it, with
+    `previous[job_id]`, the start of the tick before that one (`None` when
+    it was the first). Both `time.monotonic()`, as the deadlines are."""
+
+    def __init__(self):
+        super().__init__()
+        self.previous = {}
+
+
 def _record_settled_at(rt):
-    """Wraps `_emit_job`: job id -> `time.monotonic()` of its terminal update."""
-    settled = {}
+    """Wraps the watchdog tick and `_emit_job` to learn which tick settled
+    each job. Called before the tick is armed: the timer takes the wrapped
+    callback."""
+    settled = _Settled()
     emit = rt._emit_job
+    check = rt._check_watchdogs
+    # `current` only while a tick runs; `last` is the start of the latest.
+    ticks = {"current": None, "previous": None, "last": None}
+
+    def checking():
+        now = time.monotonic()
+        ticks["previous"], ticks["last"], ticks["current"] = ticks["last"], now, now
+        try:
+            return check()
+        finally:
+            ticks["current"] = None
 
     def recording(job_id, slug, state, **kwargs):
-        if state in ("failed", "lost", "succeeded", "cancelled"):
-            settled.setdefault(job_id, time.monotonic())
+        if state in ("failed", "lost", "succeeded", "cancelled") and job_id not in settled:
+            settled[job_id] = ticks["current"]
+            settled.previous[job_id] = ticks["previous"] if ticks["current"] is not None else None
         return emit(job_id, slug, state, **kwargs)
 
     rt._emit_job = recording
+    rt._check_watchdogs = checking
     return settled
+
+
+def _assert_settled_within_one_tick(settled, job_id, deadline):
+    """The deadline is met within one tick: the first tick that starts on or
+    after it settles the job, and that tick started one interval after the
+    tick before it (give or take the timer's wake jitter). A tick that did
+    not exist, or a deadline missed by a tick, fails here."""
+    started_at, previous = settled[job_id], settled.previous[job_id]
+    assert started_at is not None, "no watchdog tick settled {}".format(job_id)
+    assert previous is None or previous < deadline, (
+        "a tick at {:.1f} ms after the deadline did not settle {}".format(
+            (previous - deadline) * 1000.0, job_id))
+    late_ms = (started_at - deadline) * 1000.0
+    assert late_ms <= WATCHDOG_INTERVAL_S * 1000.0 + TICK_JITTER_MS, late_ms
+    if previous is not None:
+        assert (started_at - previous) * 1000.0 <= WATCHDOG_INTERVAL_S * 1000.0 + TICK_JITTER_MS
 
 
 def test_the_watchdog_tick_exists_only_while_a_service_call_is_due():
@@ -4505,15 +4560,15 @@ def test_the_watchdog_tick_exists_only_while_a_service_call_is_due():
             await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)  # running
             update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
             await asyncio.sleep(0.1)
-            return idle, due, update, (settled["job-1"] - deadline) * 1000.0, rt._watchdog_timer
+            return idle, due, update, (settled, deadline), rt._watchdog_timer
         finally:
             stop_server()
 
-    idle, due, update, late_ms, after = run(body)
+    idle, due, update, (settled, deadline), after = run(body)
     assert idle is None
     assert due
     assert update.error[0] == "service_timeout"
-    assert late_ms <= WATCHDOG_INTERVAL_S * 1000.0
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
     assert after is None
 
 
@@ -4528,13 +4583,129 @@ def test_the_watchdog_tick_exists_only_while_a_goal_waits_for_acceptance():
         update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
         rt.jobs.mark_delivered(update)
         await asyncio.sleep(0.1)
-        return idle, due, update, (settled["job-1"] - deadline) * 1000.0, rt._watchdog_timer
+        return idle, due, update, (settled, deadline), rt._watchdog_timer
 
-    idle, due, update, late_ms, after = run(body)
+    idle, due, update, (settled, deadline), after = run(body)
     assert idle is None
     assert due
     assert update.error[0] == "goal_timeout"
-    assert late_ms <= WATCHDOG_INTERVAL_S * 1000.0
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
+def test_the_watchdog_tick_exists_only_while_a_terminal_result_is_awaited(monkeypatch):
+    """A goal seen terminal whose result never comes: the tick exists while
+    the job runs, the job ends `job_lost` within one tick of
+    `TERMINAL_RESULT_WAIT_S` (shrunk here), and the tick goes."""
+    monkeypatch.setattr(ros_runtime, "TERMINAL_RESULT_WAIT_S", 0.3)
+
+    async def body(rt):
+        idle = rt._watchdog_timer
+        settled = _record_settled_at(rt)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        tracker = rt._actions["count"].tracker
+        goal_id = "33333333-3333-4333-8333-333333333333"
+
+        def start_and_see_terminal():
+            # On the executor, as the invoke and the status callback run.
+            rt.jobs.start("job-1", "count", "action")
+            rt._job_goal_ids["job-1"] = goal_id
+            tracker.register_own_goal(goal_id, "job-1")
+            tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+            rt._arm_watchdog()
+            return tracker.terminal_seen_at(goal_id)
+
+        observed = rt._enqueue(start_and_see_terminal).result(timeout=5.0)
+        due = rt._watchdog_timer is not None
+        update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        rt.jobs.mark_delivered(update)
+        await asyncio.sleep(0.1)
+        deadline = observed + ros_runtime.TERMINAL_RESULT_WAIT_S
+        return idle, due, update, (settled, deadline), rt._watchdog_timer
+
+    idle, due, update, (settled, deadline), after = run(body)
+    assert idle is None
+    assert due
+    assert (update.state, update.error[0]) == ("lost", "job_lost")
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
+def test_the_watchdog_tick_exists_only_while_an_action_server_is_watched(monkeypatch):
+    """An accepted goal whose server vanishes: the tick exists while the
+    goal is active, the job ends `action_server_lost` within one tick of the
+    debounce (shrunk here) running out, and the tick goes."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_LIVENESS_DEBOUNCE_S", 0.5)
+
+    async def body(rt):
+        idle = rt._watchdog_timer
+        settled = _record_settled_at(rt)
+        expired_at = []
+        settle = rt._settle_action_server_lost
+
+        def recording(slug, entry, goal_ids):
+            expired_at.append(entry.liveness_since + ros_runtime.ACTION_SERVER_LIVENESS_DEBOUNCE_S)
+            return settle(slug, entry, goal_ids)
+
+        rt._settle_action_server_lost = recording
+        stop_server = _start_fibonacci_server(steps=60, step_delay=0.05)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+        first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        assert first.state == "running"
+        wait_until(lambda: rt._actions["count"].liveness_confirmed_ready, timeout=15.0)
+        due = rt._watchdog_timer is not None
+        stop_server()  # the server vanishes mid-goal
+        updates = await _drain_until_terminal(rt, timeout=10.0)
+        rt.jobs.mark_delivered(updates[-1])
+        await asyncio.sleep(0.1)
+        return idle, due, updates[-1], (settled, expired_at[0]), rt._watchdog_timer
+
+    idle, due, update, (settled, deadline), after = run(body)
+    assert idle is None
+    assert due
+    assert (update.state, update.error[0]) == ("lost", "action_server_lost")
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
+def test_the_watchdog_tick_exists_only_while_a_reconciled_goal_is_awaited(monkeypatch):
+    """A goal re-attached after a restart whose server is gone: the tick
+    exists while it is reconciled, the job ends `action_server_lost` within
+    one tick of its deadline (discovery grace plus debounce, both shrunk
+    here), and the tick goes."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_DISCOVERY_GRACE_S", 0.3)
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_LIVENESS_DEBOUNCE_S", 0.3)
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.1, own_context=True)
+        try:
+            await _crash_mid_goal(state_dir, "test_tick_reconciled_before")
+        finally:
+            stop_server()
+        rt2 = RosRuntime(
+            node_name="test_tick_reconciled_after_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        settled = _record_settled_at(rt2)
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            deadline = rt2._reconciling["job-1"][2]
+            due = rt2._watchdog_timer is not None
+            updates = await _drain_until_terminal(rt2, timeout=10.0)
+            rt2.jobs.mark_delivered(updates[-1])
+            await asyncio.sleep(0.1)
+            return due, updates[-1], (settled, deadline), rt2._watchdog_timer
+        finally:
+            rt2.stop()
+
+    due, update, (settled, deadline), after = asyncio.run(body())
+    assert due
+    assert (update.state, update.error[0]) == ("lost", "action_server_lost")
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
     assert after is None
 
 

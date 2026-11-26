@@ -3,7 +3,7 @@
 every `hello_ok`, and again on every change while a session is open."""
 import asyncio
 
-from fake_cloud import FakeCloud
+from fake_cloud import FakeCloud, sequence
 from helpers import make_client, run_until
 from test_client_datapoints import FakeRos
 
@@ -88,6 +88,45 @@ def test_a_watchdog_still_starting_says_nothing():
         return box
 
     assert asyncio.run(scenario())["all"] == []
+
+
+def test_a_change_while_no_session_is_open_is_sent_by_the_next_hello_ok_only():
+    """Nothing goes out while the socket is closed: the next `hello_ok`
+    restates the state as it is then, once."""
+    ros = FakeRos()
+    ros.failsafe_state_value = ("ok", None, 0.4)
+
+    async def scenario():
+        box = {}
+
+        async def first(session):
+            await session.recv_hello()
+            await session.accept()
+            box["first"] = await session.recv_failsafe_watchdog()
+            await session.close()
+
+        async def second(session):
+            await session.recv_hello()
+            # Connected again, but no session until `hello_ok`: the change
+            # here goes nowhere, and `hello_ok` restates it.
+            ros.failsafe_state_value = ("failed", "late_fire", 23.5)
+            ros.failsafe_callback("failed", "late_fire", 23.5)
+            await session.accept()
+            box["second"] = await session.recv_failsafe_watchdog()
+            await asyncio.sleep(0.1)
+            box["done"] = True
+            await session.drain()
+
+        async with FakeCloud(sequence(first, second)) as cloud:
+            client = make_client(cloud, ros=ros)
+            await run_until(client, lambda: "done" in box)
+            box["all"] = [(f["state"], f["reason"]) for f in cloud.failsafe_watchdogs]
+        return box
+
+    box = asyncio.run(scenario())
+    assert box["first"]["state"] == "ok"
+    assert (box["second"]["state"], box["second"]["reason"]) == ("failed", "late_fire")
+    assert box["all"] == [("ok", None), ("failed", "late_fire")]
 
 
 def test_the_frame_carries_no_negative_lateness():

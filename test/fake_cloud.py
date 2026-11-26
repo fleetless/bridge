@@ -101,6 +101,8 @@ class Session:
         self._stepped_over_link_modes = deque()
         # `failsafe_watchdog` frames `recv_failsafe_watchdog` handed out.
         self._failsafe_watchdogs_read = []
+        # This session's frames; `cloud.failsafe_watchdogs` holds every session's.
+        self._failsafe_watchdogs = []
 
     async def recv(self) -> dict:
         """The next JSON frame that is not a `link_mode`.
@@ -158,6 +160,7 @@ class Session:
         every change. Validated against the vendored schema and kept in
         `cloud.failsafe_watchdogs`."""
         validate_frame("bridge-failsafe-watchdog", payload)
+        self._failsafe_watchdogs.append(payload)
         self._cloud.failsafe_watchdogs.append(payload)
         return payload
 
@@ -211,8 +214,8 @@ class Session:
         """The next `failsafe_watchdog`, whether `recv` already stepped over
         it or it is still to come; any other frame first is a failure."""
         seen = len(self._failsafe_watchdogs_read)
-        if len(self._cloud.failsafe_watchdogs) > seen:
-            payload = self._cloud.failsafe_watchdogs[seen]
+        if len(self._failsafe_watchdogs) > seen:
+            payload = self._failsafe_watchdogs[seen]
         else:
             while True:
                 raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
