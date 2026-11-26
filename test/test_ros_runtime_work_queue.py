@@ -142,7 +142,10 @@ def test_a_lost_wake_up_is_h1_while_the_executor_serves_subscriptions(records):
     assert line["cause"] == "H1"
     assert line["kind"] == "test_a_lost_wake_up_is_h1_while_the_executor_serves_subscriptions.body"
     assert float(line["waited"]) >= 0.5
-    assert line["reason"].startswith("no drain since its enqueue, 1 jobs queued, newest subscription callback ")
+    assert line["reason"].startswith(
+        "no drain since its enqueue, 1 jobs queued, 0 drain looks since its enqueue, "
+        "newest subscription callback "
+    )
     age = float(re.search(r"newest subscription callback ([0-9.]+) s ago", line["reason"]).group(1))
     assert age < 2.0
 
@@ -159,7 +162,10 @@ def test_a_lost_wake_up_without_subscriptions_says_so(records):
     run(body)
     line = _one_stall(records)
     assert line["cause"] == "H1"
-    assert line["reason"] == "no drain since its enqueue, 1 jobs queued, no subscription callback yet"
+    assert line["reason"] == (
+        "no drain since its enqueue, 1 jobs queued, 0 drain looks since its enqueue, "
+        "no subscription callback yet"
+    )
 
 
 def test_a_job_behind_one_that_holds_the_executor_is_h2(records):
@@ -184,7 +190,8 @@ def test_a_job_behind_one_that_holds_the_executor_is_h2(records):
     assert line["cause"] == "H2"
     assert re.fullmatch(
         r"behind test_a_job_behind_one_that_holds_the_executor_is_h2\.hold_the_executor "
-        r"running for [0-9.]+ s, 1 jobs queued",
+        r"running for [0-9.]+ s, 1 jobs queued, [0-9]+ drain looks since its enqueue, "
+        r"(newest subscription callback [0-9.]+ s ago|no subscription callback yet)",
         line["reason"],
     ), line["reason"]
 
@@ -197,7 +204,12 @@ def test_a_job_that_outlasts_its_timeout_is_h3(records):
     run(body)
     line = _one_stall(records)
     assert line["cause"] == "H3"
-    assert re.fullmatch(r"taken after [0-9.]+ s, running for [0-9.]+ s", line["reason"]), line["reason"]
+    assert re.fullmatch(
+        r"taken after [0-9.]+ s, running for [0-9.]+ s"
+        r", [0-9]+ jobs queued, [0-9]+ drain looks since its enqueue, "
+        r"(newest subscription callback [0-9.]+ s ago|no subscription callback yet)",
+        line["reason"],
+    ), line["reason"]
 
 
 def test_a_finished_job_whose_waiter_timed_out_is_h4(records):
@@ -222,7 +234,12 @@ def test_a_finished_job_whose_waiter_timed_out_is_h4(records):
     run(body)
     line = _one_stall(records)
     assert line["cause"] == "H4"
-    assert re.fullmatch(r"done after [0-9.]+ s; the waiter did not see it", line["reason"]), line["reason"]
+    assert re.fullmatch(
+        r"done after [0-9.]+ s; the waiter did not see it"
+        r", [0-9]+ jobs queued, [0-9]+ drain looks since its enqueue, "
+        r"(newest subscription callback [0-9.]+ s ago|no subscription callback yet)",
+        line["reason"],
+    ), line["reason"]
 
 
 def test_the_blocking_waiter_of_stop_reports_the_same_way(records):
