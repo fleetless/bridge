@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# The turtle-sim image with the bridge of a checkout in place of its own, plus
+# py-spy and the failsafe probe. A development fixture, never shipped: it is
+# what the bridge is measured in without a robot.
+#
+#   docker build -f tools/cpu-sample/Dockerfile.sim \
+#       --build-context bridge=<a bridge checkout> \
+#       -t cpu-sample-sim:<name> tools/cpu-sample
+#
+# The context is this directory (the probe and the CPU sample). The named
+# context `bridge` is the checkout whose `fleetless_bridge/` replaces the
+# installed package, so the same file builds the bridge before a change and
+# after it. Nothing else of the image changes: the simulator, its cameras,
+# the launch file and the pinned bridge's dependencies stay as released.
+ARG TURTLE_SIM=ghcr.io/fleetless/turtle-sim:0.3.3
+FROM ${TURTLE_SIM}
+
+ARG PY_SPY_VERSION=0.4.1
+
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends python3-pip \
+ && pip3 install --no-cache-dir --break-system-packages "py-spy==${PY_SPY_VERSION}" \
+ && rm -rf /var/lib/apt/lists/*
+
+# The package as `setup.py` installs it: the directory and its one data file.
+# Byte code left in the checkout is not taken along.
+RUN rm -rf "/opt/ros/$ROS_DISTRO/lib/python3.12/site-packages/fleetless_bridge"
+COPY --from=bridge fleetless_bridge/ /opt/ros/jazzy/lib/python3.12/site-packages/fleetless_bridge/
+RUN find "/opt/ros/$ROS_DISTRO/lib/python3.12/site-packages/fleetless_bridge" -name __pycache__ -prune -exec rm -rf {} + \
+ && python3 -m compileall -q "/opt/ros/$ROS_DISTRO/lib/python3.12/site-packages/fleetless_bridge"
+
+COPY cpu_sample.py failsafe_probe.py /opt/cpu-sample/
+
+USER turtle
