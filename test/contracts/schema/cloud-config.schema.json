@@ -185,7 +185,7 @@
                 "properties": {
                   "enabled": {
                     "type": "boolean",
-                    "description": "Whether values are written to the time series and become queryable. Off by default: without it the value is live only, and nobody who was not watching will ever see it."
+                    "description": "Whether values are written to the time series and become queryable. Off by default: without it the value is live only, and nobody who was not watching will ever see it. It also switches the robot's buffer: with it off, the robot holds nothing for this datapoint, and switching it off drops what the robot held."
                   },
                   "interval_seconds": {
                     "type": "integer",
@@ -201,7 +201,7 @@
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 100000,
-                    "description": "How many values the robot holds while the bridge is disconnected, to be pushed once it reconnects. The catch-up runs behind live telemetry and job results at a limited rate, so closing a gap never delays the present; without it the series simply has a gap, which is an honest answer.",
+                    "description": "How many values the robot holds while the bridge is disconnected, to be pushed once it reconnects. The catch-up runs behind live telemetry and job results at a limited rate, so closing a gap never delays the present; without it the series simply has a gap, which is an honest answer. It needs `enabled`, and it also holds the values low-bandwidth mode's rate cap holds back.",
                     "examples": [
                       5000
                     ]
