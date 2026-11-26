@@ -109,13 +109,15 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@18.3.0-next.1
+    Source: @fleetless/contracts@19.1.0-next.3
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-The prerelease of the contracts change of fleetless/fleetless#1124. Diffed
-file by file against the copies the previous pin (18.2.0) carried. New:
-`bridge-failsafe-watchdog` in both directories. Every other vendored file,
-`constants.json` included, is byte-identical.
+The prerelease of the contracts change of fleetless/fleetless#1124, rebased
+onto 19.0.1. Every vendored file was copied again and diffed file by file
+against the previous pin, 18.3.0-next.1: all of them, `constants.json`
+included, are byte-identical. 19.0.0 changed nothing the bridge speaks.
+Against 18.2.0, the pin before that, the new files are
+`bridge-failsafe-watchdog` in both directories.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a
