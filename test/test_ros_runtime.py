@@ -1068,23 +1068,44 @@ def test_removing_a_buffered_slug_clears_its_backlog():
     assert run(body) is False
 
 
-def test_disabling_a_buffer_on_reapply_stops_new_values_being_kept():
+def test_switching_retention_off_on_reapply_empties_the_buffer_and_keeps_nothing_new():
+    """The same switch tells the cloud to stop storing the datapoint, so a
+    sample still held here would be backfilled only to be thrown away on
+    arrival. Switching off drops what was held, at once."""
+
+    async def body(rt):
+        await rt.apply_config(by_slug([_dp("x", retention=RetentionConfig(enabled=True, max_buffer_values=10))]))
+        rt.set_connected(False)
+        await _publish_while_disconnected(rt, [0.1, 0.2, 0.3])
+        assert rt.backlog.has_pending()  # sanity: buffering was on
+
+        # Re-published with retention switched off, still disconnected.
+        await rt.apply_config(by_slug([_dp("x", retention=RetentionConfig(enabled=False, max_buffer_values=10))]))
+        emptied = (rt.backlog.has_pending(), rt.backlog.pop_any())
+
+        await _publish_while_disconnected(rt, [0.4])
+        return emptied, rt.backlog.has_pending()
+
+    (pending_after_switch_off, drained), pending_after_new_sample = run(body)
+    assert pending_after_switch_off is False
+    assert drained is None  # nothing left to backfill
+    assert pending_after_new_sample is False  # and nothing new is kept
+
+
+def test_switching_retention_back_on_starts_from_an_empty_buffer():
     async def body(rt):
         await rt.apply_config(by_slug([_dp("x", retention=RetentionConfig(enabled=True, max_buffer_values=10))]))
         rt.set_connected(False)
         await _publish_while_disconnected(rt, [0.1])
-        assert rt.backlog.has_pending()  # sanity: buffering was on
-
-        # Re-published with buffering turned off, still disconnected.
-        await rt.apply_config(by_slug([_dp("x", retention=RetentionConfig(enabled=False))]))
-        # The already-buffered value is not retroactively discarded — only
-        # new samples stop being kept from here on.
-        while rt.backlog.has_pending():
-            rt.backlog.pop_any()
+        await rt.apply_config(by_slug([_dp("x", retention=RetentionConfig(enabled=False, max_buffer_values=10))]))
+        await rt.apply_config(by_slug([_dp("x", retention=RetentionConfig(enabled=True, max_buffer_values=10))]))
         await _publish_while_disconnected(rt, [0.2])
-        return rt.backlog.has_pending()
+        collected = []
+        while rt.backlog.has_pending():
+            collected.append(rt.backlog.pop_any())
+        return collected
 
-    assert run(body) is False
+    assert [round(s.value, 1) for s in run(body)] == [0.2]
 
 
 # --- actions: apply_actions, the diff ------------------------------------------
