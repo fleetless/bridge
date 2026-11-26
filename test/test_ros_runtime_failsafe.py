@@ -31,7 +31,7 @@ from fleetless_bridge.failsafe import (
     SUPERVISE_INTERVAL_S,
     TERM_ANSWER_TIMEOUT_S,
 )
-from fleetless_bridge.failsafe_process import IMPORT_CAP_S, LATENESS_BOUND_MS
+from fleetless_bridge.failsafe_process import IMPORT_CAP_S, LATENESS_BOUND_MS, OWED_MATCH_WAIT_S
 from fleetless_bridge.protocol import ParameterSpec
 from helpers import by_slug
 from test_ros_runtime import (
@@ -569,6 +569,32 @@ def _publisher_joined_since(witness, since):
     replacement's new writer. A killed process's writer only ever leaves."""
     return any(e["ev"] == "publishers" and e["t"] >= since and e["n"] > e["prev"]
                for e in list(witness.events))
+
+
+def test_an_owed_failsafe_sent_before_any_reader_matched_goes_out_again_on_the_first_match():
+    """The replacement sends an owed failsafe after `OWED_MATCH_WAIT_S` even
+    with no reader matched, and a sample written before any match is lost.
+    On a loaded machine discovery takes longer than that, so it goes out
+    again when the first reader matches: here, a witness that starts only
+    after the wait."""
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        await rt.publish("drive", {"speed": 1.0})
+        os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+        await asyncio.sleep(OWED_MATCH_WAIT_S + 1.0)  # the first send went to nobody
+        witness = _start_witness_process(TOPIC)
+        try:
+            witness.wait_for("ready", WITNESS_PROCESS_READY_TIMEOUT_S, "the witness process never became ready")
+            wait_until(lambda: len(_rx(witness)) >= 1, timeout=15.0)
+            await asyncio.sleep(0.3)
+            return [x for _, x in _rx(witness)]
+        finally:
+            witness.stop()
+
+    assert run(body) == [0.0]
 
 
 def test_a_killed_failsafe_process_is_failed_and_replaced():

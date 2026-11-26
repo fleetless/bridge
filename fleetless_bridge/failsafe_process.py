@@ -82,6 +82,11 @@ RETIRING_CHECK_INTERVAL_S = 0.05
 #: matched is lost, so it waits for a reader this long, at most.
 OWED_MATCH_WAIT_S = 2.0
 
+#: One that went out with no reader matched yet goes out again when the first
+#: reader matches, within this long: on a loaded machine discovery takes
+#: longer than `OWED_MATCH_WAIT_S`, and the robot would keep its command.
+OWED_RESEND_WINDOW_S = 30.0
+
 QOS_DEPTH = 10
 
 #: The most read from the pipe at once. Between two reads, what is due fires.
@@ -118,6 +123,8 @@ class _Writer:
     fired: bool = True
     # A failsafe owed from a previous process, fired once a reader matched.
     owed_since: Optional[float] = None
+    # It went out with no reader matched: sent again on the first match.
+    resend_on_match_since: Optional[float] = None
     # Created only once no retiring writer of another type holds the topic.
     create_after: float = 0.0
 
@@ -201,7 +208,13 @@ class FailsafeProcess:
             if type_name is None:
                 return
             try:
-                self._load_results.put((type_name, get_message(type_name), None))
+                message_class = get_message(type_name)
+                # The compiled typesupport loads lazily, on the first
+                # publisher; here instead, so that load is off the loop too.
+                import_type_support = getattr(type(message_class), "__import_type_support__", None)
+                if import_type_support is not None:
+                    import_type_support()
+                self._load_results.put((type_name, message_class, None))
             except Exception:  # noqa: BLE001 - reported by the loop, like any arm that failed
                 self._load_results.put((type_name, None, traceback.format_exc()))
             try:
@@ -238,6 +251,21 @@ class FailsafeProcess:
         """Hands the loader the next type, one at a time, once no deadline
         (a fire or the self-test) is due within `IMPORT_MARGIN_S`, or once
         it has waited `IMPORT_CAP_S`."""
+        if self._dispatched is not None and not self._loader.is_alive():
+            # The loader died (it never should): its type, and every arm
+            # waiting for one, would wait for ever. Said, and given up.
+            self._report("error", "the failsafe process's loader thread ended")
+            self._load_requests = queue.SimpleQueue()
+            for slug in [s for s, arm in self._pending_arms.items() if arm[1] in self._loading]:
+                del self._pending_arms[slug]
+            self._loading.clear()
+            self._load_queue.clear()
+            self._dispatched = None
+            self._loader = threading.Thread(
+                target=self._load_loop, name="fleetless-failsafe-loader", daemon=True
+            )
+            self._loader.start()
+            return
         if self._dispatched is not None or not self._load_queue:
             return
         type_name, asked_at = self._load_queue[0]
@@ -258,6 +286,13 @@ class FailsafeProcess:
     # --- the loop -------------------------------------------------------------
 
     def run(self) -> int:
+        # What the loader and `_arm` import, imported here, before the loader
+        # runs: two threads importing the same package for the first time
+        # can deadlock in Python's import locks, and the loser raises
+        # `_DeadlockError`.
+        from fleetless_bridge import params  # noqa: F401
+        from rosidl_runtime_py.utilities import get_message  # noqa: F401
+
         self._sender.start()
         self._loader.start()
         self._report("ready")
@@ -357,7 +392,8 @@ class FailsafeProcess:
         for writer in self._writers.values():
             if writer.touched_at is not None and not writer.fired:
                 wake = min(wake, writer.touched_at + writer.timeout_s)
-            if writer.owed_since is not None or writer.publisher is None:
+            if (writer.owed_since is not None or writer.resend_on_match_since is not None
+                    or writer.publisher is None):
                 wake = min(wake, now + RETIRING_CHECK_INTERVAL_S)
         if self._retiring or self._load_queue:
             wake = min(wake, now + RETIRING_CHECK_INTERVAL_S)
@@ -385,6 +421,15 @@ class FailsafeProcess:
             matched = writer.publisher.get_subscription_count() > 0
             if matched or now - writer.owed_since >= OWED_MATCH_WAIT_S:
                 writer.owed_since = None
+                writer.resend_on_match_since = None if matched else now
+                self._publish_parting(writer, report="owed")
+        for writer in self._writers.values():
+            if writer.resend_on_match_since is None or writer.publisher is None:
+                continue
+            if now - writer.resend_on_match_since >= OWED_RESEND_WINDOW_S:
+                writer.resend_on_match_since = None
+            elif writer.publisher.get_subscription_count() > 0:
+                writer.resend_on_match_since = None
                 self._publish_parting(writer, report="owed")
 
     # --- messages from the bridge ---------------------------------------------
@@ -402,6 +447,7 @@ class FailsafeProcess:
             writer.touched_at = self._clock()
             writer.fired = False
             writer.owed_since = None
+            writer.resend_on_match_since = None  # a newer command: its own failsafe follows
             writer.publisher.publish(data)
         elif kind == "arm":
             _, slug, topic, type_name, body, timeout_ms, owed = message
