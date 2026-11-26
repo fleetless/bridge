@@ -4494,8 +4494,11 @@ def test_a_service_that_never_responds_times_out_and_frees_the_slug():
 
 
 #: How much later than one interval a tick may start after the one before
-#: it: the timer's wake-up jitter, measured in microseconds on orca.
-TICK_JITTER_MS = 1.0
+#: it: the timer's wake-up jitter. Microseconds on an idle machine, but more
+#: than 1 ms on a shared one (11.07 against 11.0 measured). Half an interval
+#: keeps every property the check tests: a missed tick shows as 20 ms, a
+#: missing timer as no settling tick at all.
+TICK_JITTER_MS = 5.0
 
 
 class _Settled(dict):
