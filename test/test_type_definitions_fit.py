@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """A `type_definitions` answer never exceeds the frame budget
-(fleetless/fleetless#1221, D8): the overflow moves to `unresolved`."""
+(fleetless/fleetless#1221): the overflow moves to `unresolved`."""
 
 import contextlib
 import json
