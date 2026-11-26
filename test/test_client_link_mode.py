@@ -866,7 +866,11 @@ def test_the_lever_pull_does_not_hold_up_the_receive_loop_at_hello():
 
         async with FakeCloud(behavior) as cloud:
             client = _client(cloud, clock, ros)
-            await run_until(client, lambda: "pong" in box)
+            # Until the pull is seen blocked, not only until the pong: the
+            # pong lands first by construction, and stopping the client there
+            # left `blocked_pull` unwritten whenever the cloud's side had not
+            # got to it yet (KeyError, fleetless/fleetless#1128).
+            await run_until(client, lambda: "blocked_pull" in box)
         return box
 
     box = asyncio.run(scenario())
