@@ -311,6 +311,16 @@ MAX_TRACKED_JOBS = 200
 # queue, not a shared vocabulary this file should reach into.
 _JOB_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "lost"})
 
+
+def _action_failed_message(status: Optional[int]) -> str:
+    """The message of an `action_failed` error: ABORTED in words, since
+    that is the one a server sends on purpose and its result usually says
+    why; every other status as the number ROS gave, because the bridge
+    knows no more about it than that."""
+    if status == GoalStatus.STATUS_ABORTED:
+        return "the action was aborted"
+    return "the action ended with status {}".format(status)
+
 # How long an invoked action may go unaccepted before the bridge gives up on
 # its server ever answering — without this, a `send_goal_async()` whose server
 # does not exist never resolves its response future: no `job_update` is ever
@@ -4042,7 +4052,7 @@ class RosRuntime:
         else:
             self._emit_job(
                 job_id, slug, "failed", result=result_json,
-                error=("action_failed", "the action ended with status {}".format(response.status)),
+                error=("action_failed", _action_failed_message(response.status)),
             )
 
     def _destroy_action(self, slug: str) -> None:
@@ -4554,7 +4564,7 @@ class RosRuntime:
                 slug,
                 "failed",
                 result=result_json,
-                error=("action_failed", "the action ended with status {}".format(response.status)),
+                error=("action_failed", _action_failed_message(response.status)),
             )
 
     def _emit_job_heartbeats(self) -> None:
@@ -4661,7 +4671,7 @@ class RosRuntime:
         else:
             self._emit_job(
                 job_id, slug, "failed",
-                error=("action_failed", "the action ended with status {}".format(status)),
+                error=("action_failed", _action_failed_message(status)),
             )
 
     # --- services: apply, runs on the executor thread ------------------------
