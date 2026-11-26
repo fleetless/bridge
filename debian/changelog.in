@@ -1,3 +1,10 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.5.2-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * fix(live): a hardware encoder whose plugins load slowly is no longer taken for a device that did not open, and one that stops taking a keyframe request or a bitrate change costs one late frame
+  * fix(live): a hardware chain whose plugin load was given up on answers at once with what the load found, and capsfilter's plugin loads before the start too
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Thu, 26 Nov 2026 00:23:01 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.5.1-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * fix(main): a stop in the bridge's first seconds ends it quietly
