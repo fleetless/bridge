@@ -944,6 +944,46 @@ def type_definitions_message(
     )
 
 
+def fit_type_definitions_message(
+    request_id: str,
+    definitions: Sequence[dict],
+    unresolved: Sequence[str],
+    max_bytes: int = BRIDGE_FRAME_MAX_BYTES,
+) -> Tuple[str, List[str]]:
+    """`type_definitions_message`, kept within `max_bytes` (fleetless/fleetless#1221).
+
+    While the payload would exceed the budget, the last definition's name
+    moves to `unresolved`: the cloud asks a name from a batch again on its
+    own, so a definition moved here is fetched alone, and one that does not
+    fit alone stays unresolved. Returns the payload and the moved names, in
+    the order they were requested.
+
+    Sized per definition, so the cut is one pass however many there are; the
+    result is then measured as a whole (`frame_bytes`, the unit the cloud's
+    socket limit counts)."""
+    kept = list(definitions)
+    names = list(unresolved)
+    payload = type_definitions_message(request_id, kept, names)
+    size = frame_bytes(payload)
+    if size <= max_bytes:
+        return payload, []
+    # `json.dumps` joins list items with ", ": two bytes per gap.
+    moved: List[str] = []
+    while kept and size > max_bytes:
+        last = kept.pop()
+        name = str(last.get("name", ""))
+        size -= frame_bytes(json.dumps(last)) + (2 if kept else 0)
+        size += frame_bytes(json.dumps(name)) + (2 if names or moved else 0)
+        moved.insert(0, name)
+        payload = None
+        if size <= max_bytes:
+            payload = type_definitions_message(request_id, kept, names + moved)
+            size = frame_bytes(payload)
+    if payload is None:
+        payload = type_definitions_message(request_id, kept, names + moved)
+    return payload, moved
+
+
 def datapoint_message(
     slug: str, value: Any, timestamp_ms: int, backfill: bool = False
 ) -> str:

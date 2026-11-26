@@ -121,7 +121,7 @@ from fleetless_bridge.protocol import (
     link_mode_message,
     parse_cloud_message,
     pong_message,
-    type_definitions_message,
+    fit_type_definitions_message,
 )
 from fleetless_bridge.sampling import capture_timestamp_ms
 
@@ -264,6 +264,12 @@ _OMITTED_RESULT_IDS_MAX = 1024
 # `json.dumps` writes keys in insertion order and every builder in
 # `protocol.py` puts `type` first, so the head of the payload is enough.
 _FRAME_TYPE_RE = re.compile(r'^\{"type": "([a-z_]+)"')
+
+# The budget a `type_definitions` answer is kept under (`_handle_type_request`):
+# the cloud's frame limit (fleetless/fleetless#1221), which the writer guard
+# would otherwise enforce by refusing the whole answer. A module name so a
+# test can shrink it.
+TYPE_DEFINITIONS_MAX_BYTES = BRIDGE_FRAME_MAX_BYTES
 
 # How often the low-bandwidth controller is asked to decide. Its timers
 # advance only inside `evaluate`, so this is the resolution of `enter_after_s`
@@ -2669,10 +2675,20 @@ class BridgeClient:
             definitions, unresolved = await self._ros.resolve_types(message.type_names)
         else:
             definitions, unresolved = [], list(message.type_names)
-        writer.enqueue(
-            _TIER_TOOLING,
-            type_definitions_message(message.request_id, definitions, unresolved),
+        # An answer over the budget would close the socket on the cloud's
+        # side (1009), and the reconnect would ask again. The overflow goes
+        # to `unresolved`; the cloud asks each such name again on its own.
+        payload, moved = fit_type_definitions_message(
+            message.request_id, definitions, unresolved, TYPE_DEFINITIONS_MAX_BYTES
         )
+        if moved:
+            log.warning(
+                "type_definitions for request %s: %d definitions moved to "
+                "unresolved to stay under %d bytes: %s",
+                message.request_id, len(moved), TYPE_DEFINITIONS_MAX_BYTES,
+                ", ".join(moved),
+            )
+        writer.enqueue(_TIER_TOOLING, payload)
 
     async def _handle_job_query(
         self, writer: PrioritizedWriter, message: CloudJobQuery
