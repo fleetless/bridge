@@ -1,3 +1,12 @@
+ros-@ROS_DISTRO@-fleetless-bridge (6.6.0-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
+
+  * feat(client): a frame over the cloud's limit no longer knocks the robot offline; an oversized datapoint value is dropped and reported, a job sheds its feedback and then its result, and the graph is cut to fit
+  * fix(ros_runtime): a work-queue job that times out says why in the log
+  * fix(ros_runtime): every stalled-job line names the queue, the drains and the newest callback
+  * fix(jobs): an aborted action says it was aborted, not that it ended with status 6
+
+ -- Andre Dehne <andre@dehne-robotik.de>  Thu, 26 Nov 2026 20:03:46 +0000
+
 ros-@ROS_DISTRO@-fleetless-bridge (6.5.2-0@DEB_CODENAME@) @DEB_CODENAME@; urgency=medium
 
   * fix(live): a hardware encoder whose plugins load slowly is no longer taken for a device that did not open, and one that stops taking a keyframe request or a bitrate change costs one late frame
