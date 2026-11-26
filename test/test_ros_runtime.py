@@ -2968,6 +2968,70 @@ def test_terminal_result_timeout_leaves_a_normal_result_unchanged():
     assert leftover is None
 
 
+def test_action_failed_message_names_abort_and_keeps_every_other_status_as_a_number():
+    """fleetless/fleetless#1220: ABORTED is the status a server sends on
+    purpose, so it gets words; the rest stay the number ROS gave."""
+    assert ros_runtime._action_failed_message(GoalStatus.STATUS_ABORTED) == "the action was aborted"
+    assert ros_runtime._action_failed_message(GoalStatus.STATUS_CANCELING) == "the action ended with status 3"
+    assert ros_runtime._action_failed_message(None) == "the action ended with status None"
+
+
+def test_an_aborted_goal_fails_as_aborted_and_keeps_its_result():
+    """The turtle's `drive_to_square` on an occupied square: the goal ends
+    ABORTED with a result that says why. The job is `failed` with
+    `action_failed: the action was aborted`, and the result travels with it
+    (fleetless/fleetless#1220)."""
+    from types import SimpleNamespace
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        rt.jobs.start("job-1", "count", "action")
+        result = Fibonacci.Result()
+        result.sequence = [0, 1, 1]
+        future = SimpleNamespace(result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_ABORTED, result=result,
+        ))
+        rt._on_action_result("job-1", "count", future)
+        return await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+
+    update = run(body)
+    assert update.state == "failed"
+    assert update.error == ("action_failed", "the action was aborted")
+    assert update.result == {"sequence": [0, 1, 1]}
+
+
+def test_a_goal_ending_on_another_status_keeps_the_number():
+    from types import SimpleNamespace
+
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        rt.jobs.start("job-1", "count", "action")
+        future = SimpleNamespace(result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_CANCELING, result=Fibonacci.Result(),
+        ))
+        rt._on_action_result("job-1", "count", future)
+        return await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+
+    update = run(body)
+    assert update.state == "failed"
+    assert update.error == ("action_failed", "the action ended with status 3")
+
+
+def test_an_aborted_external_goal_fails_as_aborted_without_a_result():
+    """An external goal is settled from `_action/status`, which carries no
+    result: the same words, `result` stays `None`."""
+    async def body(rt):
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        rt.jobs.start("job-x", "count", "action")
+        rt._settle_external_goal("job-x", "count", GoalStatus.STATUS_ABORTED)
+        return await asyncio.wait_for(rt.jobs.updates.get(), timeout=2.0)
+
+    update = run(body)
+    assert update.state == "failed"
+    assert update.error == ("action_failed", "the action was aborted")
+    assert update.result is None
+
+
 def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job():
     """"server_is_ready() raising: treated as not-ready for the debounce,
     and logged once per job" (spec, "Error handling") — not once per tick,
