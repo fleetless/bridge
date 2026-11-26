@@ -841,6 +841,27 @@ def link_mode_message(low_bandwidth: bool, reason: str, at_ms: int) -> str:
     )
 
 
+def failsafe_watchdog_message(
+    state: str, reason: Optional[str], lateness_ms: Optional[float], at_ms: int
+) -> str:
+    """The failsafe watchdog's state: `ok`, or `failed` with the `reason`
+    (`self_test`, `late_fire`, `not_alive`, `crashed`).
+
+    Sent once after every `hello_ok` and on every change, like `link_mode`.
+    `lateness_ms` is what decided the state: the self-test's lateness, or the
+    late fire's; `null` where there is no lateness to report. While it reads
+    `failed`, no publisher takes a publish."""
+    return json.dumps(
+        {
+            "type": "failsafe_watchdog",
+            "state": state,
+            "reason": reason,
+            "lateness_ms": None if lateness_ms is None else round(max(lateness_ms, 0.0), 3),
+            "at_ms": at_ms,
+        }
+    )
+
+
 def config_applied_message(
     version: int, ok: bool, errors: Sequence[ApplyError]
 ) -> str:

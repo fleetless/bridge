@@ -118,6 +118,7 @@ from fleetless_bridge.protocol import (
     fit_job_update,
     frame_bytes,
     hello_message,
+    failsafe_watchdog_message,
     link_mode_message,
     parse_cloud_message,
     pong_message,
@@ -1567,6 +1568,7 @@ class BridgeClient:
         if self._ros is not None:
             self._ros.on_low_bandwidth_params(self._on_low_bandwidth_params)
             self._ros.on_live_params(self._on_live_params)
+            self._ros.on_failsafe_state(self._on_failsafe_state)
 
     def stop(self) -> None:
         """Ask the bridge to shut down; safe to call from a signal handler."""
@@ -1874,6 +1876,25 @@ class BridgeClient:
             link_mode_message(low_bandwidth, reason, capture_timestamp_ms()),
         )
 
+    def _on_failsafe_state(self, state: str, reason: Optional[str], lateness_ms: Optional[float]) -> None:
+        """The failsafe watchdog changed state (on the loop, from the runtime)."""
+        self._report_failsafe_watchdog(state, reason, lateness_ms)
+
+    def _report_failsafe_watchdog(
+        self, state: str, reason: Optional[str], lateness_ms: Optional[float]
+    ) -> None:
+        """One `failsafe_watchdog` frame, tier 0 like `link_mode`: a robot that
+        takes no publishes must say so before anything queued behind it.
+        Dropped when no session is open: the next `hello_ok` restates it. A
+        watchdog still `starting` has nothing to say yet."""
+        writer = self._last_writer
+        if writer is None or not self._session_open or state not in ("ok", "failed"):
+            return
+        writer.enqueue(
+            _TIER_SESSION,
+            failsafe_watchdog_message(state, reason, lateness_ms, capture_timestamp_ms()),
+        )
+
     def _observe_dwell(self, captured_ms: int) -> None:
         """How long one sample waited between capture and the wire.
 
@@ -2157,6 +2178,8 @@ class BridgeClient:
                         except Exception:  # noqa: BLE001 - a packet size must not cost the greeting
                             log.exception("Unexpected error reading the live parameters")
                     await self._start_link_mode()
+                    if self._ros is not None:
+                        self._report_failsafe_watchdog(*self._ros.failsafe_state())
                 elif isinstance(message, HelloError):
                     if message.terminal:
                         log.error(

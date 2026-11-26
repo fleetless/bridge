@@ -234,6 +234,12 @@ class FakeRos:
     def on_live_params(self, callback):
         self.live_callback = callback
 
+    def on_failsafe_state(self, callback):
+        self.failsafe_callback = callback
+
+    def failsafe_state(self):
+        return getattr(self, "failsafe_state_value", ("ok", None, 0.5))
+
     def set_live_settings(self, settings):
         self.live_settings_calls.append(settings)
         if self.set_live_settings_raises is not None:

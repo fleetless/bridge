@@ -99,6 +99,8 @@ class Session:
         self._ws = ws
         # `link_mode` frames another `recv*` stepped over — see `recv`.
         self._stepped_over_link_modes = deque()
+        # `failsafe_watchdog` frames `recv_failsafe_watchdog` handed out.
+        self._failsafe_watchdogs_read = []
 
     async def recv(self) -> dict:
         """The next JSON frame that is not a `link_mode`.
@@ -120,6 +122,9 @@ class Session:
         while True:
             raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
             payload = json.loads(raw)
+            if payload.get("type") == "failsafe_watchdog":
+                self._record_failsafe_watchdog(payload)
+                continue
             if payload.get("type") != "link_mode":
                 return payload
             self._stepped_over_link_modes.append(self._record_link_mode(payload))
@@ -140,9 +145,19 @@ class Session:
                 payload = json.loads(wire)
             except ValueError:
                 return wire  # deliberate garbage from a transport test
+            if isinstance(payload, dict) and payload.get("type") == "failsafe_watchdog":
+                self._record_failsafe_watchdog(payload)
+                continue
             if not isinstance(payload, dict) or payload.get("type") != "link_mode":
                 return wire
             self._stepped_over_link_modes.append(self._record_link_mode(payload))
+
+    def _record_failsafe_watchdog(self, payload: dict) -> dict:
+        """`failsafe_watchdog` is stepped over by `recv` and `recv_raw` for
+        the reason `link_mode` is: unsolicited, once after `hello_ok` and on
+        every change. Kept in `cloud.failsafe_watchdogs`."""
+        self._cloud.failsafe_watchdogs.append(payload)
+        return payload
 
     def _record_link_mode(self, payload: dict) -> dict:
         validate_frame("bridge-link-mode", payload)
@@ -178,13 +193,38 @@ class Session:
         over — the asymmetry with `recv` is the point."""
         if self._stepped_over_link_modes:
             return self._stepped_over_link_modes.popleft()
-        raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
-        payload = json.loads(raw)
+        while True:
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
+            payload = json.loads(raw)
+            if payload.get("type") != "failsafe_watchdog":
+                break
+            self._record_failsafe_watchdog(payload)
         if payload.get("type") != "link_mode":
             raise AssertionError(
                 "expected a link_mode frame, got {!r}".format(payload.get("type"))
             )
         return self._record_link_mode(payload)
+
+    async def recv_failsafe_watchdog(self) -> dict:
+        """The next `failsafe_watchdog`, whether `recv` already stepped over
+        it or it is still to come; any other frame first is a failure."""
+        seen = len(self._failsafe_watchdogs_read)
+        if len(self._cloud.failsafe_watchdogs) > seen:
+            payload = self._cloud.failsafe_watchdogs[seen]
+        else:
+            while True:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=RECV_TIMEOUT_S)
+                payload = json.loads(raw)
+                if payload.get("type") != "link_mode":
+                    break
+                self._stepped_over_link_modes.append(self._record_link_mode(payload))
+            if payload.get("type") != "failsafe_watchdog":
+                raise AssertionError(
+                    "expected a failsafe_watchdog frame, got {!r}".format(payload.get("type"))
+                )
+            self._record_failsafe_watchdog(payload)
+        self._failsafe_watchdogs_read.append(payload)
+        return payload
 
     async def recv_config_applied(self) -> dict:
         payload = validate_frame("bridge-config-applied", await self.recv())
@@ -457,6 +497,7 @@ class FakeCloud:
         self.hellos = []
         self.pongs = []
         self.link_modes = []
+        self.failsafe_watchdogs = []
         self.config_applied = []
         self.introspects = []
         self.type_definitions = []
