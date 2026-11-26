@@ -31,7 +31,7 @@ from fleetless_bridge.failsafe import (
     SUPERVISE_INTERVAL_S,
     TERM_ANSWER_TIMEOUT_S,
 )
-from fleetless_bridge.failsafe_process import LATENESS_BOUND_MS
+from fleetless_bridge.failsafe_process import IMPORT_CAP_S, LATENESS_BOUND_MS
 from fleetless_bridge.protocol import ParameterSpec
 from helpers import by_slug
 from test_ros_runtime import (
@@ -74,10 +74,10 @@ async def _matched_witness(rt, slug="drive", topic=TOPIC):
     return witness
 
 
-async def _silences(rt, witness, count, during=None):
+async def _silences(rt, witness, count, during=None, timeout_ms=TIMEOUT_MS):
     """`count` silences: one client message, then nothing until its
     failsafe arrives. `during()` runs right after each publish, for the load.
-    Returns each failsafe's lateness in ms."""
+    Returns each failsafe's lateness in ms, against `timeout_ms`."""
     lateness = []
     for _ in range(count):
         before = len(_rx(witness))
@@ -88,7 +88,7 @@ async def _silences(rt, witness, count, during=None):
         await asyncio.sleep(0.05)  # nothing else may follow
         samples = _rx(witness)[before:]
         assert [x for _, x in samples] == [pytest.approx(1.0), pytest.approx(0.0)], samples
-        lateness.append((samples[1][0] - samples[0][0]) * 1000.0 - TIMEOUT_MS)
+        lateness.append((samples[1][0] - samples[0][0]) * 1000.0 - timeout_ms)
     return lateness
 
 
@@ -232,6 +232,90 @@ def test_a_failsafe_goes_out_within_the_bound_beside_large_publishes_under_gil_l
     assert state[0] == STATE_OK, state
     assert sent and all(sent)
     assert max(lateness) <= LATENESS_BOUND_MS
+
+
+#: Message types the failsafe process has not loaded when the test arms them,
+#: one package each: the first `get_message` of a package imports it, 7-42 ms
+#: measured in the jazzy image.
+FRESH_TYPES = (
+    "sensor_msgs/msg/PointCloud2",
+    "nav_msgs/msg/Path",
+    "trajectory_msgs/msg/JointTrajectory",
+    "std_msgs/msg/String",
+    "diagnostic_msgs/msg/DiagnosticArray",
+    "visualization_msgs/msg/MarkerArray",
+)
+
+
+def test_arming_a_publisher_of_a_new_message_type_never_delays_another_s_failsafe():
+    """Each silence of `drive` (300 ms) gets a publisher of a message type
+    the process has not loaded, armed 100 ms before `drive`'s deadline. The
+    import would hold the process's GIL for tens of ms, so it waits until
+    no deadline is due within `IMPORT_MARGIN_S`: `drive`'s failsafe goes out
+    within the bound, and the new publisher has a writer afterwards."""
+    timeout_ms = 300
+    timers = []
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg(timeout_ms=timeout_ms)) == []
+        witness = await _matched_witness(rt)
+        types = iter(FRESH_TYPES)
+
+        def arm_next():
+            type_name = next(types)
+            slug = "fresh_" + type_name.split("/")[0]
+            # The bridge's own arm, 100 ms before the deadline.
+            timer = threading.Timer((timeout_ms - 100) / 1000.0, rt._failsafe.arm, args=(
+                slug, "/failsafe_test/" + slug, type_name, {}, 60_000))
+            timer.start()
+            timers.append((slug, timer))
+
+        try:
+            lateness = await _silences(rt, witness, len(FRESH_TYPES), during=arm_next,
+                                       timeout_ms=timeout_ms)
+            for slug, timer in timers:
+                timer.join()
+            wait_until(lambda: all(rt._failsafe.subscription_count(slug) >= 0 for slug, _ in timers),
+                       timeout=10.0)
+        finally:
+            witness.stop()
+        return lateness, rt.failsafe_state()
+
+    lateness, state = run(body)
+    _report("arming new message types", lateness)
+    assert state[0] == STATE_OK, state
+    assert max(lateness) <= LATENESS_BOUND_MS
+
+
+def test_a_new_message_type_is_armed_after_the_cap_while_a_short_timeout_never_pauses():
+    """`drive` at 200 ms, below `IMPORT_MARGIN_S`, published every 40 ms
+    without pause: a deadline is always due within the margin. The new type
+    is imported once it has waited `IMPORT_CAP_S`, not never."""
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg(timeout_ms=200)) == []
+        armed_at = None
+        writer_at = None
+        states = set()
+        started = time.monotonic()
+        while armed_at is None or time.monotonic() - armed_at < IMPORT_CAP_S + 3.0:
+            if armed_at is None and time.monotonic() - started >= 0.5:
+                # Driven for half a second first: from here on a deadline is
+                # always due within the margin.
+                rt._failsafe.arm("fresh", "/failsafe_test/fresh", FRESH_TYPES[0], {}, 60_000)
+                armed_at = time.monotonic()
+            await rt.publish("drive", {"speed": 1.0})
+            states.add(rt.failsafe_state()[0])
+            if (armed_at is not None and writer_at is None
+                    and rt._failsafe.subscription_count("fresh", timeout_s=0.01) >= 0):
+                writer_at = time.monotonic() - armed_at
+            await asyncio.sleep(0.03)
+        return writer_at, states
+
+    writer_at, states = run(body)
+    assert states == {STATE_OK}, states  # no restart, which would arm afresh
+    assert writer_at is not None
+    assert IMPORT_CAP_S - 0.5 <= writer_at <= IMPORT_CAP_S + 2.0, writer_at
 
 
 # --- once, the race, the order ------------------------------------------------------
@@ -492,13 +576,13 @@ def test_a_killed_failsafe_process_is_failed_and_replaced():
     that was already running, as a robot's subscriber is: four cycles of
     three silences each.
 
-    The witness starts before the first kill, and that is deliberate (André,
-    2026-11-26). A subscriber that first discovers a bridge process older
-    than about a second can stall once for up to 333 ms around that
-    discovery, on its own side: Fast DDS 2.x shared memory sleeps in
-    `Port::healthy_check` the first time it sends to such a port (fixed
-    upstream in 3.6.x). That is the subscriber's Fast DDS, not the bridge;
-    the spec records the limit."""
+    The witness starts before the first kill, and that is deliberate. A
+    subscriber that first discovers a bridge process older than about a
+    second can stall once for up to 333 ms around that discovery, on its own
+    side: Fast DDS 2.x shared memory sleeps in `Port::healthy_check` the
+    first time it sends to such a port (fixed upstream in 3.6.x). That is
+    the subscriber's Fast DDS, not the bridge, and fleetless/fleetless#1124
+    records the limit."""
 
     async def body(rt):
         assert await rt.apply_publishers(_cfg()) == []

@@ -14,14 +14,17 @@ robot would end on the command. One writer keeps the failsafe after every
 command before it. So the bridge builds a client's message, serializes it and
 sends it here, and publishing it is what re-arms the deadline.
 
-One thread, no executor. It waits in `select` until the earliest thing that
+One loop thread, no executor. It waits in `select` until the earliest thing that
 is due and fires what is due before it handles the next message. It never
 waits for the rest of a message: it reads what has arrived into a buffer of
 its own and handles a message once all of it is there. A large publish (a
 `Path`, a `PointCloud2`) arrives in pieces, each written only once the
 bridge's busy GIL lets its sender run again, and a blocking read of the rest
 would hold every deadline that falls due meanwhile. Reports go back through a
-sender thread, so a parent that stops reading never blocks a fire.
+sender thread, so a parent that stops reading never blocks a fire. A loader
+thread imports a message type the first time an arm names it, and only while
+no deadline is due within `IMPORT_MARGIN_S`: the import holds this
+interpreter's GIL. The arm takes effect once the type is loaded.
 Nothing here imports `ros_runtime`: the child loads rclpy, the message types
 and `params`, nothing else.
 
@@ -41,6 +44,7 @@ import queue
 import select
 import signal
 import struct
+import sys
 import threading
 import time
 import traceback
@@ -82,6 +86,17 @@ QOS_DEPTH = 10
 
 #: The most read from the pipe at once. Between two reads, what is due fires.
 READ_CHUNK_BYTES = 64 * 1024
+
+#: A message type is imported only while no deadline is due within this long.
+#: The import runs on the loader thread, but loading its compiled typesupport
+#: holds this interpreter's GIL for tens of ms (up to about 50 measured), and
+#: the loop would wait for it.
+IMPORT_MARGIN_S = 0.25
+
+#: An import still not started after this long starts anyway, so a publisher
+#: driven without pause at a `timeout_ms` below the margin cannot keep a new
+#: one unarmed for ever. A fire it makes late fails the watchdog closed.
+IMPORT_CAP_S = 5.0
 
 
 class _Terminated(BaseException):
@@ -141,6 +156,25 @@ class FailsafeProcess:
         self._sender = threading.Thread(
             target=self._send_loop, name="fleetless-failsafe-sender", daemon=True
         )
+        # Message types, loaded off the loop: the first `get_message` of a
+        # package imports it, measured at 7-42 ms, and every deadline would
+        # wait that long. An arm waits in `_pending_arms` until its type is
+        # here; the loader says so through `_loaded_r`.
+        self._loaded: Dict[str, type] = {}
+        self._loading: set = set()
+        self._pending_arms: Dict[str, tuple] = {}
+        # Types waiting for a moment with nothing due (`_dispatch_loads`),
+        # with when they were asked for; and the one the loader has now.
+        self._load_queue: List[tuple] = []
+        self._dispatched: Optional[str] = None
+        self._load_requests: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._load_results: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._loaded_r, self._loaded_w = os.pipe()
+        os.set_blocking(self._loaded_r, False)
+        os.set_blocking(self._loaded_w, False)
+        self._loader = threading.Thread(
+            target=self._load_loop, name="fleetless-failsafe-loader", daemon=True
+        )
 
     # --- reporting, off the loop's thread ------------------------------------
 
@@ -157,10 +191,75 @@ class FailsafeProcess:
             except (OSError, EOFError, ValueError):
                 return  # the parent is gone; the loop finds out by its own read
 
+    # --- loading message types, off the loop's thread --------------------------
+
+    def _load_loop(self) -> None:
+        from rosidl_runtime_py.utilities import get_message
+
+        while True:
+            type_name = self._load_requests.get()
+            if type_name is None:
+                return
+            try:
+                self._load_results.put((type_name, get_message(type_name), None))
+            except Exception:  # noqa: BLE001 - reported by the loop, like any arm that failed
+                self._load_results.put((type_name, None, traceback.format_exc()))
+            try:
+                os.write(self._loaded_w, b"l")
+            except BlockingIOError:
+                pass  # the pipe is full, so the loop has a wake-up waiting anyway
+
+    def _take_loaded(self) -> None:
+        """Arms whose message type the loader has loaded since, on the loop."""
+        try:
+            while os.read(self._loaded_r, 512):
+                pass
+        except (BlockingIOError, InterruptedError):
+            pass
+        while True:
+            try:
+                type_name, message_class, error = self._load_results.get_nowait()
+            except queue.Empty:
+                return
+            self._loading.discard(type_name)
+            if self._dispatched == type_name:
+                self._dispatched = None
+            waiting = [slug for slug, arm in self._pending_arms.items() if arm[1] == type_name]
+            if message_class is None:
+                for slug in waiting:
+                    del self._pending_arms[slug]
+                self._report("error", error)
+                continue
+            self._loaded[type_name] = message_class
+            for slug in waiting:
+                self._arm(slug, *self._pending_arms.pop(slug))
+
+    def _dispatch_loads(self, now: float) -> None:
+        """Hands the loader the next type, one at a time, once no deadline
+        (a fire or the self-test) is due within `IMPORT_MARGIN_S`, or once
+        it has waited `IMPORT_CAP_S`."""
+        if self._dispatched is not None or not self._load_queue:
+            return
+        type_name, asked_at = self._load_queue[0]
+        due = self._next_deadline()
+        if due is not None and due - now < IMPORT_MARGIN_S and now - asked_at < IMPORT_CAP_S:
+            return
+        self._load_queue.pop(0)
+        self._dispatched = type_name
+        self._load_requests.put(type_name)
+
+    def _next_deadline(self) -> Optional[float]:
+        deadlines = [w.touched_at + w.timeout_s for w in self._writers.values()
+                     if w.touched_at is not None and not w.fired and w.publisher is not None]
+        if self._self_test_at is not None:
+            deadlines.append(self._self_test_at)
+        return min(deadlines) if deadlines else None
+
     # --- the loop -------------------------------------------------------------
 
     def run(self) -> int:
         self._sender.start()
+        self._loader.start()
         self._report("ready")
         try:
             while True:
@@ -176,6 +275,7 @@ class FailsafeProcess:
             return 0
         finally:
             self._outbox.put(None)
+            self._load_requests.put(None)
 
     def _turn(self) -> bool:
         """One pass: fire what is due, then handle one message, or wait for
@@ -192,6 +292,8 @@ class FailsafeProcess:
         if now >= self._next_alive:
             self._report("alive")
             self._next_alive = now + ALIVE_INTERVAL_S
+        self._take_loaded()
+        self._dispatch_loads(now)
         self._create_pending(now)
         self._reap_retiring(now)
         message = self._take_message()
@@ -201,10 +303,15 @@ class FailsafeProcess:
             self._fire_due(self._clock())
             return self._handle(message)
         wake = self._next_wake(now)
-        fds = [self._fd] if self._wakeup_fd is None else [self._fd, self._wakeup_fd]
+        fds = [self._fd, self._loaded_r]
+        if self._wakeup_fd is not None:
+            fds.append(self._wakeup_fd)
         readable, _, _ = select.select(fds, [], [], max(0.0, wake - self._clock()))
         if self._wakeup_fd is not None and self._wakeup_fd in readable:
             self._drain_wakeup()
+        if self._loaded_r in readable:
+            self._fire_due(self._clock())
+            self._take_loaded()
         if self._fd in readable:
             self._fire_due(self._clock())
             # Readable, so this returns what has arrived and does not wait.
@@ -252,7 +359,7 @@ class FailsafeProcess:
                 wake = min(wake, writer.touched_at + writer.timeout_s)
             if writer.owed_since is not None or writer.publisher is None:
                 wake = min(wake, now + RETIRING_CHECK_INTERVAL_S)
-        if self._retiring:
+        if self._retiring or self._load_queue:
             wake = min(wake, now + RETIRING_CHECK_INTERVAL_S)
         return wake
 
@@ -300,6 +407,7 @@ class FailsafeProcess:
             _, slug, topic, type_name, body, timeout_ms, owed = message
             self._arm(slug, topic, type_name, body, timeout_ms, owed)
         elif kind == "disarm":
+            self._pending_arms.pop(message[1], None)
             self._disarm(message[1], parting=True)
         elif kind == "self_test":
             block_s = self._options.get("block_before_self_test_s", 0.0)
@@ -319,6 +427,7 @@ class FailsafeProcess:
         elif kind == "stop":
             # The runtime's teardown disarmed every publisher first, so
             # nothing is owed here, unless that teardown did not run.
+            self._pending_arms.clear()
             for slug in list(self._writers):
                 self._disarm(slug, parting=True)
             self._wait_retiring()
@@ -327,7 +436,6 @@ class FailsafeProcess:
 
     def _arm(self, slug, topic, type_name, body, timeout_ms, owed) -> None:
         from fleetless_bridge import params
-        from rosidl_runtime_py.utilities import get_message
 
         existing = self._writers.get(slug)
         if existing is not None and (existing.topic != topic or existing.type_name != type_name):
@@ -337,7 +445,17 @@ class FailsafeProcess:
             existing.failsafe = params.build_message(existing.message_class, body)
             existing.timeout_s = timeout_ms / 1000.0
             return
-        message_class = get_message(type_name)
+        message_class = self._loaded.get(type_name)
+        if message_class is None:
+            # Not loaded yet: the loader imports it, and this arm waits (a
+            # newer arm of the slug replaces it). Until then the slug has no
+            # writer, and a publish to it is reported dropped.
+            self._pending_arms[slug] = (topic, type_name, body, timeout_ms, owed)
+            if type_name not in self._loading:
+                self._loading.add(type_name)
+                self._load_queue.append((type_name, self._clock()))
+            return
+        self._pending_arms.pop(slug, None)
         writer = _Writer(
             slug=slug, topic=topic, type_name=type_name, message_class=message_class,
             failsafe=params.build_message(message_class, body), timeout_s=timeout_ms / 1000.0,
@@ -436,8 +554,21 @@ class FailsafeProcess:
         """The pipe closed or SIGTERM came: every armed failsafe goes out
         now, and the process waits for its acknowledgement before it exits.
         `terminating` first: the supervisor waits for the acknowledgements
-        only for a process that answered its SIGTERM."""
+        only for a process that answered its SIGTERM. An arm still waiting
+        for its type that owes a failsafe from a previous process is loaded
+        here, on this thread: nothing is timed any more."""
         self._report("terminating")
+        from rosidl_runtime_py.utilities import get_message
+
+        for slug, arm in list(self._pending_arms.items()):
+            if not arm[4]:
+                continue
+            try:
+                self._loaded.setdefault(arm[1], get_message(arm[1]))
+                self._arm(slug, *arm)
+                self._create_pending(self._clock())
+            except Exception:  # noqa: BLE001 - the next one still has to go
+                self._report("error", traceback.format_exc())
         for writer in list(self._writers.values()):
             if writer.publisher is None:
                 continue
@@ -477,6 +608,9 @@ def main(conn, node_name: str, options: Optional[Dict[str, Any]] = None) -> None
 
     signal.signal(signal.SIGTERM, _on_term)
     signal.set_wakeup_fd(wakeup_w)
+    # The loader and the sender share this interpreter's GIL with the loop;
+    # a shorter switch interval bounds how long the loop waits for it.
+    sys.setswitchinterval(0.001)
     try:
         process.run()
     finally:

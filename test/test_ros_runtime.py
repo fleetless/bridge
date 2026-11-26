@@ -700,7 +700,7 @@ def _start_witness_process(topic):
     sleeps up to 333 ms the first time it sends to the bridge's main process's
     port once that port is more than a second old, and the samples it is
     receiving wait too. That is a limit of the subscriber's Fast DDS, recorded
-    in the spec, not lateness of the bridge."""
+    on fleetless/fleetless#1124, not lateness of the bridge."""
     env = os.environ.copy()
     env["FASTDDS_BUILTIN_TRANSPORTS"] = "UDPv4"
     process = subprocess.Popen(

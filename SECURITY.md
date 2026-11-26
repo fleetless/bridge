@@ -86,7 +86,7 @@ descriptor of its socket, the bridge's node name, and options only a test
 passes (the bridge itself passes none).
 Nothing from a cloud message reaches it, and no shell runs it.
 
-GStreamer starts a second one, and only on a robot whose `live.encoder` is
+GStreamer starts a third, and only on a robot whose `live.encoder` is
 not `software`. The hardware encoders are reached through GStreamer, which
 the bridge loads with the first live session that uses one. When GStreamer's
 plugin registry is missing or stale, its initialisation runs GStreamer's own

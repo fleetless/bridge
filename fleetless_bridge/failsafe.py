@@ -148,21 +148,25 @@ def child_environment(environ) -> Dict[str, str]:
     """The failsafe process's environment: the bridge's own, so it finds
     the same ROS and the same domain, with three changes.
 
-    - `-m` puts the working directory first on `sys.path`, where a
+    - `PYTHONPATH` keeps the bridge's order, so an overlay workspace still
+      wins over the base install and the child has the bridge's message
+      types. The directory `fleetless_bridge` was loaded from is appended
+      only when it is not on it already (a sourced install has it).
+    - `-m` would put the working directory first on `sys.path`, where a
       `queue.py` or a `fleetless_bridge/` checkout would shadow what the
-      child imports. It starts in `/`, with `PYTHONSAFEPATH` (Python 3.11
-      and later) keeping even that off the path, and with the directory
-      this package was loaded from first on it.
+      child imports. The child starts in `/`, with `PYTHONSAFEPATH` (Python
+      3.11 and later) keeping even that off the path.
     - `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` (`CHILD_TRANSPORTS`), unless the
       robot set the variable to something other than `DEFAULT`: an explicit
       choice is kept, and the bridge says what it costs. A Fast DDS profile
       that defines its own transports overrides the variable in either case.
     """
     env = dict(environ)
+    entries = [e for e in env.get("PYTHONPATH", "").split(os.pathsep) if e]
+    if not any(os.path.abspath(e) == _PACKAGE_PARENT for e in entries):
+        entries.append(_PACKAGE_PARENT)
     env["PYTHONSAFEPATH"] = "1"
-    env["PYTHONPATH"] = os.pathsep.join(
-        p for p in (_PACKAGE_PARENT, env.get("PYTHONPATH", "")) if p
-    )
+    env["PYTHONPATH"] = os.pathsep.join(entries)
     if env.get(TRANSPORTS_VARIABLE, "").strip().upper() in ("", "DEFAULT"):
         env[TRANSPORTS_VARIABLE] = CHILD_TRANSPORTS
     return env
@@ -451,9 +455,17 @@ class FailsafeWatchdog:
         while True:
             remaining = deadline - self._clock()
             if remaining <= 0:
-                return False
+                # Once more without waiting, as `_word_waiting` does: this
+                # thread can wake long after its deadline under GIL load, and
+                # an answer already waiting is an answer.
+                remaining = 0.0
+                try:
+                    if not conn.poll(0):
+                        return False
+                except (OSError, EOFError):
+                    return True
             try:
-                if not conn.poll(min(remaining, SUPERVISE_INTERVAL_S)):
+                if remaining > 0 and not conn.poll(min(remaining, SUPERVISE_INTERVAL_S)):
                     if not process.is_alive():
                         return True
                     continue

@@ -32,10 +32,21 @@ def test_the_bridge_s_environment_is_left_as_it_is():
     assert environ == {"PYTHONPATH": "/opt/ros/lib"}
 
 
-def test_the_import_path_starts_with_this_package_and_skips_the_working_directory():
-    env = child_environment({"PYTHONPATH": "/opt/ros/lib"})
+PACKAGE_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(failsafe.__file__)))
+
+
+def test_an_overlay_keeps_winning_in_the_failsafe_process():
+    """The bridge's `PYTHONPATH` order is kept: an overlay before the base
+    install stays before it, so the child has the bridge's message types."""
+    pythonpath = os.pathsep.join(["/overlay/site-packages", PACKAGE_PARENT, "/opt/ros/site-packages"])
+    env = child_environment({"PYTHONPATH": pythonpath})
     assert env["PYTHONSAFEPATH"] == "1"
-    first, rest = env["PYTHONPATH"].split(os.pathsep, 1)
-    assert os.path.isdir(os.path.join(first, "fleetless_bridge"))
-    assert first == os.path.dirname(os.path.dirname(os.path.abspath(failsafe.__file__)))
-    assert rest == "/opt/ros/lib"
+    assert env["PYTHONPATH"] == pythonpath
+
+
+def test_the_package_is_appended_when_the_path_does_not_have_it():
+    env = child_environment({"PYTHONPATH": os.pathsep.join(["/overlay/site-packages", "/opt/ros/site-packages"])})
+    assert env["PYTHONPATH"].split(os.pathsep) == [
+        "/overlay/site-packages", "/opt/ros/site-packages", PACKAGE_PARENT,
+    ]
+    assert child_environment({})["PYTHONPATH"] == PACKAGE_PARENT
