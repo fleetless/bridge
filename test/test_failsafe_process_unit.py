@@ -10,6 +10,7 @@ import time
 
 import pytest
 from geometry_msgs.msg import Twist
+from std_msgs.msg import String
 
 from fleetless_bridge.failsafe import STATE_OK, FailsafeWatchdog
 from fleetless_bridge.failsafe_process import (
@@ -592,6 +593,108 @@ def test_a_replacement_resends_the_superseding_publisher_s_fire_to_a_late_reader
     process._fire_due(process.clock.now + 1.5)
     assert len(teleop.sent) == 3
     assert drive.sent == []
+
+
+def _reap(proc, after_s):
+    proc.clock.now += after_s
+    proc._reap_retiring(proc.clock.now)
+
+
+def test_a_removed_publisher_s_owed_failsafe_reaches_the_robot_s_reader_matching_late(process):
+    """In a replacement's window, removed while it owes the dead process's
+    failsafe, with only a recorder matched: the writer is kept, and the
+    robot's reader that matches later gets the failsafe too, once."""
+    _replacement(process)
+    publisher = _armed_owed(process)
+    publisher.readers = 1  # the recorder, before the owed failsafe went out
+    process._handle(("disarm", "drive"))
+    _reap(process, 0.05)
+    assert len(publisher.sent) == 1 and process._retiring  # sent, kept
+    _reap(process, 5.0)
+    assert process._retiring  # acknowledged, still kept
+    publisher.readers = 2  # the robot
+    _reap(process, 0.05)
+    assert len(publisher.sent) == 2
+    _reap(process, 1.0)
+    assert len(publisher.sent) == 2
+    assert ("resent", "drive", TOPIC) in _reports(process)
+
+
+def test_a_publisher_removed_in_the_window_sends_its_parting_failsafe_to_a_late_reader(process):
+    """`teleop`'s command reached only a recorder, superseding `drive`'s
+    inherited failsafe, and `teleop` is removed before its deadline: its
+    parting failsafe reaches the robot's reader that matches afterwards."""
+    _replacement(process)
+    drive = _armed_owed(process)
+    _at(process, 1, drive, 0.05)  # `drive`'s owed failsafe, to the recorder
+    process._arm("teleop", TOPIC, TYPE, {}, 100, False)
+    teleop = process._writers["teleop"].publisher
+    teleop.readers = 1
+    process._handle(("publish", "teleop", "command", 1))
+    process._handle(("disarm", "teleop"))
+    assert teleop.sent == ["command", process._retiring[0].failsafe]
+    for publisher in (drive, teleop):
+        publisher.readers = 2
+    for _ in range(10):
+        process.clock.now += 0.1
+        process._fire_due(process.clock.now)
+        process._reap_retiring(process.clock.now)
+    assert len(teleop.sent) == 3  # once more, for the robot
+
+
+def test_a_command_on_the_topic_ends_a_kept_retiring_writer(process):
+    _replacement(process)
+    publisher = _armed_owed(process)
+    publisher.readers = 1
+    process._handle(("disarm", "drive"))
+    _reap(process, 0.05)
+    assert len(publisher.sent) == 1
+    process._arm("teleop", TOPIC, TYPE, {}, 100, False)
+    process._writers["teleop"].publisher.readers = 1
+    process._handle(("publish", "teleop", "command", 1))
+    publisher.readers = 2
+    _reap(process, 0.05)
+    assert len(publisher.sent) == 1  # the command's own failsafe covers it
+    assert not process._retiring
+
+
+def test_outside_a_replacement_a_retiring_writer_is_not_kept(process):
+    publisher = _armed_owed(process)
+    publisher.readers = 1
+    process._handle(("disarm", "drive"))
+    _reap(process, 0.05)
+    assert len(publisher.sent) == 1
+    assert not process._retiring
+
+
+def test_a_stop_does_not_wait_out_the_replacement_window(process):
+    _replacement(process)
+    publisher = _armed_owed(process)
+    publisher.readers = 1
+    process._handle(("disarm", "drive"))
+    _reap(process, 0.05)
+    assert process._retiring
+    assert process._handle(("stop",)) is False
+    assert not process._retiring
+
+
+def test_a_kept_writer_does_not_hold_back_a_new_writer_on_its_topic(process):
+    """Same type: the new writer is created at once. Another type: it waits
+    the type change's 0.5 s, then the kept writer goes."""
+    _replacement(process)
+    publisher = _armed_owed(process)
+    publisher.readers = 1
+    process._handle(("disarm", "drive"))
+    _reap(process, 0.05)
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    assert process._writers["drive"].publisher is not None
+    process._loaded["std_msgs/msg/String"] = String
+    process._arm("other", TOPIC, "std_msgs/msg/String", {}, 100, False)
+    assert process._writers["other"].publisher is None
+    process.clock.now += 0.6
+    process._create_pending(process.clock.now)
+    assert process._writers["other"].publisher is not None
+    assert publisher in process._node.destroyed
 
 
 def test_outside_a_replacement_a_fire_is_not_resent(process):

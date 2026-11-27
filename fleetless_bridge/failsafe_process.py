@@ -154,6 +154,10 @@ class _Retiring:
     send_by: Optional[float] = None
     matched_floor: int = 0
     last_seq: int = 0
+    # In a replacement's first seconds: kept until then once its failsafe
+    # went out, and sent again to each reader that matches later, unless a
+    # command on the topic supersedes it.
+    keep_until: Optional[float] = None
 
 
 class FailsafeProcess:
@@ -541,7 +545,8 @@ class FailsafeProcess:
             # The runtime's teardown disarmed every publisher first, so
             # nothing is owed here, unless that teardown did not run or a
             # failsafe owed from a previous process still waits for its
-            # type or a reader.
+            # type or a reader. A replacement's window is not waited out.
+            self._end_window()
             for slug in list(self._writers):
                 self._disarm(slug, parting=True)
             self._retire_owed_pending()
@@ -621,6 +626,17 @@ class FailsafeProcess:
         now = self._clock()
         if parting and touched:
             self._publish_parting(writer)
+            if self._in_window(now):
+                # The robot's reader may not have matched this process yet:
+                # the parting failsafe goes again to each reader that does.
+                self._retiring.append(_Retiring(
+                    slug=slug, topic=writer.topic, type_name=writer.type_name,
+                    publisher=writer.publisher, deadline=now + PARTING_FAILSAFE_ACK_TIMEOUT_S,
+                    failsafe=writer.failsafe, last_seq=writer.last_seq,
+                    matched_floor=writer.publisher.get_subscription_count(),
+                    keep_until=self._replacement_until,
+                ))
+                return
         elif parting and inherited:
             retiring = self._owed_retiring(
                 slug, writer.topic, writer.type_name, writer.publisher, writer.failsafe, now,
@@ -639,15 +655,20 @@ class FailsafeProcess:
             publisher=writer.publisher, deadline=now + PARTING_FAILSAFE_ACK_TIMEOUT_S,
         ))
 
-    @staticmethod
-    def _owed_retiring(slug, topic, type_name, publisher, failsafe, now, last_seq) -> "_Retiring":
+    def _in_window(self, now: float) -> bool:
+        """Whether this process is a replacement in its first seconds."""
+        return self._replacement_until is not None and now < self._replacement_until
+
+    def _owed_retiring(self, slug, topic, type_name, publisher, failsafe, now, last_seq) -> "_Retiring":
         """A retiring writer that still owes its failsafe: sent once a reader
-        matched or after `OWED_MATCH_WAIT_S`, then acknowledged."""
+        matched or after `OWED_MATCH_WAIT_S`, then acknowledged; in a
+        replacement's first seconds kept until they end."""
         send_by = now + OWED_MATCH_WAIT_S
         return _Retiring(
             slug=slug, topic=topic, type_name=type_name, publisher=publisher,
             deadline=send_by + PARTING_FAILSAFE_ACK_TIMEOUT_S, failsafe=failsafe, send_by=send_by,
             last_seq=last_seq,
+            keep_until=self._replacement_until if self._in_window(now) else None,
         )
 
     def _retire_owed(self, slug: str, arm: tuple) -> None:
@@ -762,7 +783,14 @@ class FailsafeProcess:
         # Removed writers' failsafes, of any slug.
         removed = []
         for retiring in self._retiring:
-            if retiring.topic == topic and retiring.send_by is not None:
+            if retiring.topic != topic:
+                continue
+            # A kept one sends no more: this command's own failsafe reaches
+            # late readers now.
+            if retiring.keep_until is not None:
+                retiring.keep_until = None
+                retiring.deadline = self._clock() + PARTING_FAILSAFE_ACK_TIMEOUT_S
+            if retiring.send_by is not None:
                 retiring.send_by = None
                 removed.append(retiring.slug)
         removed += [slug for slug, arm in self._parting_pending if arm[0] == topic]
@@ -792,6 +820,26 @@ class FailsafeProcess:
             # slug owed if it published since.
             self._report("superseded_owed", slug, topic, seq)
 
+    def _resend_retiring(self, retiring: _Retiring) -> None:
+        """A kept retiring writer's failsafe, again, for a reader that matched
+        after it went out."""
+        try:
+            retiring.publisher.publish(retiring.failsafe)
+        except Exception:  # noqa: BLE001 - said loudly; nothing else to do
+            self._report("fire_failed", retiring.slug, traceback.format_exc())
+            return
+        self._report("resent", retiring.slug, retiring.topic)
+
+    def _end_window(self) -> None:
+        """A stop, or the bridge gone: no longer a replacement's first
+        seconds. Kept writers retire as any; the bridge's own bounded waits
+        apply."""
+        self._replacement_until = None
+        for retiring in self._retiring:
+            if retiring.keep_until is not None:
+                retiring.keep_until = None
+                retiring.deadline = self._clock() + PARTING_FAILSAFE_ACK_TIMEOUT_S
+
     def _send_owed(self, retiring: _Retiring) -> None:
         try:
             retiring.publisher.publish(retiring.failsafe)
@@ -815,6 +863,18 @@ class FailsafeProcess:
                     # Every reader still there had it; nobody new came.
                     self._report("parting", retiring.slug, retiring.topic, retiring.last_seq)
                     retiring.send_by = None
+                retiring.matched_floor = matched
+            if retiring.keep_until is not None:
+                if now < retiring.keep_until:
+                    matched = retiring.publisher.get_subscription_count()
+                    if matched > retiring.matched_floor:
+                        self._resend_retiring(retiring)
+                    retiring.matched_floor = matched
+                    keep.append(retiring)
+                    continue
+                # The window is over: acknowledged from here on, as any.
+                retiring.keep_until = None
+                retiring.deadline = now + PARTING_FAILSAFE_ACK_TIMEOUT_S
             acked = self._acked(retiring.publisher)
             if not acked and now < retiring.deadline:
                 keep.append(retiring)
@@ -851,6 +911,7 @@ class FailsafeProcess:
         any more. Those go out once a reader matched, or after
         `OWED_MATCH_WAIT_S`."""
         self._report("terminating")
+        self._end_window()
         for slug in list(self._writers):
             self._disarm(slug, parting=True)
         self._retire_owed_pending()
