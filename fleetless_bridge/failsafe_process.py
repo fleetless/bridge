@@ -139,6 +139,13 @@ class _Retiring:
     type_name: str
     publisher: Any
     deadline: float
+    # A failsafe still owed when the writer went, from a previous process:
+    # sent once more readers matched than `matched_floor` (those that got
+    # it already), then acknowledged. At `send_by` without them: sent
+    # anyway when none had it, given up otherwise.
+    failsafe: Any = None
+    send_by: Optional[float] = None
+    matched_floor: int = 0
 
 
 class FailsafeProcess:
@@ -177,6 +184,10 @@ class FailsafeProcess:
         # with when they were asked for; and the one the loader has now.
         self._load_queue: List[tuple] = []
         self._dispatched: Optional[str] = None
+        # Owed arms disarmed (or replaced by another topic or type) while
+        # their type was loading, as `(slug, arm)`: their failsafe still
+        # goes out, from a writer that only retires.
+        self._parting_pending: List[tuple] = []
         self._load_requests: "queue.SimpleQueue" = queue.SimpleQueue()
         self._load_results: "queue.SimpleQueue" = queue.SimpleQueue()
         self._loaded_r, self._loaded_w = os.pipe()
@@ -241,12 +252,16 @@ class FailsafeProcess:
             if self._dispatched == type_name:
                 self._dispatched = None
             waiting = [slug for slug, arm in self._pending_arms.items() if arm[1] == type_name]
+            parting = [entry for entry in self._parting_pending if entry[1][1] == type_name]
+            self._parting_pending = [e for e in self._parting_pending if e[1][1] != type_name]
             if message_class is None:
                 for slug in waiting:
                     del self._pending_arms[slug]
                 self._report("error", error)
                 continue
             self._loaded[type_name] = message_class
+            for slug, arm in parting:
+                self._retire_owed(slug, arm)
             for slug in waiting:
                 self._arm(slug, *self._pending_arms.pop(slug))
 
@@ -461,7 +476,12 @@ class FailsafeProcess:
             _, slug, topic, type_name, body, timeout_ms, owed = message
             self._arm(slug, topic, type_name, body, timeout_ms, owed)
         elif kind == "disarm":
-            self._pending_arms.pop(message[1], None)
+            pending = self._pending_arms.pop(message[1], None)
+            if pending is not None and pending[4]:
+                # Owed and its type still loading: its failsafe goes out
+                # once the loader has the type, which keeps the import off
+                # this loop while other publishers are still timed.
+                self._parting_pending.append((message[1], pending))
             self._disarm(message[1], parting=True)
         elif kind == "self_test":
             block_s = self._options.get("block_before_self_test_s", 0.0)
@@ -480,10 +500,12 @@ class FailsafeProcess:
             self._report("count", request_id, count)
         elif kind == "stop":
             # The runtime's teardown disarmed every publisher first, so
-            # nothing is owed here, unless that teardown did not run.
-            self._pending_arms.clear()
+            # nothing is owed here, unless that teardown did not run or a
+            # failsafe owed from a previous process still waits for its
+            # type or a reader.
             for slug in list(self._writers):
                 self._disarm(slug, parting=True)
+            self._retire_owed_pending()
             self._wait_retiring()
             return False
         return True
@@ -499,6 +521,15 @@ class FailsafeProcess:
             existing.failsafe = params.build_message(existing.message_class, body)
             existing.timeout_s = timeout_ms / 1000.0
             return
+        previous = self._pending_arms.get(slug)
+        if previous is not None and previous[4]:
+            # A newer arm replaces a waiting one, but not the failsafe that
+            # one owed: kept for the same topic and type, parted otherwise.
+            if previous[0] == topic and previous[1] == type_name:
+                owed = True
+            else:
+                del self._pending_arms[slug]
+                self._parting_pending.append((slug, previous))
         message_class = self._loaded.get(type_name)
         if message_class is None:
             # Not loaded yet: the loader imports it, and this arm waits (a
@@ -543,16 +574,74 @@ class FailsafeProcess:
         writer = self._writers.pop(slug, None)
         if writer is None or writer.publisher is None:
             return
-        owed = writer.touched_at is not None and not writer.fired
-        if parting and (owed or writer.owed_since is not None):
+        touched = writer.touched_at is not None and not writer.fired
+        # A previous process's failsafe, not sent yet, or sent with perhaps
+        # no reader of the robot matched (`resend_until`).
+        inherited = writer.owed_since is not None or writer.resend_until is not None
+        now = self._clock()
+        if parting and touched:
             self._publish_parting(writer)
-        if writer.touched_at is None and writer.owed_since is None:
+        elif parting and inherited:
+            retiring = self._owed_retiring(
+                slug, writer.topic, writer.type_name, writer.publisher, writer.failsafe, now)
+            if writer.owed_since is None:
+                # Sent already, to the readers matched then: again only for
+                # one that matched since, as the resend does.
+                retiring.matched_floor = writer.resend_matched
+            self._retiring.append(retiring)
+            return
+        if writer.touched_at is None and not inherited:
             self._node.destroy_publisher(writer.publisher)
             return
         self._retiring.append(_Retiring(
             slug=slug, topic=writer.topic, type_name=writer.type_name,
-            publisher=writer.publisher, deadline=self._clock() + PARTING_FAILSAFE_ACK_TIMEOUT_S,
+            publisher=writer.publisher, deadline=now + PARTING_FAILSAFE_ACK_TIMEOUT_S,
         ))
+
+    @staticmethod
+    def _owed_retiring(slug, topic, type_name, publisher, failsafe, now) -> "_Retiring":
+        """A retiring writer that still owes its failsafe: sent once a reader
+        matched or after `OWED_MATCH_WAIT_S`, then acknowledged."""
+        send_by = now + OWED_MATCH_WAIT_S
+        return _Retiring(
+            slug=slug, topic=topic, type_name=type_name, publisher=publisher,
+            deadline=send_by + PARTING_FAILSAFE_ACK_TIMEOUT_S, failsafe=failsafe, send_by=send_by,
+        )
+
+    def _retire_owed(self, slug: str, arm: tuple) -> None:
+        """An owed arm that went before it had a writer: a writer only to
+        send that failsafe, retiring from the start. Its type is loaded."""
+        from fleetless_bridge import params
+
+        topic, type_name, body, _, _ = arm
+        try:
+            message_class = self._loaded[type_name]
+            publisher = self._node.create_publisher(message_class, topic, QOS_DEPTH)
+            failsafe = params.build_message(message_class, body)
+        except Exception:  # noqa: BLE001 - said loudly; the next one still has to go
+            self._report("fire_failed", slug, traceback.format_exc())
+            return
+        self._retiring.append(self._owed_retiring(
+            slug, topic, type_name, publisher, failsafe, self._clock()))
+
+    def _retire_owed_pending(self) -> None:
+        """Every failsafe still waiting for its type, at a stop or with the
+        bridge gone: the types loaded here, on this thread, since nothing
+        is timed any more."""
+        from rosidl_runtime_py.utilities import get_message
+
+        owed = [(slug, arm) for slug, arm in self._pending_arms.items() if arm[4]]
+        owed += self._parting_pending
+        self._pending_arms.clear()
+        self._parting_pending = []
+        for slug, arm in owed:
+            try:
+                if arm[1] not in self._loaded:
+                    self._loaded[arm[1]] = get_message(arm[1])
+            except Exception:  # noqa: BLE001 - said loudly; the next one still has to go
+                self._report("fire_failed", slug, traceback.format_exc())
+                continue
+            self._retire_owed(slug, arm)
 
     def _publish_parting(self, writer: _Writer, report: str = "parting",
                          matched: bool = True) -> None:
@@ -583,9 +672,29 @@ class FailsafeProcess:
         except Exception:  # noqa: BLE001 - an RMW without the call: nothing to wait for
             return True
 
+    def _send_owed(self, retiring: _Retiring) -> None:
+        try:
+            retiring.publisher.publish(retiring.failsafe)
+        except Exception:  # noqa: BLE001 - said loudly; nothing else to do
+            self._report("fire_failed", retiring.slug, traceback.format_exc())
+        else:
+            self._report("parting", retiring.slug)
+        retiring.send_by = None
+
     def _reap_retiring(self, now: float) -> None:
         keep: List[_Retiring] = []
         for retiring in self._retiring:
+            if retiring.send_by is not None:
+                matched = retiring.publisher.get_subscription_count()
+                if matched <= retiring.matched_floor and now < retiring.send_by:
+                    keep.append(retiring)
+                    continue
+                if matched > retiring.matched_floor or retiring.matched_floor == 0:
+                    self._send_owed(retiring)
+                else:
+                    # Every reader still there had it; nobody new came.
+                    self._report("parting", retiring.slug)
+                    retiring.send_by = None
             acked = self._acked(retiring.publisher)
             if not acked and now < retiring.deadline:
                 keep.append(retiring)
@@ -594,6 +703,10 @@ class FailsafeProcess:
         self._retiring = keep
 
     def _destroy_retiring(self, retiring: _Retiring, acked: bool) -> None:
+        if retiring.send_by is not None:
+            # A new writer of another type needs the topic: whatever was
+            # still owed goes out now, matched or not.
+            self._send_owed(retiring)
         if not acked:
             self._report("unacked", retiring.slug, PARTING_FAILSAFE_ACK_TIMEOUT_S)
         try:
@@ -612,28 +725,15 @@ class FailsafeProcess:
         """The pipe closed or SIGTERM came: every armed failsafe goes out
         now, and the process waits for its acknowledgement before it exits.
         `terminating` first: the supervisor waits for the acknowledgements
-        only for a process that answered its SIGTERM. An arm still waiting
-        for its type that owes a failsafe from a previous process is loaded
-        here, on this thread: nothing is timed any more."""
+        only for a process that answered its SIGTERM. The writers' own
+        failsafes first; then those owed from a previous process that still
+        wait for their type, loaded here, on this thread: nothing is timed
+        any more. Those go out once a reader matched, or after
+        `OWED_MATCH_WAIT_S`."""
         self._report("terminating")
-        from rosidl_runtime_py.utilities import get_message
-
-        for slug, arm in list(self._pending_arms.items()):
-            if not arm[4]:
-                continue
-            try:
-                self._loaded.setdefault(arm[1], get_message(arm[1]))
-                self._arm(slug, *arm)
-                self._create_pending(self._clock())
-            except Exception:  # noqa: BLE001 - the next one still has to go
-                self._report("error", traceback.format_exc())
-        for writer in list(self._writers.values()):
-            if writer.publisher is None:
-                continue
-            if (writer.touched_at is not None and not writer.fired) or writer.owed_since is not None:
-                self._publish_parting(writer)
         for slug in list(self._writers):
-            self._disarm(slug, parting=False)
+            self._disarm(slug, parting=True)
+        self._retire_owed_pending()
         self._wait_retiring()
 
 

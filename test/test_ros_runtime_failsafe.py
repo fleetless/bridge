@@ -597,6 +597,80 @@ def test_an_owed_failsafe_sent_before_any_reader_matched_goes_out_again_on_the_f
     assert run(body) == [0.0]
 
 
+def _killed_while_driven(rt, witness):
+    """A command, then SIGKILL: the killed process owes its failsafe."""
+
+    async def go():
+        await rt.publish("drive", {"speed": 1.0})
+        wait_until(lambda: len(_rx(witness)) >= 1, timeout=5.0)
+        os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+
+    return go()
+
+
+def _after_the_runtime(body, samples=2):
+    """Runs `body(rt, witnesses)`, then reads every witness's samples once
+    the runtime has stopped: what reached the robot by then."""
+    witnesses = []
+    try:
+        run(lambda rt: body(rt, witnesses))
+        for witness in witnesses:
+            wait_until(lambda: len(_rx(witness)) >= samples, timeout=10.0)
+        time.sleep(0.3)
+        return [[x for _, x in _rx(witness)] for witness in witnesses]
+    finally:
+        for witness in witnesses:
+            witness.stop()
+
+
+def test_a_stop_while_a_crashed_process_is_replaced_still_sends_its_failsafe():
+    """The bridge stops right after its failsafe process was killed while
+    driven: the stop waits for the replacement, which sends the failsafe the
+    killed one owed, before the bridge goes."""
+
+    async def body(rt, witnesses):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        witnesses.append(await _matched_witness(rt))
+        await _killed_while_driven(rt, witnesses[0])
+
+    assert _after_the_runtime(body) == [[1.0, 0.0]]
+
+
+def test_a_publisher_removed_while_its_owed_failsafe_waits_still_sends_it():
+    """Removed as soon as the replacement is back: its type may still be
+    loading, or its writer may not have found a reader yet."""
+
+    async def body(rt, witnesses):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        witnesses.append(await _matched_witness(rt))
+        await _killed_while_driven(rt, witnesses[0])
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+        assert await rt.apply_publishers({}) == []
+
+    assert _after_the_runtime(body) == [[1.0, 0.0]]
+
+
+def test_a_publisher_removed_after_its_owed_failsafe_went_to_nobody_sends_it_again():
+    """The replacement sent it after `OWED_MATCH_WAIT_S` with no reader
+    matched. Removed before the robot's subscriber matched, its writer stays
+    until that reader matched and got it."""
+
+    async def body(rt, witnesses):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        await rt.publish("drive", {"speed": 1.0})
+        os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+        await asyncio.sleep(OWED_MATCH_WAIT_S + 1.0)  # the first send went to nobody
+        # Removed while the subscriber's process is still starting, so it
+        # matches the retiring writer only.
+        witnesses.append(_start_witness_process(TOPIC))
+        assert await rt.apply_publishers({}) == []
+
+    assert _after_the_runtime(body, samples=1) == [[0.0]]
+
+
 def test_a_killed_failsafe_process_is_failed_and_replaced():
     """SIGKILL, `crashed`, a new process, and the bound again, for a witness
     that was already running, as a robot's subscriber is: four cycles of

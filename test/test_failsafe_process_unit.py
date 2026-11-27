@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import queue
 import threading
+import time
 
 import pytest
 from geometry_msgs.msg import Twist
@@ -36,14 +37,19 @@ class _Publisher:
 class _Node:
     def __init__(self):
         self.publishers = []
+        self.destroyed = []
+        # Readers a new writer finds already matched.
+        self.readers = 0
 
     def create_publisher(self, message_class, topic, depth):
         publisher = _Publisher()
+        publisher.readers = self.readers
         self.publishers.append(publisher)
         return publisher
 
     def destroy_publisher(self, publisher):
-        pass
+        self.destroyed.append(publisher)
+
 
 
 class _Clock:
@@ -154,6 +160,107 @@ def test_a_dead_loader_s_waiting_arms_are_armed_by_its_replacement(process):
     assert process._writers["drive"].publisher is not None
 
 
+def _pending_owed(proc, slug="drive", type_name=TYPE, topic=TOPIC):
+    """An arm that owes a previous process's failsafe, its type not loaded."""
+    proc._arm(slug, topic, type_name, {}, 100, True)
+    assert slug in proc._pending_arms and slug not in proc._writers
+
+
+def _loader_delivers(proc, type_name=TYPE, message_class=Twist):
+    proc._load_results.put((type_name, message_class, None))
+    proc._take_loaded()
+
+
+def _sent(proc):
+    return [msg for p in proc._node.publishers for msg in p.sent]
+
+
+def test_an_owed_arm_disarmed_while_its_type_loads_still_sends_its_failsafe(process):
+    _pending_owed(process)
+    process._handle(("disarm", "drive"))
+    assert "drive" not in process._pending_arms
+    _loader_delivers(process)
+    (retiring,) = process._retiring
+    publisher = retiring.publisher
+    process._reap_retiring(process.clock())  # no reader yet: waits for one
+    assert publisher.sent == [] and process._retiring
+    publisher.readers = 1
+    process._reap_retiring(process.clock.now + 0.1)
+    assert len(publisher.sent) == 1
+    assert ("parting", "drive") in _reports(process)
+    assert not process._writers and not process._pending_arms
+
+
+def test_an_owed_failsafe_with_no_reader_goes_out_after_the_match_wait(process):
+    _pending_owed(process)
+    process._handle(("disarm", "drive"))
+    _loader_delivers(process)
+    process._reap_retiring(process.clock.now + OWED_MATCH_WAIT_S)
+    assert len(_sent(process)) == 1
+    assert not process._retiring  # nobody to acknowledge it
+
+
+def test_a_stop_sends_the_failsafe_of_an_owed_arm_still_waiting_for_its_type(process):
+    """Loaded on the loop's thread at a stop: nothing is timed any more."""
+    process._node.readers = 1
+    _pending_owed(process)
+    assert process._handle(("stop",)) is False
+    assert len(_sent(process)) == 1
+    assert not process._retiring
+
+
+def test_the_bridge_gone_sends_the_failsafe_of_an_owed_arm_still_waiting_for_its_type(process):
+    process._node.readers = 1
+    _pending_owed(process)
+    process._bridge_gone()
+    assert len(_sent(process)) == 1
+
+
+def test_a_writer_whose_owed_failsafe_went_to_nobody_sends_it_again_when_disarmed(process):
+    publisher = _armed_owed(process)
+    _at(process, 0, publisher, OWED_MATCH_WAIT_S)  # sent with no reader matched
+    assert len(publisher.sent) == 1
+    process._handle(("disarm", "drive"))
+    assert publisher not in process._node.destroyed  # retiring, not gone
+    publisher.readers = 1
+    process._reap_retiring(process.clock.now + 0.5)
+    assert len(publisher.sent) == 2
+
+
+def test_a_writer_whose_owed_failsafe_reached_a_reader_sends_it_again_only_for_a_new_one(process):
+    """Removed after its owed failsafe went to a matched reader (perhaps a
+    recorder): not again to that reader, but to one that matches before the
+    writer is gone, as the resend does."""
+    publisher = _armed_owed(process)
+    _at(process, 1, publisher, 0.05)
+    assert len(publisher.sent) == 1
+    process._handle(("disarm", "drive"))
+    process._reap_retiring(process.clock.now + 0.5)
+    assert len(publisher.sent) == 1  # the same reader
+    publisher.readers = 2
+    process._reap_retiring(process.clock.now + 1.0)
+    assert len(publisher.sent) == 2
+
+
+def test_a_writer_whose_owed_failsafe_reached_its_readers_goes_without_a_second(process):
+    publisher = _armed_owed(process)
+    _at(process, 1, publisher, 0.05)
+    process._handle(("disarm", "drive"))
+    process._reap_retiring(process.clock.now + OWED_MATCH_WAIT_S)
+    assert len(publisher.sent) == 1
+    assert not process._retiring
+    assert ("parting", "drive") in _reports(process)
+
+
+def test_a_newer_arm_keeps_the_failsafe_a_waiting_arm_owed(process):
+    _pending_owed(process)
+    process._arm("drive", TOPIC, TYPE, {"linear": {"x": 0.5}}, 200, False)
+    assert process._pending_arms["drive"][4] is True
+    process._arm("drive", "/unit/other", TYPE, {}, 100, False)
+    assert process._pending_arms["drive"][4] is False
+    assert [slug for slug, _ in process._parting_pending] == ["drive"]
+
+
 def _watchdog():
     watchdog = FailsafeWatchdog("unit")
     watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
@@ -169,3 +276,24 @@ def test_the_bridge_keeps_a_failsafe_owed_until_a_matched_reader_got_it():
     assert watchdog._owed["drive"] is True
     watchdog._handle(("owed", "drive", True))
     assert watchdog._owed["drive"] is False
+
+
+def test_the_bridge_keeps_a_disarmed_owed_failsafe_until_a_process_sent_it():
+    """A replacement gets the arm and the disarm again, so it sends it."""
+    watchdog = _watchdog()
+    watchdog.disarm("drive")  # no process: nothing sent, nothing lost
+    assert "drive" not in watchdog._armed
+    assert watchdog._parting["drive"] == (TOPIC, TYPE, {}, 100)
+    watchdog._handle(("parting", "drive"))
+    assert watchdog._parting == {}
+
+
+def test_a_stop_does_not_wait_when_nothing_is_owed():
+    watchdog = FailsafeWatchdog("unit")
+    watchdog._supervisor = threading.Thread(target=threading.Event().wait, args=(5.0,), daemon=True)
+    watchdog._supervisor.start()
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._owed["drive"] = False
+    started = time.monotonic()
+    watchdog._await_replacement_for_owed()
+    assert time.monotonic() - started < 0.5

@@ -47,7 +47,11 @@ import time
 from multiprocessing.connection import Connection
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from fleetless_bridge.failsafe_process import LATENESS_BOUND_MS, PARTING_FAILSAFE_ACK_TIMEOUT_S
+from fleetless_bridge.failsafe_process import (
+    LATENESS_BOUND_MS,
+    OWED_MATCH_WAIT_S,
+    PARTING_FAILSAFE_ACK_TIMEOUT_S,
+)
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +80,15 @@ RETRY_INTERVAL_S = 1.0
 
 #: How often the supervisor wakes when nothing arrives.
 SUPERVISE_INTERVAL_S = 0.1
+
+#: How long a process with writers still retiring is waited for at its end:
+#: an owed failsafe waits for a reader up to `OWED_MATCH_WAIT_S`, then for
+#: its acknowledgement up to `PARTING_FAILSAFE_ACK_TIMEOUT_S`.
+RETIRING_WAIT_S = OWED_MATCH_WAIT_S + PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0
+
+#: How long a stop waits for a replacement process to take the failsafes
+#: its crashed predecessor owed: one start and its self-test.
+OWED_REPLACEMENT_WAIT_S = START_TIMEOUT_S + SELF_TEST_TIMEOUT_S
 
 STATE_STARTING = "starting"
 STATE_OK = "ok"
@@ -203,6 +216,12 @@ class FailsafeWatchdog:
         self._armed: Dict[str, Tuple[str, str, Any, int]] = {}
         # Published since its last failsafe: owed if the process dies.
         self._owed: Dict[str, bool] = {}
+        # Disarmed while owed, until a process said it sent the failsafe:
+        # a replacement gets the arm and the disarm again, so it sends it.
+        self._parting: Dict[str, Tuple[str, str, Any, int]] = {}
+        # The current process has the arms (set after `_spawn_and_test`
+        # sent them; cleared on a failure).
+        self._rearmed = threading.Event()
         self._last_word_at = 0.0
         self._errors: List[float] = []
         self._stopping = False
@@ -264,8 +283,9 @@ class FailsafeWatchdog:
         """The process sends the parting failsafe if one is owed and keeps the
         writer until its readers acknowledged it."""
         with self._lock:
-            self._armed.pop(slug, None)
-            self._owed.pop(slug, None)
+            arm = self._armed.pop(slug, None)
+            if self._owed.pop(slug, False) and arm is not None:
+                self._parting[slug] = arm
         self._send(("disarm", slug))
 
     def publish(self, slug: str, msg: Any) -> bool:
@@ -297,7 +317,14 @@ class FailsafeWatchdog:
         """Tells the process to stop and waits for it. The process disarms
         everything with the parting failsafe of any writer still owed one:
         none, when the runtime's teardown disarmed its publishers first, as
-        it does unless that teardown timed out."""
+        it does unless that teardown timed out.
+
+        A process that crashed while driven leaves its failsafes owed, and
+        its replacement sends them. A stop while that replacement starts
+        waits for it to have the arms, `OWED_REPLACEMENT_WAIT_S` at most.
+        Nothing is owed in a bridge's first seconds, so an early stop never
+        waits here."""
+        self._await_replacement_for_owed()
         with self._lock:
             # Under the lock the supervisor spawns under: no process starts
             # after this line, and the one that did is in `_process`.
@@ -326,12 +353,26 @@ class FailsafeWatchdog:
             if conn is not None and _writable(conn, 1.0):
                 self._send(("stop",))
             if process is not None:
-                process.join(PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
+                process.join(RETIRING_WAIT_S)
                 # Not read here: the supervisor may still be reading. A
                 # process still there after the stop's own wait is stuck.
                 self._end(process, None)
         if self._supervisor is not None:
             self._supervisor.join(2.0)
+
+    def _await_replacement_for_owed(self) -> None:
+        with self._lock:
+            owed = sorted({slug for slug, owes in self._owed.items() if owes} | set(self._parting))
+        supervisor = self._supervisor
+        if not owed or self._rearmed.is_set() or supervisor is None or not supervisor.is_alive():
+            return
+        log.warning("Failsafe watchdog: stopping while its process is replaced; waiting up to "
+                    "%.0f s to publish the failsafes owed for %s", OWED_REPLACEMENT_WAIT_S,
+                    ", ".join(owed))
+        if not self._rearmed.wait(OWED_REPLACEMENT_WAIT_S):
+            log.error("Failsafe watchdog: no failsafe process took the failsafes owed within "
+                      "%.0f s; publishers %s are left on their last command",
+                      OWED_REPLACEMENT_WAIT_S, ", ".join(owed))
 
     # --- the process -------------------------------------------------------------
 
@@ -366,6 +407,7 @@ class FailsafeWatchdog:
                 parent_conn.close()
                 raise _Gone("the bridge is stopping")
             self._ready = False
+            self._rearmed.clear()
             # An argument list, no shell: this interpreter, the module, its
             # end of the socket pair, and `child_environment`.
             env = child_environment(os.environ)
@@ -393,10 +435,17 @@ class FailsafeWatchdog:
         # older arm would overwrite it.
         with self._send_lock:
             with self._lock:
+                parting = list(self._parting.items())
                 arms = [(slug, arm, self._owed.get(slug, False)) for slug, arm in self._armed.items()]
+            # Disarmed while owed, first: an arm and its disarm, so the
+            # process sends that failsafe; a slug armed again since follows.
+            for slug, (topic, type_name, body, timeout_ms) in parting:
+                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, True))
+                self._send_locked(("disarm", slug))
             for slug, (topic, type_name, body, timeout_ms), owed in arms:
                 self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, owed))
             self._send_locked(("self_test",))
+            self._rearmed.set()
         reply = self._await(parent_conn, "self_test", SELF_TEST_TIMEOUT_S)
         return float(reply[1])
 
@@ -440,7 +489,7 @@ class FailsafeWatchdog:
         if process.is_alive():
             process.terminate()
             if self._answered_term(process, conn):
-                process.join(PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
+                process.join(RETIRING_WAIT_S)
         if process.is_alive():
             process.kill()
             process.join(1.0)
@@ -533,6 +582,7 @@ class FailsafeWatchdog:
                 self._fail(REASON_LATE_FIRE, lateness_ms)
         elif kind == "parting":
             with self._lock:
+                self._parting.pop(message[1], None)
                 if message[1] in self._owed:
                     self._owed[message[1]] = False
             log.warning("Publisher slug %r: removed while driven — the bridge published its failsafe",
@@ -616,6 +666,9 @@ class FailsafeWatchdog:
         restart to the supervisor's next turn."""
         if self._state == STATE_FAILED:
             return
+        # A process that crashed or froze sent nothing it owed: a stop
+        # from here on waits for the replacement that sends it.
+        self._rearmed.clear()
         log.error("Failsafe watchdog failed (%s); publishers take no publishes until it is back",
                   reason)
         self._set_failed(reason, lateness_ms)
