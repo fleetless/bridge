@@ -257,12 +257,13 @@ class FailsafeProcess:
             if message_class is None:
                 # Every publisher whose owed failsafe is lost with the type,
                 # by name.
-                lost = [slug for slug in waiting if self._pending_arms[slug][4]]
-                lost += [slug for slug, _ in parting]
+                lost = [(slug, self._pending_arms[slug][0]) for slug in waiting
+                        if self._pending_arms[slug][4]]
+                lost += [(slug, arm[0]) for slug, arm in parting]
                 for slug in waiting:
                     del self._pending_arms[slug]
-                for slug in lost:
-                    self._report("fire_failed", slug, error)
+                for slug, topic in lost:
+                    self._report("owed_failed", slug, topic, error)
                 self._report("error", error)
                 continue
             self._loaded[type_name] = message_class
@@ -438,7 +439,7 @@ class FailsafeProcess:
                 continue
             writer.fired = True
             lateness_ms = (self._clock() - deadline) * 1000.0
-            self._report("fired", writer.slug, int(writer.timeout_s * 1000), lateness_ms)
+            self._report("fired", writer.slug, int(writer.timeout_s * 1000), lateness_ms, writer.topic)
         for writer in self._writers.values():
             if writer.owed_since is None or writer.publisher is None:
                 continue
@@ -466,7 +467,8 @@ class FailsafeProcess:
     def _handle(self, message) -> bool:
         kind = message[0]
         if kind == "publish":
-            _, slug, data = message
+            # `seq` numbers the bridge's publishes, for its bookkeeping.
+            _, slug, data, seq = message
             writer = self._writers.get(slug)
             if writer is None or writer.publisher is None:
                 self._report("dropped", slug)
@@ -477,8 +479,12 @@ class FailsafeProcess:
             writer.fired = False
             writer.owed_since = None
             writer.resend_until = None  # a newer command: its own failsafe follows
-            self._supersede_owed(writer.topic)
             writer.publisher.publish(data)
+            # Only a command that went out to a reader supersedes what
+            # others owed on the topic: one that raised, or that no reader
+            # can see yet, cannot overtake their failsafe either.
+            if writer.publisher.get_subscription_count() > 0:
+                self._supersede_owed(writer.topic, slug, seq)
         elif kind == "arm":
             _, slug, topic, type_name, body, timeout_ms, owed = message
             self._arm(slug, topic, type_name, body, timeout_ms, owed)
@@ -626,7 +632,7 @@ class FailsafeProcess:
             publisher = self._node.create_publisher(message_class, topic, QOS_DEPTH)
             failsafe = params.build_message(message_class, body)
         except Exception:  # noqa: BLE001 - said loudly; the next one still has to go
-            self._report("fire_failed", slug, traceback.format_exc())
+            self._report("owed_failed", slug, topic, traceback.format_exc())
             return
         self._retiring.append(self._owed_retiring(
             slug, topic, type_name, publisher, failsafe, self._clock()))
@@ -660,13 +666,24 @@ class FailsafeProcess:
         owed += self._parting_pending
         self._pending_arms.clear()
         self._parting_pending = []
+        hung = set()
         for slug, arm in owed:
-            self._await_loader(arm[1])
+            if arm[1] not in hung:
+                self._await_loader(arm[1])
+            if self._dispatched == arm[1] and self._loader.is_alive():
+                hung.add(arm[1])
+                # The loader is stuck inside this type's import and holds
+                # its module lock: an import here would wait on it too. Said,
+                # and the other types go on.
+                self._report("owed_failed", slug, arm[0],
+                             "the loader thread still imports {} after {:.0f} s".format(
+                                 arm[1], IMPORT_CAP_S))
+                continue
             try:
                 if arm[1] not in self._loaded:
                     self._loaded[arm[1]] = get_message(arm[1])
             except Exception:  # noqa: BLE001 - said loudly; the next one still has to go
-                self._report("fire_failed", slug, traceback.format_exc())
+                self._report("owed_failed", slug, arm[0], traceback.format_exc())
                 continue
             self._retire_owed(slug, arm)
 
@@ -679,13 +696,16 @@ class FailsafeProcess:
             writer.publisher.publish(writer.failsafe)
         except Exception:  # noqa: BLE001 - said loudly; nothing else to do
             writer.fired = True
-            self._report("fire_failed", writer.slug, traceback.format_exc())
+            if report == "owed":
+                self._report("fire_failed", writer.slug, traceback.format_exc())
+            else:
+                self._report("owed_failed", writer.slug, writer.topic, traceback.format_exc())
             return
         writer.fired = True
         if report == "owed":
             self._report(report, writer.slug, matched)
         else:
-            self._report(report, writer.slug)
+            self._report(report, writer.slug, writer.topic)
 
     # --- retiring writers -------------------------------------------------------
 
@@ -699,28 +719,49 @@ class FailsafeProcess:
         except Exception:  # noqa: BLE001 - an RMW without the call: nothing to wait for
             return True
 
-    def _supersede_owed(self, topic: str) -> None:
-        """A command on `topic`: every failsafe still owed there, by any
-        slug, is not sent any more. Sent first would not do: DDS keeps no
-        order across writers, and the robot could end on the old failsafe.
-        The command's own failsafe follows it."""
-        superseded = []
+    def _supersede_owed(self, topic: str, by_slug: str, seq: int) -> None:
+        """A command on `topic` that reached a reader: every failsafe a
+        previous process owed there, by any other slug, is not sent any
+        more. Sent first would not do: DDS keeps no order across writers,
+        and the robot could end on the old failsafe. The command's own
+        failsafe follows it. A failsafe already sent can still arrive
+        after it by a reliable resend; that is the safe direction."""
+        # Removed writers' failsafes, of any slug.
+        removed = []
         for retiring in self._retiring:
             if retiring.topic == topic and retiring.send_by is not None:
                 retiring.send_by = None
-                superseded.append(retiring.slug)
-        superseded += [slug for slug, arm in self._parting_pending if arm[0] == topic]
+                removed.append(retiring.slug)
+        removed += [slug for slug, arm in self._parting_pending if arm[0] == topic]
         self._parting_pending = [(s, a) for s, a in self._parting_pending if a[0] != topic]
-        for slug in superseded:
-            self._report("superseded", slug)
+        # Other publishers' inherited failsafes on the topic, armed or
+        # waiting for their type; their own commands' failsafes stand.
+        active = []
+        for writer in self._writers.values():
+            if writer.slug == by_slug or writer.topic != topic:
+                continue
+            if writer.owed_since is not None or writer.resend_until is not None:
+                writer.owed_since = None
+                writer.resend_until = None
+                active.append(writer.slug)
+        for slug, arm in list(self._pending_arms.items()):
+            if slug != by_slug and arm[0] == topic and arm[4]:
+                self._pending_arms[slug] = arm[:4] + (False,)
+                active.append(slug)
+        for slug in removed:
+            self._report("superseded", slug, topic)
+        for slug in active:
+            # With the superseding publish's number: the bridge keeps the
+            # slug owed if it published since.
+            self._report("superseded_owed", slug, topic, seq)
 
     def _send_owed(self, retiring: _Retiring) -> None:
         try:
             retiring.publisher.publish(retiring.failsafe)
         except Exception:  # noqa: BLE001 - said loudly; nothing else to do
-            self._report("fire_failed", retiring.slug, traceback.format_exc())
+            self._report("owed_failed", retiring.slug, retiring.topic, traceback.format_exc())
         else:
-            self._report("parting", retiring.slug)
+            self._report("parting", retiring.slug, retiring.topic)
         retiring.send_by = None
 
     def _reap_retiring(self, now: float) -> None:
@@ -735,7 +776,7 @@ class FailsafeProcess:
                     self._send_owed(retiring)
                 else:
                     # Every reader still there had it; nobody new came.
-                    self._report("parting", retiring.slug)
+                    self._report("parting", retiring.slug, retiring.topic)
                     retiring.send_by = None
             acked = self._acked(retiring.publisher)
             if not acked and now < retiring.deadline:

@@ -222,6 +222,8 @@ class FailsafeWatchdog:
         # The current process has the arms (set after `_spawn_and_test`
         # sent them; cleared on a failure).
         self._rearmed = threading.Event()
+        self._publish_seq = 0
+        self._published_seq: Dict[str, int] = {}
         self._last_word_at = 0.0
         self._errors: List[float] = []
         self._stopping = False
@@ -296,11 +298,14 @@ class FailsafeWatchdog:
             if self._state != STATE_OK or slug not in self._armed:
                 return False
             self._owed[slug] = True
-            # A newer command: the failsafe a removed writer of this slug
-            # still owed is not sent any more (the process supersedes it).
-            self._parting.pop(slug, None)
             self._ever_published = True
-        return self._send(("publish", slug, data))
+            # Numbered, so that a report of a failsafe superseded by an older
+            # publish does not clear what this one owes. What a removed
+            # writer of the slug owed stays until the process reports it
+            # superseded: only a command a reader received does that.
+            self._publish_seq += 1
+            seq = self._published_seq[slug] = self._publish_seq
+        return self._send(("publish", slug, data, seq))
 
     def subscription_count(self, slug: str, timeout_s: float = 2.0) -> int:
         """How many readers the slug's writer in the process matched; -1 when
@@ -569,10 +574,13 @@ class FailsafeWatchdog:
     def _handle(self, message) -> None:
         kind = message[0]
         if kind == "fired":
-            _, slug, timeout_ms, lateness_ms = message
+            _, slug, timeout_ms, lateness_ms, topic = message
             with self._lock:
                 if slug in self._owed:
                     self._owed[slug] = False
+                # Removed just after it fired: the failsafe is the topic's
+                # last word already.
+                self._forget_parting(slug, topic)
             log.warning(
                 "Publisher slug %r: no publish for %d ms — the bridge published its failsafe "
                 "(%.1f ms after timeout)", slug, timeout_ms, lateness_ms,
@@ -585,7 +593,7 @@ class FailsafeWatchdog:
                 self._fail(REASON_LATE_FIRE, lateness_ms)
         elif kind == "parting":
             with self._lock:
-                self._parting.pop(message[1], None)
+                self._forget_parting(message[1], message[2])
                 if message[1] in self._owed:
                     self._owed[message[1]] = False
             log.warning("Publisher slug %r: removed while driven — the bridge published its failsafe",
@@ -605,19 +613,36 @@ class FailsafeWatchdog:
             log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
                         "replaced — the bridge published it", slug)
         elif kind == "fire_failed":
-            with self._lock:
-                # Not sent, and said so: not handed to every later process.
-                self._parting.pop(message[1], None)
             log.error(
                 "Publisher slug %r: its failsafe could not be published — nothing was sent, "
                 "which is worse than a stale value, so this is logged loudly:\n%s",
                 message[1], message[2],
             )
-        elif kind == "superseded":
+        elif kind == "owed_failed":
+            _, slug, topic, error = message
             with self._lock:
-                self._parting.pop(message[1], None)
-            log.info("Publisher slug %r: the failsafe its removed writer owed is not sent; a newer "
-                     "command on its topic came first", message[1])
+                # Not sent, and said so: not handed to every later process.
+                self._forget_parting(slug, topic)
+            log.error(
+                "Publisher slug %r: the failsafe it owed on %s could not be published — nothing "
+                "was sent, which is worse than a stale value, so this is logged loudly:\n%s",
+                slug, topic, error,
+            )
+        elif kind == "superseded":
+            _, slug, topic = message
+            with self._lock:
+                self._forget_parting(slug, topic)
+            log.info("Publisher slug %r: the failsafe its removed writer owed on %s is not sent; a "
+                     "newer command there reached a reader first", slug, topic)
+        elif kind == "superseded_owed":
+            _, slug, topic, seq = message
+            with self._lock:
+                armed = self._armed.get(slug)
+                if (armed is not None and armed[0] == topic and slug in self._owed
+                        and self._published_seq.get(slug, 0) < seq):
+                    self._owed[slug] = False
+            log.info("Publisher slug %r: the failsafe owed from the previous failsafe process is "
+                     "not sent; a newer command on %s reached a reader first", slug, topic)
         elif kind == "dropped":
             self._limited(message[1], "dropped", logging.WARNING,
                           "Publisher slug %r: publish dropped — its writer is not created yet", message[1])
@@ -644,6 +669,13 @@ class FailsafeWatchdog:
         elif kind == "terminating":
             pass  # a SIGTERM this process did not send, or one already judged
         # "alive" and "ready" only refresh `_last_word_at`.
+
+    def _forget_parting(self, slug: str, topic: str) -> None:
+        """A removed owed failsafe of `slug` dealt with on `topic`: forgotten
+        only if it was owed on that topic. Under `_lock`."""
+        record = self._parting.get(slug)
+        if record is not None and record[0] == topic:
+            del self._parting[slug]
 
     def _limited(self, slug: str, what: str, level: int, fmt: str, *args) -> None:
         now = self._clock()

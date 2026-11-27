@@ -126,7 +126,7 @@ def test_a_matched_owed_failsafe_still_reaches_a_reader_that_matches_later(proce
 def test_no_resend_after_a_newer_command_or_after_the_window(process):
     publisher = _armed_owed(process)
     _at(process, 0, publisher, OWED_MATCH_WAIT_S)
-    process._handle(("publish", "drive", Twist()))
+    process._handle(("publish", "drive", Twist(), 1))
     _at(process, 1, publisher, 0.05)
     assert len(publisher.sent) == 2  # the owed failsafe, then the command
     assert process._writers["drive"].resend_until is None
@@ -187,7 +187,7 @@ def test_an_owed_arm_disarmed_while_its_type_loads_still_sends_its_failsafe(proc
     publisher.readers = 1
     process._reap_retiring(process.clock.now + 0.1)
     assert len(publisher.sent) == 1
-    assert ("parting", "drive") in _reports(process)
+    assert ("parting", "drive", TOPIC) in _reports(process)
     assert not process._writers and not process._pending_arms
 
 
@@ -249,7 +249,7 @@ def test_a_writer_whose_owed_failsafe_reached_its_readers_goes_without_a_second(
     process._reap_retiring(process.clock.now + OWED_MATCH_WAIT_S)
     assert len(publisher.sent) == 1
     assert not process._retiring
-    assert ("parting", "drive") in _reports(process)
+    assert ("parting", "drive", TOPIC) in _reports(process)
 
 
 def test_a_newer_arm_keeps_the_failsafe_a_waiting_arm_owed(process):
@@ -270,14 +270,14 @@ def test_a_newer_command_on_the_topic_cancels_a_removed_writer_s_owed_failsafe(p
     process._arm("drive", TOPIC, TYPE, {}, 100, False)
     _loader_delivers(process)
     (retiring,) = process._retiring
-    process._handle(("publish", "drive", "command"))
-    for publisher in process._node.publishers:
-        publisher.readers = 1
+    process._writers["drive"].publisher.readers = 1
+    process._handle(("publish", "drive", "command", 1))
+    retiring.publisher.readers = 1
     process._reap_retiring(process.clock.now + 0.1)
     process._reap_retiring(process.clock.now + OWED_MATCH_WAIT_S)
     assert retiring.publisher.sent == []
     assert process._writers["drive"].publisher.sent == ["command"]
-    assert ("superseded", "drive") in _reports(process)
+    assert ("superseded", "drive", TOPIC) in _reports(process)
 
 
 def test_a_command_by_another_slug_on_the_topic_cancels_the_owed_failsafe(process):
@@ -286,11 +286,12 @@ def test_a_command_by_another_slug_on_the_topic_cancels_the_owed_failsafe(proces
     process._arm("drive2", TOPIC, TYPE, {}, 100, False)
     _loader_delivers(process)
     (retiring,) = process._retiring
-    process._handle(("publish", "drive2", "command"))
+    process._writers["drive2"].publisher.readers = 1
+    process._handle(("publish", "drive2", "command", 1))
     retiring.publisher.readers = 1
     process._reap_retiring(process.clock.now + 0.1)
     assert retiring.publisher.sent == []
-    assert ("superseded", "drive") in _reports(process)
+    assert ("superseded", "drive", TOPIC) in _reports(process)
 
 
 def test_a_command_on_another_topic_leaves_the_owed_failsafe(process):
@@ -298,11 +299,64 @@ def test_a_command_on_another_topic_leaves_the_owed_failsafe(process):
     process._handle(("disarm", "drive"))
     process._arm("other", "/unit/other", TYPE, {}, 100, False)
     _loader_delivers(process)
-    process._handle(("publish", "other", "command"))
+    process._writers["other"].publisher.readers = 1
+    process._handle(("publish", "other", "command", 1))
     (retiring,) = process._retiring
     retiring.publisher.readers = 1
     process._reap_retiring(process.clock.now + 0.1)
     assert len(retiring.publisher.sent) == 1
+
+
+def test_a_command_no_reader_can_see_yet_leaves_the_owed_failsafe(process):
+    """Lost under volatile durability, so it cannot overtake the failsafe."""
+    _pending_owed(process)
+    process._handle(("disarm", "drive"))
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    _loader_delivers(process)
+    process._handle(("publish", "drive", "command", 1))  # its writer has no reader
+    (retiring,) = process._retiring
+    retiring.publisher.readers = 1
+    process._reap_retiring(process.clock.now + 0.1)
+    assert len(retiring.publisher.sent) == 1
+
+
+def test_a_command_that_raised_leaves_the_owed_failsafe(process):
+    _pending_owed(process)
+    process._handle(("disarm", "drive"))
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    _loader_delivers(process)
+    writer = process._writers["drive"].publisher
+    writer.readers = 1
+
+    def raises(msg):
+        raise RuntimeError("publish failed")
+
+    writer.publish = raises
+    with pytest.raises(RuntimeError):
+        process._handle(("publish", "drive", "command", 1))
+    (retiring,) = process._retiring
+    retiring.publisher.readers = 1
+    process._reap_retiring(process.clock.now + 0.1)
+    assert len(retiring.publisher.sent) == 1
+
+
+def test_a_command_cancels_another_publisher_s_inherited_failsafe_on_its_topic(process):
+    """Two publishers on one topic after a crash: `drive`'s writer owes the
+    dead process's failsafe, `steer`'s owed arm waits for its type. A
+    command by `teleop` there reaches a reader: neither failsafe follows it."""
+    publisher = _armed_owed(process)  # `drive`, owed_since set
+    _pending_owed(process, slug="steer", type_name="geometry_msgs/msg/TwistStamped")
+    process._loaded[TYPE] = Twist
+    process._arm("teleop", TOPIC, TYPE, {}, 100, False)
+    process._writers["teleop"].publisher.readers = 1
+    process._handle(("publish", "teleop", "command", 7))
+    publisher.readers = 1
+    process._fire_due(process.clock.now + OWED_MATCH_WAIT_S)
+    assert publisher.sent == []
+    assert process._pending_arms["steer"][4] is False
+    reports = _reports(process)
+    assert ("superseded_owed", "drive", TOPIC, 7) in reports
+    assert ("superseded_owed", "steer", TOPIC, 7) in reports
 
 
 def test_a_type_that_fails_to_load_names_each_publisher_whose_failsafe_is_lost(process):
@@ -312,8 +366,31 @@ def test_a_type_that_fails_to_load_names_each_publisher_whose_failsafe_is_lost(p
     process._load_results.put((TYPE, None, "Traceback: no such type"))
     process._take_loaded()
     reports = _reports(process)
-    assert ("fire_failed", "drive", "Traceback: no such type") in reports
-    assert ("fire_failed", "steer", "Traceback: no such type") in reports
+    assert ("owed_failed", "drive", TOPIC, "Traceback: no such type") in reports
+    assert ("owed_failed", "steer", "/unit/steer", "Traceback: no such type") in reports
+
+
+def test_a_stop_skips_a_type_the_loader_is_stuck_importing_and_sends_the_others(process, monkeypatch):
+    """A loader stuck inside an import holds its module lock: the loop would
+    wait on it too. Said for each of its publishers; the other types go on."""
+    import fleetless_bridge.failsafe_process as fp
+
+    monkeypatch.setattr(fp, "IMPORT_CAP_S", 0.2)
+    stuck = threading.Event()
+    process._loader = threading.Thread(target=stuck.wait, daemon=True)
+    process._loader.start()
+    process._node.readers = 1
+    _pending_owed(process, slug="drive", type_name="geometry_msgs/msg/TwistStamped")
+    _pending_owed(process, slug="other", topic="/unit/other")
+    process._dispatched = "geometry_msgs/msg/TwistStamped"
+    try:
+        process._retire_owed_pending()
+    finally:
+        stuck.set()
+    process._reap_retiring(process.clock())
+    assert len(_sent(process)) == 1  # `other`'s
+    failed = [r[:3] for r in _reports(process) if r[0] == "owed_failed"]
+    assert failed == [("owed_failed", "drive", TOPIC)]
 
 
 def test_a_stop_takes_the_loader_s_result_for_a_type_it_is_importing(process, monkeypatch):
@@ -363,25 +440,60 @@ def test_the_bridge_keeps_a_disarmed_owed_failsafe_until_a_process_sent_it():
     watchdog.disarm("drive")  # no process: nothing sent, nothing lost
     assert "drive" not in watchdog._armed
     assert watchdog._parting["drive"] == (TOPIC, TYPE, {}, 100)
-    watchdog._handle(("parting", "drive"))
+    watchdog._handle(("parting", "drive", TOPIC))
     assert watchdog._parting == {}
 
 
-@pytest.mark.parametrize("report", [("fire_failed", "drive", "Traceback"), ("superseded", "drive")])
-def test_the_bridge_forgets_a_removed_owed_failsafe_that_failed_or_was_superseded(report):
+@pytest.mark.parametrize("report", [
+    ("owed_failed", "drive", TOPIC, "Traceback"),
+    ("superseded", "drive", TOPIC),
+    ("parting", "drive", TOPIC),
+    ("fired", "drive", 100, 0.5, TOPIC),
+])
+def test_the_bridge_forgets_a_removed_owed_failsafe_dealt_with_on_its_topic(report):
     watchdog = _watchdog()
     watchdog.disarm("drive")
     watchdog._handle(report)
     assert watchdog._parting == {}
 
 
-def test_a_newer_command_of_the_slug_forgets_its_removed_owed_failsafe():
+@pytest.mark.parametrize("report", [
+    ("owed_failed", "drive", "/unit/other", "Traceback"),
+    ("superseded", "drive", "/unit/other"),
+    ("parting", "drive", "/unit/other"),
+    ("fired", "drive", 100, 0.5, "/unit/other"),
+    ("fire_failed", "drive", "Traceback"),
+])
+def test_the_bridge_keeps_a_removed_owed_failsafe_for_a_report_about_another_topic(report):
+    """The slug's writer on another topic, or its live writer's own fire."""
     watchdog = _watchdog()
     watchdog.disarm("drive")
-    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._handle(report)
+    assert "drive" in watchdog._parting
+
+
+def test_a_command_of_the_slug_on_another_topic_keeps_its_removed_owed_failsafe():
+    """Removed while owed on one topic, added back on another, then a
+    command: the first topic's failsafe is still owed."""
+    watchdog = _watchdog()
+    watchdog.disarm("drive")
+    watchdog._armed["drive"] = ("/unit/other", TYPE, {}, 100)
     watchdog._state = STATE_OK
     watchdog.publish("drive", Twist())
-    assert watchdog._parting == {}
+    assert watchdog._parting["drive"][0] == TOPIC
+
+
+def test_the_bridge_clears_an_owed_mark_superseded_only_by_a_newer_command():
+    """Another publisher's command superseded `drive`'s inherited failsafe;
+    a command of `drive` sent after that one keeps `drive` owed."""
+    watchdog = _watchdog()
+    watchdog._state = STATE_OK
+    watchdog.publish("drive", Twist())  # publish 1
+    watchdog._handle(("superseded_owed", "drive", TOPIC, 2))  # by publish 2
+    assert watchdog._owed["drive"] is False
+    watchdog.publish("drive", Twist())  # publish 3, sent before the report came
+    watchdog._handle(("superseded_owed", "drive", TOPIC, 2))
+    assert watchdog._owed["drive"] is True
 
 
 def test_a_stop_does_not_wait_when_nothing_is_owed():
