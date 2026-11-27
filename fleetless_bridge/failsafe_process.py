@@ -130,6 +130,11 @@ class _Writer:
     resend_matched: int = 0
     # Created only once no retiring writer of another type holds the topic.
     create_after: float = 0.0
+    # The number of the bridge's last publish this writer's failsafe answers:
+    # its own last command, or for an inherited failsafe the last the bridge
+    # had made when it armed it. Echoed in the reports that clear an owed
+    # mark, so that the bridge keeps the mark of a newer publish.
+    last_seq: int = 0
 
 
 @dataclass
@@ -146,6 +151,7 @@ class _Retiring:
     failsafe: Any = None
     send_by: Optional[float] = None
     matched_floor: int = 0
+    last_seq: int = 0
 
 
 class FailsafeProcess:
@@ -439,7 +445,8 @@ class FailsafeProcess:
                 continue
             writer.fired = True
             lateness_ms = (self._clock() - deadline) * 1000.0
-            self._report("fired", writer.slug, int(writer.timeout_s * 1000), lateness_ms, writer.topic)
+            self._report("fired", writer.slug, int(writer.timeout_s * 1000), lateness_ms, writer.topic,
+                         writer.last_seq)
         for writer in self._writers.values():
             if writer.owed_since is None or writer.publisher is None:
                 continue
@@ -479,6 +486,7 @@ class FailsafeProcess:
             writer.fired = False
             writer.owed_since = None
             writer.resend_until = None  # a newer command: its own failsafe follows
+            writer.last_seq = seq
             writer.publisher.publish(data)
             # Only a command that went out to a reader supersedes what
             # others owed on the topic: one that raised, or that no reader
@@ -486,8 +494,9 @@ class FailsafeProcess:
             if writer.publisher.get_subscription_count() > 0:
                 self._supersede_owed(writer.topic, slug, seq)
         elif kind == "arm":
-            _, slug, topic, type_name, body, timeout_ms, owed = message
-            self._arm(slug, topic, type_name, body, timeout_ms, owed)
+            # `seq`: the bridge's last publish of the slug when it sent this.
+            _, slug, topic, type_name, body, timeout_ms, owed, seq = message
+            self._arm(slug, topic, type_name, body, timeout_ms, owed, seq)
         elif kind == "disarm":
             pending = self._pending_arms.pop(message[1], None)
             if pending is not None and pending[4]:
@@ -523,7 +532,7 @@ class FailsafeProcess:
             return False
         return True
 
-    def _arm(self, slug, topic, type_name, body, timeout_ms, owed) -> None:
+    def _arm(self, slug, topic, type_name, body, timeout_ms, owed, seq=0) -> None:
         from fleetless_bridge import params
 
         existing = self._writers.get(slug)
@@ -539,7 +548,7 @@ class FailsafeProcess:
             # A newer arm replaces a waiting one, but not the failsafe that
             # one owed: kept for the same topic and type, parted otherwise.
             if previous[0] == topic and previous[1] == type_name:
-                owed = True
+                owed, seq = True, previous[5]
             else:
                 del self._pending_arms[slug]
                 self._parting_pending.append((slug, previous))
@@ -548,7 +557,7 @@ class FailsafeProcess:
             # Not loaded yet: the loader imports it, and this arm waits (a
             # newer arm of the slug replaces it). Until then the slug has no
             # writer, and a publish to it is reported dropped.
-            self._pending_arms[slug] = (topic, type_name, body, timeout_ms, owed)
+            self._pending_arms[slug] = (topic, type_name, body, timeout_ms, owed, seq)
             if type_name not in self._loading:
                 self._loading.add(type_name)
                 self._load_queue.append((type_name, self._clock()))
@@ -557,6 +566,7 @@ class FailsafeProcess:
         writer = _Writer(
             slug=slug, topic=topic, type_name=type_name, message_class=message_class,
             failsafe=params.build_message(message_class, body), timeout_s=timeout_ms / 1000.0,
+            last_seq=seq,
         )
         now = self._clock()
         if any(r.topic == topic and r.type_name != type_name for r in self._retiring):
@@ -596,7 +606,8 @@ class FailsafeProcess:
             self._publish_parting(writer)
         elif parting and inherited:
             retiring = self._owed_retiring(
-                slug, writer.topic, writer.type_name, writer.publisher, writer.failsafe, now)
+                slug, writer.topic, writer.type_name, writer.publisher, writer.failsafe, now,
+                writer.last_seq)
             if writer.owed_since is None:
                 # Sent already, to the readers matched then: again only for
                 # one that matched since, as the resend does.
@@ -612,13 +623,14 @@ class FailsafeProcess:
         ))
 
     @staticmethod
-    def _owed_retiring(slug, topic, type_name, publisher, failsafe, now) -> "_Retiring":
+    def _owed_retiring(slug, topic, type_name, publisher, failsafe, now, last_seq) -> "_Retiring":
         """A retiring writer that still owes its failsafe: sent once a reader
         matched or after `OWED_MATCH_WAIT_S`, then acknowledged."""
         send_by = now + OWED_MATCH_WAIT_S
         return _Retiring(
             slug=slug, topic=topic, type_name=type_name, publisher=publisher,
             deadline=send_by + PARTING_FAILSAFE_ACK_TIMEOUT_S, failsafe=failsafe, send_by=send_by,
+            last_seq=last_seq,
         )
 
     def _retire_owed(self, slug: str, arm: tuple) -> None:
@@ -626,7 +638,7 @@ class FailsafeProcess:
         send that failsafe, retiring from the start. Its type is loaded."""
         from fleetless_bridge import params
 
-        topic, type_name, body, _, _ = arm
+        topic, type_name, body, seq = arm[0], arm[1], arm[2], arm[5]
         try:
             message_class = self._loaded[type_name]
             publisher = self._node.create_publisher(message_class, topic, QOS_DEPTH)
@@ -635,7 +647,7 @@ class FailsafeProcess:
             self._report("owed_failed", slug, topic, traceback.format_exc())
             return
         self._retiring.append(self._owed_retiring(
-            slug, topic, type_name, publisher, failsafe, self._clock()))
+            slug, topic, type_name, publisher, failsafe, self._clock(), seq))
 
     def _await_loader(self, type_name: str) -> None:
         """When the loader is importing `type_name` right now, its result,
@@ -703,9 +715,9 @@ class FailsafeProcess:
             return
         writer.fired = True
         if report == "owed":
-            self._report(report, writer.slug, matched)
+            self._report(report, writer.slug, matched, writer.last_seq)
         else:
-            self._report(report, writer.slug, writer.topic)
+            self._report(report, writer.slug, writer.topic, writer.last_seq)
 
     # --- retiring writers -------------------------------------------------------
 
@@ -746,7 +758,7 @@ class FailsafeProcess:
                 active.append(writer.slug)
         for slug, arm in list(self._pending_arms.items()):
             if slug != by_slug and arm[0] == topic and arm[4]:
-                self._pending_arms[slug] = arm[:4] + (False,)
+                self._pending_arms[slug] = arm[:4] + (False,) + arm[5:]
                 active.append(slug)
         for slug in removed:
             self._report("superseded", slug, topic)
@@ -761,7 +773,7 @@ class FailsafeProcess:
         except Exception:  # noqa: BLE001 - said loudly; nothing else to do
             self._report("owed_failed", retiring.slug, retiring.topic, traceback.format_exc())
         else:
-            self._report("parting", retiring.slug, retiring.topic)
+            self._report("parting", retiring.slug, retiring.topic, retiring.last_seq)
         retiring.send_by = None
 
     def _reap_retiring(self, now: float) -> None:
@@ -776,7 +788,7 @@ class FailsafeProcess:
                     self._send_owed(retiring)
                 else:
                     # Every reader still there had it; nobody new came.
-                    self._report("parting", retiring.slug, retiring.topic)
+                    self._report("parting", retiring.slug, retiring.topic, retiring.last_seq)
                     retiring.send_by = None
             acked = self._acked(retiring.publisher)
             if not acked and now < retiring.deadline:

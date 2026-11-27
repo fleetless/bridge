@@ -279,7 +279,8 @@ class FailsafeWatchdog:
         with self._lock:
             self._armed[slug] = (topic, type_name, body, timeout_ms)
             self._owed.setdefault(slug, False)
-        self._send(("arm", slug, topic, type_name, body, timeout_ms, False))
+            seq = self._published_seq.get(slug, 0)
+        self._send(("arm", slug, topic, type_name, body, timeout_ms, False, seq))
 
     def disarm(self, slug: str) -> None:
         """The process sends the parting failsafe if one is owed and keeps the
@@ -445,13 +446,16 @@ class FailsafeWatchdog:
             with self._lock:
                 parting = list(self._parting.items())
                 arms = [(slug, arm, self._owed.get(slug, False)) for slug, arm in self._armed.items()]
+                seqs = dict(self._published_seq)
             # Disarmed while owed, first: an arm and its disarm, so the
             # process sends that failsafe; a slug armed again since follows.
             for slug, (topic, type_name, body, timeout_ms) in parting:
-                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, True))
+                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, True,
+                                   seqs.get(slug, 0)))
                 self._send_locked(("disarm", slug))
             for slug, (topic, type_name, body, timeout_ms), owed in arms:
-                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, owed))
+                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, owed,
+                                   seqs.get(slug, 0)))
             self._send_locked(("self_test",))
             self._rearmed.set()
         reply = self._await(parent_conn, "self_test", SELF_TEST_TIMEOUT_S)
@@ -574,10 +578,9 @@ class FailsafeWatchdog:
     def _handle(self, message) -> None:
         kind = message[0]
         if kind == "fired":
-            _, slug, timeout_ms, lateness_ms, topic = message
+            _, slug, timeout_ms, lateness_ms, topic, seq = message
             with self._lock:
-                if slug in self._owed:
-                    self._owed[slug] = False
+                self._answered(slug, seq)
                 # Removed just after it fired: the failsafe is the topic's
                 # last word already.
                 self._forget_parting(slug, topic)
@@ -594,12 +597,11 @@ class FailsafeWatchdog:
         elif kind == "parting":
             with self._lock:
                 self._forget_parting(message[1], message[2])
-                if message[1] in self._owed:
-                    self._owed[message[1]] = False
+                self._answered(message[1], message[3])
             log.warning("Publisher slug %r: removed while driven — the bridge published its failsafe",
                         message[1])
         elif kind == "owed":
-            _, slug, matched = message
+            _, slug, matched, seq = message
             if not matched:
                 # Sent to nobody: still owed, so a process that replaces
                 # this one before a reader matched sends it too.
@@ -608,8 +610,7 @@ class FailsafeWatchdog:
                             "publishes it again as readers match", slug)
                 return
             with self._lock:
-                if slug in self._owed:
-                    self._owed[slug] = False
+                self._answered(slug, seq)
             log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
                         "replaced — the bridge published it", slug)
         elif kind == "fire_failed":
@@ -669,6 +670,13 @@ class FailsafeWatchdog:
         elif kind == "terminating":
             pass  # a SIGTERM this process did not send, or one already judged
         # "alive" and "ready" only refresh `_last_word_at`.
+
+    def _answered(self, slug: str, seq: int) -> None:
+        """A failsafe went out for `slug`, answering its publishes up to
+        `seq`: no longer owed, unless a newer publish of it is already on its
+        way to the process. Under `_lock`."""
+        if slug in self._owed and self._published_seq.get(slug, 0) <= seq:
+            self._owed[slug] = False
 
     def _forget_parting(self, slug: str, topic: str) -> None:
         """A removed owed failsafe of `slug` dealt with on `topic`: forgotten

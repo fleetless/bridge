@@ -113,7 +113,7 @@ def test_an_owed_failsafe_goes_out_again_each_time_another_reader_matches(proces
     _at(process, 2, publisher, 1.0)  # the controller restarts
     assert len(publisher.sent) == 4
     owed = [r for r in _reports(process) if r[0] == "owed"]
-    assert owed == [("owed", "drive", False)] + [("owed", "drive", True)] * 3
+    assert owed == [("owed", "drive", False, 0)] + [("owed", "drive", True, 0)] * 3
 
 
 def test_a_matched_owed_failsafe_still_reaches_a_reader_that_matches_later(process):
@@ -187,7 +187,7 @@ def test_an_owed_arm_disarmed_while_its_type_loads_still_sends_its_failsafe(proc
     publisher.readers = 1
     process._reap_retiring(process.clock.now + 0.1)
     assert len(publisher.sent) == 1
-    assert ("parting", "drive", TOPIC) in _reports(process)
+    assert ("parting", "drive", TOPIC, 0) in _reports(process)
     assert not process._writers and not process._pending_arms
 
 
@@ -249,7 +249,7 @@ def test_a_writer_whose_owed_failsafe_reached_its_readers_goes_without_a_second(
     process._reap_retiring(process.clock.now + OWED_MATCH_WAIT_S)
     assert len(publisher.sent) == 1
     assert not process._retiring
-    assert ("parting", "drive", TOPIC) in _reports(process)
+    assert ("parting", "drive", TOPIC, 0) in _reports(process)
 
 
 def test_a_newer_arm_keeps_the_failsafe_a_waiting_arm_owed(process):
@@ -428,9 +428,9 @@ def test_the_bridge_keeps_a_failsafe_owed_until_a_matched_reader_got_it():
     """Sent to nobody, it is still owed: a process that replaces this one
     before any reader matched sends it too."""
     watchdog = _watchdog()
-    watchdog._handle(("owed", "drive", False))
+    watchdog._handle(("owed", "drive", False, 0))
     assert watchdog._owed["drive"] is True
-    watchdog._handle(("owed", "drive", True))
+    watchdog._handle(("owed", "drive", True, 0))
     assert watchdog._owed["drive"] is False
 
 
@@ -440,15 +440,15 @@ def test_the_bridge_keeps_a_disarmed_owed_failsafe_until_a_process_sent_it():
     watchdog.disarm("drive")  # no process: nothing sent, nothing lost
     assert "drive" not in watchdog._armed
     assert watchdog._parting["drive"] == (TOPIC, TYPE, {}, 100)
-    watchdog._handle(("parting", "drive", TOPIC))
+    watchdog._handle(("parting", "drive", TOPIC, 0))
     assert watchdog._parting == {}
 
 
 @pytest.mark.parametrize("report", [
     ("owed_failed", "drive", TOPIC, "Traceback"),
     ("superseded", "drive", TOPIC),
-    ("parting", "drive", TOPIC),
-    ("fired", "drive", 100, 0.5, TOPIC),
+    ("parting", "drive", TOPIC, 0),
+    ("fired", "drive", 100, 0.5, TOPIC, 0),
 ])
 def test_the_bridge_forgets_a_removed_owed_failsafe_dealt_with_on_its_topic(report):
     watchdog = _watchdog()
@@ -460,8 +460,8 @@ def test_the_bridge_forgets_a_removed_owed_failsafe_dealt_with_on_its_topic(repo
 @pytest.mark.parametrize("report", [
     ("owed_failed", "drive", "/unit/other", "Traceback"),
     ("superseded", "drive", "/unit/other"),
-    ("parting", "drive", "/unit/other"),
-    ("fired", "drive", 100, 0.5, "/unit/other"),
+    ("parting", "drive", "/unit/other", 0),
+    ("fired", "drive", 100, 0.5, "/unit/other", 0),
     ("fire_failed", "drive", "Traceback"),
 ])
 def test_the_bridge_keeps_a_removed_owed_failsafe_for_a_report_about_another_topic(report):
@@ -481,6 +481,45 @@ def test_a_command_of_the_slug_on_another_topic_keeps_its_removed_owed_failsafe(
     watchdog._state = STATE_OK
     watchdog.publish("drive", Twist())
     assert watchdog._parting["drive"][0] == TOPIC
+
+
+@pytest.mark.parametrize("answer", [
+    lambda seq: ("fired", "drive", 100, 0.5, TOPIC, seq),
+    lambda seq: ("parting", "drive", TOPIC, seq),
+    lambda seq: ("owed", "drive", True, seq),
+])
+def test_a_newer_publish_in_flight_when_the_failsafe_is_reported_keeps_the_owed_mark(answer):
+    """The failsafe answers publish 1; publish 2 is already on its way to
+    the process when the report arrives. A crash now must still find
+    publish 2's failsafe owed."""
+    watchdog = _watchdog()
+    watchdog._state = STATE_OK
+    watchdog.publish("drive", Twist())  # 1
+    watchdog.publish("drive", Twist())  # 2, sent before the report came
+    watchdog._handle(answer(1))
+    assert watchdog._owed["drive"] is True
+    watchdog._handle(answer(2))
+    assert watchdog._owed["drive"] is False
+
+
+def test_the_process_reports_which_publish_a_failsafe_answers(process):
+    process._loaded[TYPE] = Twist
+    process._arm("drive", TOPIC, TYPE, {}, 100, False, 4)
+    publisher = process._writers["drive"].publisher
+    process._fire_due(process.clock.now)
+    process._handle(("publish", "drive", "command", 5))
+    process._fire_due(process.clock.now + 0.2)
+    fired = [r for r in _reports(process) if r[0] == "fired"]
+    assert fired and fired[-1][-1] == 5
+    assert publisher.sent == ["command", process._writers["drive"].failsafe]
+
+
+def test_an_inherited_failsafe_answers_the_publish_the_bridge_had_made_when_it_armed_it(process):
+    process._loaded[TYPE] = Twist
+    process._arm("drive", TOPIC, TYPE, {}, 100, True, 9)
+    publisher = process._writers["drive"].publisher
+    _at(process, 1, publisher, 0.05)
+    assert ("owed", "drive", True, 9) in _reports(process)
 
 
 def test_the_bridge_clears_an_owed_mark_superseded_only_by_a_newer_command():
