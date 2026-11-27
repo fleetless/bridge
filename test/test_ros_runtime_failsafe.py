@@ -725,7 +725,11 @@ def _no_reader_warnings(handler):
 
 def test_a_stop_right_after_a_crash_says_when_the_owed_failsafe_reached_no_reader():
     """Killed while driven, nobody subscribed, the bridge stopped at once:
-    the owed failsafe goes out to nobody, and the bridge's log says so."""
+    the owed failsafe goes out to nobody, and the bridge's log says so.
+
+    The process's reports go out 50 ms apart (`send_delay_s`), so its last
+    one, this warning, is still queued when it exits: it arrives only
+    because the process waits for its sender first."""
     handler = _logging_failsafe()
 
     async def body(rt):
@@ -735,7 +739,7 @@ def test_a_stop_right_after_a_crash_says_when_the_owed_failsafe_reached_no_reade
         wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
 
     try:
-        run(body)
+        run(body, failsafe_options={"send_delay_s": 0.05})
     finally:
         logging.getLogger("fleetless_bridge.failsafe").removeHandler(handler)
     assert _no_reader_warnings(handler), handler.lines

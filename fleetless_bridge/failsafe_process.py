@@ -237,10 +237,15 @@ class FailsafeProcess:
         self._outbox.put(message)
 
     def _send_loop(self) -> None:
+        # A test's seam: a slow pipe, so that a report the exit would cut off
+        # is cut off every time unless the exit waits for this thread.
+        delay_s = self._options.get("send_delay_s", 0.0)
         while True:
             message = self._outbox.get()
             if message is None:
                 return
+            if delay_s:
+                time.sleep(delay_s)
             try:
                 self._conn.send(message)
             except (OSError, EOFError, ValueError):
@@ -972,6 +977,9 @@ class FailsafeProcess:
         # so that every send and report happens inside the bridge's wait.
         deadline = self._leave_deadline = self._clock() + STOP_WAIT_S
         self._leaving = True
+        # Kept for a replacement's window until now: the robot's reader may
+        # still match, whoever had the failsafe so far.
+        kept = {id(r) for r in self._retiring if r.keep_until is not None}
         self._end_window()
         for slug in list(self._writers):
             self._disarm(slug, parting=True)
@@ -984,9 +992,16 @@ class FailsafeProcess:
                 # an unsent one does, and is said if none came.
                 retiring.send_by = send_by
                 retiring.matched_floor = 0
+            elif retiring.send_by is None and retiring.sent_to and id(retiring) in kept:
+                # Kept, and a reader had it, perhaps only a bystander: sent
+                # again to a new reader, as an armed writer's; no word else.
+                retiring.send_by = send_by
+                retiring.matched_floor = retiring.sent_to
             elif retiring.send_by is not None:
                 retiring.send_by = send_by
-            retiring.deadline = max(deadline, send_by)
+            # Its acknowledgement gets the reserve even when a slow type load
+            # made it late.
+            retiring.deadline = max(deadline, send_by + STOP_ACK_RESERVE_S)
         self._wait_retiring()
 
 

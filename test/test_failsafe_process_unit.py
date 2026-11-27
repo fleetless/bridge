@@ -672,14 +672,17 @@ def test_outside_a_replacement_a_retiring_writer_is_not_kept(process):
 
 
 def test_a_stop_does_not_wait_out_the_replacement_window(process):
+    """It waits for a new reader the stop's deadline at most, not the 30 s."""
     _replacement(process)
     publisher = _armed_owed(process)
     publisher.readers = 1
     process._handle(("disarm", "drive"))
     _reap(process, 0.05)
     assert process._retiring
+    start = _advancing(process)
     assert process._handle(("stop",)) is False
     assert not process._retiring
+    assert process.clock.now - start <= STOP_WAIT_S + 0.2
 
 
 def test_a_kept_writer_does_not_hold_back_a_new_writer_of_its_type(process):
@@ -900,18 +903,71 @@ def test_a_stop_says_the_teardown_s_parting_failsafe_reached_nobody(process):
     assert len(publisher.sent) == 3  # the command, its parting failsafe, again at the stop
 
 
+def _kept_after_a_bystander_had_it(proc):
+    _replacement(proc)
+    publisher = _armed_owed(proc)
+    publisher.readers = 1  # a recorder
+    proc._handle(("disarm", "drive"))
+    _reap(proc, 0.05)
+    assert len(publisher.sent) == 1 and proc._retiring[0].sent_to == 1
+    return publisher
+
+
+def test_a_stop_sends_a_kept_failsafe_a_bystander_had_again_to_a_new_reader(process):
+    """Kept, and a recorder had it: as an armed writer's, the stop waits for
+    a new reader, the robot's matching 1 s in, and sends it again to it."""
+    publisher = _kept_after_a_bystander_had_it(process)
+    _advancing(process, at=(1.0, lambda: setattr(publisher, "readers", 2)))
+    assert process._handle(("stop",)) is False
+    assert len(publisher.sent) == 2
+    assert not [r for r in _reports(process) if r[0] == "unheard"]
+
+
 def test_a_stop_gives_no_word_for_a_failsafe_a_bystander_had(process):
-    """Reached a reader, perhaps only a recorder: no wait and no word, as
-    an armed writer's."""
-    _replacement(process)
-    publisher = _armed_owed(process)
-    publisher.readers = 1
-    process._handle(("disarm", "drive"))
-    _reap(process, 0.05)
+    """No new reader by the stop's deadline: it goes, without a word."""
+    publisher = _kept_after_a_bystander_had_it(process)
     _advancing(process)
     assert process._handle(("stop",)) is False
     assert len(publisher.sent) == 1
+    assert ("parting", "drive", TOPIC, 0) in _reports(process)
     assert not [r for r in _reports(process) if r[0] == "unheard"]
+
+
+def test_a_writer_parted_outside_a_window_does_not_hold_the_stop(process):
+    """Not kept: a reader had its parting failsafe and has not acknowledged
+    it yet when the stop comes. The stop does not wait for a new reader."""
+    process._loaded[TYPE] = Twist
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    publisher = process._writers["drive"].publisher
+    publisher.readers = 1
+    process._handle(("publish", "drive", "command", 1))
+    process._handle(("disarm", "drive"))
+    (retiring,) = process._retiring
+    start = _advancing(process)
+    acked_at = start + 0.5
+    process._acked = lambda publisher: process.clock.now >= acked_at
+    assert process._handle(("stop",)) is False
+    assert process.clock.now - start < 1.0
+    assert retiring.send_by is None
+
+
+@pytest.mark.parametrize("load_s", [6.0, 7.0])
+def test_a_late_writer_s_acknowledgement_keeps_its_reserve(process, load_s):
+    """A type load past the stop's deadline: the writer sends at once, and
+    still waits `STOP_ACK_RESERVE_S` for its acknowledgement."""
+    process._node.readers = 1
+    _pending_owed(process)
+    destroyed_at = []
+    destroy = process._node.destroy_publisher
+    process._node.destroy_publisher = lambda p: (destroyed_at.append(process.clock.now), destroy(p))
+    sent = _recording_sends(process)
+    start = _advancing(process)
+    process._await_loader = lambda type_name: setattr(process.clock, "now",
+                                                      process.clock.now + load_s)
+    process._acked = lambda publisher: False
+    assert process._handle(("stop",)) is False
+    assert len(sent) == 1 and sent[0][0] - start >= load_s
+    assert destroyed_at[0] - sent[0][0] >= STOP_ACK_RESERVE_S - 0.1
 
 
 def test_a_stop_s_send_that_raised_is_not_said_to_have_reached_nobody(process):
@@ -938,8 +994,10 @@ def test_a_stop_s_send_that_raised_is_not_said_to_have_reached_nobody(process):
 
 def test_a_stop_is_not_held_by_a_new_type_waiting_for_a_kept_writer(process):
     _retargeted_in_the_window(process)
+    start = _advancing(process)
     assert process._handle(("stop",)) is False
     assert not process._retiring
+    assert process.clock.now - start <= STOP_WAIT_S + 0.2
 
 
 def test_outside_a_replacement_a_fire_is_not_resent(process):
