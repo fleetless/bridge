@@ -405,14 +405,18 @@ class FailsafeWatchdog:
         if conn is None or (supervisor is not None and supervisor.is_alive()):
             process.join(max(0.0, deadline - self._clock()))
             return
-        while process.is_alive():
+        # Until the pipe's end, not until the process is gone: what it said
+        # just before it exited is still in the pipe then.
+        while True:
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return
             try:
                 if conn.poll(min(remaining, SUPERVISE_INTERVAL_S)):
                     message = conn.recv()
-                    # Only what is said: no state change while stopping.
+                    # Only the reports that log, and the bookkeeping that goes
+                    # with them: nothing that fails the watchdog or starts a
+                    # process while stopping.
                     if message[0] in _SAID_AT_STOP:
                         self._handle(message)
             except (OSError, EOFError):
@@ -677,20 +681,24 @@ class FailsafeWatchdog:
                 message[1], message[2],
             )
         elif kind == "owed_failed":
-            _, slug, topic, error = message
+            _, slug, topic, seq, error = message
             with self._lock:
                 # Not sent, and said so: not handed to every later process.
-                self._forget_parting(slug, topic)
+                # Only that removal's record, not a newer one.
+                self._forget_parting(slug, topic, seq)
             log.error(
                 "Publisher slug %r: the failsafe it owed on %s could not be published — nothing "
                 "was sent, which is worse than a stale value, so this is logged loudly:\n%s",
                 slug, topic, error,
             )
         elif kind == "superseded":
-            _, slug, topic = message
+            _, slug, topic, seq = message
             with self._lock:
-                self._forget_parting(slug, topic)
-                self._held_parting.pop((slug, topic), None)
+                # Superseded by publish `seq`: only a removal older than it;
+                # one made since answers that very command.
+                self._forget_parting(slug, topic, seq - 1)
+                if self._held_parting.get((slug, topic), seq) < seq:
+                    del self._held_parting[(slug, topic)]
             log.info("Publisher slug %r: the failsafe its removed writer owed on %s is not sent; a "
                      "newer command there reached a reader first", slug, topic)
         elif kind == "superseded_owed":

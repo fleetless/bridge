@@ -282,7 +282,7 @@ def test_a_newer_command_on_the_topic_cancels_a_removed_writer_s_owed_failsafe(p
     process._reap_retiring(process.clock.now + OWED_MATCH_WAIT_S)
     assert retiring.publisher.sent == []
     assert process._writers["drive"].publisher.sent == ["command"]
-    assert ("superseded", "drive", TOPIC) in _reports(process)
+    assert ("superseded", "drive", TOPIC, 1) in _reports(process)
 
 
 def test_a_command_by_another_slug_on_the_topic_cancels_the_owed_failsafe(process):
@@ -296,7 +296,7 @@ def test_a_command_by_another_slug_on_the_topic_cancels_the_owed_failsafe(proces
     retiring.publisher.readers = 1
     process._reap_retiring(process.clock.now + 0.1)
     assert retiring.publisher.sent == []
-    assert ("superseded", "drive", TOPIC) in _reports(process)
+    assert ("superseded", "drive", TOPIC, 1) in _reports(process)
 
 
 def test_a_command_on_another_topic_leaves_the_owed_failsafe(process):
@@ -371,8 +371,8 @@ def test_a_type_that_fails_to_load_names_each_publisher_whose_failsafe_is_lost(p
     process._load_results.put((TYPE, None, "Traceback: no such type"))
     process._take_loaded()
     reports = _reports(process)
-    assert ("owed_failed", "drive", TOPIC, "Traceback: no such type") in reports
-    assert ("owed_failed", "steer", "/unit/steer", "Traceback: no such type") in reports
+    assert ("owed_failed", "drive", TOPIC, 0, "Traceback: no such type") in reports
+    assert ("owed_failed", "steer", "/unit/steer", 0, "Traceback: no such type") in reports
 
 
 def test_a_stop_skips_a_type_the_loader_is_stuck_importing_and_sends_the_others(process, monkeypatch):
@@ -450,8 +450,8 @@ def test_the_bridge_keeps_a_disarmed_owed_failsafe_until_a_process_sent_it():
 
 
 @pytest.mark.parametrize("report", [
-    ("owed_failed", "drive", TOPIC, "Traceback"),
-    ("superseded", "drive", TOPIC),
+    ("owed_failed", "drive", TOPIC, 0, "Traceback"),
+    ("superseded", "drive", TOPIC, 1),
     ("parting", "drive", TOPIC, 0),
     ("fired", "drive", 100, 0.5, TOPIC, 0),
 ])
@@ -463,8 +463,8 @@ def test_the_bridge_forgets_a_removed_owed_failsafe_dealt_with_on_its_topic(repo
 
 
 @pytest.mark.parametrize("report", [
-    ("owed_failed", "drive", "/unit/other", "Traceback"),
-    ("superseded", "drive", "/unit/other"),
+    ("owed_failed", "drive", "/unit/other", 0, "Traceback"),
+    ("superseded", "drive", "/unit/other", 1),
     ("parting", "drive", "/unit/other", 0),
     ("fired", "drive", 100, 0.5, "/unit/other", 0),
     ("fire_failed", "drive", "Traceback"),
@@ -823,6 +823,119 @@ def test_a_stop_s_parting_failsafe_with_no_reader_is_said(process):
     assert ("unheard", "drive", TOPIC) in _reports(process)
 
 
+def _recording_sends(proc):
+    """Each send of a writer created from here on, with the clock and the
+    readers matched then."""
+    sent = []
+    create = proc._node.create_publisher
+
+    def created(message_class, topic, depth):
+        publisher = create(message_class, topic, depth)
+        original = publisher.publish
+        publisher.publish = lambda msg: (sent.append((proc.clock.now, publisher.readers)),
+                                         original(msg))
+        return publisher
+
+    proc._node.create_publisher = created
+    return sent
+
+
+@pytest.mark.parametrize("load_s", [2.5, 3.5])
+def test_a_stop_s_deadline_holds_through_a_slow_type_load(process, load_s):
+    """The type of an owed arm takes seconds to load at the stop: its send,
+    and the word that it reached nobody, still come inside the stop's
+    shared deadline, so inside the bridge's wait for the process."""
+    sent = _recording_sends(process)
+    _pending_owed(process)
+    start = _advancing(process)
+    process._await_loader = lambda type_name: setattr(process.clock, "now",
+                                                      process.clock.now + load_s)
+    assert process._handle(("stop",)) is False
+    assert len(sent) == 1
+    assert sent[0][0] - start <= STOP_WAIT_S + 0.2
+    assert ("unheard", "drive", TOPIC) in _reports(process)
+
+
+def _kept_after_sending_to_nobody(proc):
+    """In a replacement's window, `drive` removed while it owed the dead
+    process's failsafe; that failsafe went out with no reader, and the
+    writer is kept."""
+    _replacement(proc)
+    publisher = _armed_owed(proc)
+    proc._handle(("disarm", "drive"))
+    _reap(proc, OWED_MATCH_WAIT_S + 0.1)
+    assert len(publisher.sent) == 1 and proc._retiring[0].sent_to == 0
+    return publisher
+
+
+def test_a_stop_waits_for_a_reader_for_a_kept_failsafe_that_reached_nobody(process):
+    publisher = _kept_after_sending_to_nobody(process)
+    _advancing(process, at=(1.0, lambda: setattr(publisher, "readers", 1)))
+    assert process._handle(("stop",)) is False
+    assert len(publisher.sent) == 2
+    assert not [r for r in _reports(process) if r[0] == "unheard"]
+
+
+def test_a_stop_says_a_kept_failsafe_reached_nobody_when_no_reader_came(process):
+    publisher = _kept_after_sending_to_nobody(process)
+    _advancing(process)
+    assert process._handle(("stop",)) is False
+    assert ("unheard", "drive", TOPIC) in _reports(process)
+    assert len(publisher.sent) == 2
+
+
+def test_a_stop_says_the_teardown_s_parting_failsafe_reached_nobody(process):
+    """In a replacement's window, a command, then the runtime's teardown
+    removes the publisher before the stop: its parting failsafe went to no
+    reader. The stop waits for one, and says it when none came."""
+    _replacement(process)
+    process._loaded[TYPE] = Twist
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    publisher = process._writers["drive"].publisher
+    process._handle(("publish", "drive", "command", 1))
+    process._handle(("disarm", "drive"))
+    _advancing(process)
+    assert process._handle(("stop",)) is False
+    assert ("unheard", "drive", TOPIC) in _reports(process)
+    assert len(publisher.sent) == 3  # the command, its parting failsafe, again at the stop
+
+
+def test_a_stop_gives_no_word_for_a_failsafe_a_bystander_had(process):
+    """Reached a reader, perhaps only a recorder: no wait and no word, as
+    an armed writer's."""
+    _replacement(process)
+    publisher = _armed_owed(process)
+    publisher.readers = 1
+    process._handle(("disarm", "drive"))
+    _reap(process, 0.05)
+    _advancing(process)
+    assert process._handle(("stop",)) is False
+    assert len(publisher.sent) == 1
+    assert not [r for r in _reports(process) if r[0] == "unheard"]
+
+
+def test_a_stop_s_send_that_raised_is_not_said_to_have_reached_nobody(process):
+    sent = _recording_sends(process)
+    _pending_owed(process)
+    _advancing(process)
+    create = process._node.create_publisher
+
+    def failing(message_class, topic, depth):
+        publisher = create(message_class, topic, depth)
+
+        def raises(msg):
+            raise RuntimeError("publish failed")
+
+        publisher.publish = raises
+        return publisher
+
+    process._node.create_publisher = failing
+    assert process._handle(("stop",)) is False
+    reports = _reports(process)
+    assert [r[0] for r in reports if r[0] in ("owed_failed", "unheard")] == ["owed_failed"]
+    assert sent == []
+
+
 def test_a_stop_is_not_held_by_a_new_type_waiting_for_a_kept_writer(process):
     _retargeted_in_the_window(process)
     assert process._handle(("stop",)) is False
@@ -889,7 +1002,7 @@ def test_in_a_replacement_s_window_a_command_that_reached_a_reader_clears_at_onc
     watchdog._owed["steer"] = True
     watchdog.disarm("drive")
     _in_replacement_window(watchdog, clock)
-    watchdog._handle(("superseded", "drive", TOPIC))
+    watchdog._handle(("superseded", "drive", TOPIC, 1))
     watchdog._handle(("superseded_owed", "steer", TOPIC, 5))
     assert watchdog._parting == {}
     assert watchdog._owed["steer"] is False
@@ -964,6 +1077,40 @@ def logged():
     logger.removeHandler(handler)
 
 
+def _two_removals(watchdog):
+    """`drive` removed while owed (seq 1), added back, driven and removed
+    again on the same topic (seq 2)."""
+    watchdog._state = STATE_OK
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._owed["drive"] = False
+    watchdog.publish("drive", Twist())  # 1
+    watchdog.disarm("drive")
+    watchdog.arm("drive", TOPIC, TYPE, {}, 100)
+    watchdog.publish("drive", Twist())  # 2
+    watchdog.disarm("drive")
+    assert watchdog._parting["drive"][4] == 2
+
+
+def test_a_failure_to_send_the_first_removal_s_failsafe_keeps_the_newer_record():
+    watchdog = FailsafeWatchdog("unit")
+    _two_removals(watchdog)
+    watchdog._handle(("owed_failed", "drive", TOPIC, 1, "Traceback"))
+    assert watchdog._parting["drive"][4] == 2
+    watchdog._handle(("owed_failed", "drive", TOPIC, 2, "Traceback"))
+    assert watchdog._parting == {}
+
+
+def test_a_late_superseded_report_keeps_a_removal_made_since_the_command():
+    """The first removal superseded by publish 2; the removal made after it
+    answers that very publish and stays."""
+    watchdog = FailsafeWatchdog("unit")
+    _two_removals(watchdog)
+    watchdog._handle(("superseded", "drive", TOPIC, 2))
+    assert watchdog._parting["drive"][4] == 2
+    watchdog._handle(("superseded", "drive", TOPIC, 3))
+    assert watchdog._parting == {}
+
+
 def test_the_bridge_logs_a_stop_s_failsafe_that_went_to_no_reader(logged):
     watchdog = FailsafeWatchdog("unit")
     watchdog._handle(("unheard", "drive", TOPIC))
@@ -985,18 +1132,23 @@ class _Stopping:
         pass
 
 
-def test_a_stop_reads_what_the_process_says_while_it_waits_for_it(logged):
+def test_a_stop_reads_what_the_process_said_before_it_exited(logged):
+    """The process is gone already; what it said last is still in the pipe,
+    up to its end."""
     watchdog = FailsafeWatchdog("unit")
     ours, theirs = multiprocessing.Pipe()
     try:
+        theirs.send(("parting", "drive", TOPIC, 0))
         theirs.send(("unheard", "drive", TOPIC))
-        theirs.send(("fired", "drive", 100, 50.0, TOPIC, 1))  # no state change at a stop
-        watchdog._join_reading(_Stopping(ends_after=5), ours, 2.0)
+        theirs.send(("fired", "drive", 100, 50.0, TOPIC, 1))  # nothing that fails it at a stop
+        theirs.close()
+        started = time.monotonic()
+        watchdog._join_reading(_Stopping(ends_after=0), ours, 5.0)
+        assert time.monotonic() - started < 1.0  # the pipe's end, not the deadline
         assert any("no reader" in line for line in logged)
         assert watchdog.state != "failed"
     finally:
         ours.close()
-        theirs.close()
 
 
 def test_a_stop_does_not_wait_when_nothing_is_owed():

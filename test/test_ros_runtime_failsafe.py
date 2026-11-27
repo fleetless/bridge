@@ -12,6 +12,7 @@ own process is doing: idle, with its executor busy in a pure-Python callback,
 and with threads that keep its GIL busy.
 """
 import asyncio
+import logging
 import os
 import signal
 import threading
@@ -699,6 +700,96 @@ def test_a_second_failure_inside_the_window_still_reaches_a_late_robot_reader():
                 robot.stop()
 
     assert run(body) == [0.0]
+
+
+class _Logged(logging.Handler):
+    """What the bridge's failsafe watchdog logs, as text."""
+
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def _logging_failsafe():
+    handler = _Logged()
+    logging.getLogger("fleetless_bridge.failsafe").addHandler(handler)
+    return handler
+
+
+def _no_reader_warnings(handler):
+    return [line for line in handler.lines if "no reader" in line and "'drive'" in line]
+
+
+def test_a_stop_right_after_a_crash_says_when_the_owed_failsafe_reached_no_reader():
+    """Killed while driven, nobody subscribed, the bridge stopped at once:
+    the owed failsafe goes out to nobody, and the bridge's log says so."""
+    handler = _logging_failsafe()
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        await rt.publish("drive", {"speed": 1.0})
+        os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+
+    try:
+        run(body)
+    finally:
+        logging.getLogger("fleetless_bridge.failsafe").removeHandler(handler)
+    assert _no_reader_warnings(handler), handler.lines
+
+
+def test_a_stop_after_a_command_to_nobody_in_the_window_says_its_failsafe_reached_no_reader():
+    """After a restart, a command with nobody subscribed; the runtime's
+    teardown removes the publisher, its parting failsafe reaches nobody,
+    and the stop says so."""
+    handler = _logging_failsafe()
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+        await rt.publish("drive", {"speed": 1.0})
+
+    try:
+        run(body)
+    finally:
+        logging.getLogger("fleetless_bridge.failsafe").removeHandler(handler)
+    assert _no_reader_warnings(handler), handler.lines
+
+
+@pytest.mark.parametrize("removed", [False, True], ids=["armed", "removed"])
+def test_a_stop_waits_for_a_late_reader_for_a_failsafe_that_reached_nobody(removed):
+    """Killed while driven with nobody subscribed; the replacement's owed
+    failsafe goes to nobody. Armed, or removed so that its retiring send
+    went to nobody as well: the robot's subscriber starts, the bridge stops
+    at once, and the subscriber still gets the failsafe."""
+    witnesses = []
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        await rt.publish("drive", {"speed": 1.0})
+        os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+        wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+        await asyncio.sleep(OWED_MATCH_WAIT_S + 1.0)
+        if removed:
+            assert await rt.apply_publishers({}) == []
+            await asyncio.sleep(OWED_MATCH_WAIT_S + 1.0)
+        witnesses.append(_start_witness_process(TOPIC))
+
+    try:
+        run(body)
+        wait_until(lambda: len(_rx(witnesses[0])) >= 1, timeout=10.0)
+        time.sleep(0.3)
+        xs = [x for _, x in _rx(witnesses[0])]
+    finally:
+        for witness in witnesses:
+            witness.stop()
+    assert xs == [0.0]
 
 
 def test_a_killed_failsafe_process_is_failed_and_replaced():
