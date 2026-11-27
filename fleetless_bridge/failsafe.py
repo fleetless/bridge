@@ -87,6 +87,11 @@ SUPERVISE_INTERVAL_S = 0.1
 #: its acknowledgement up to `PARTING_FAILSAFE_ACK_TIMEOUT_S`.
 RETIRING_WAIT_S = OWED_MATCH_WAIT_S + PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0
 
+#: The process's reports a stop reads while it waits for the process: the
+#: ones that only log.
+_SAID_AT_STOP = frozenset({"unheard", "parting", "owed_failed", "fire_failed", "unsent_owed",
+                           "resent", "unacked"})
+
 #: How long a stop waits for a replacement process to take the failsafes
 #: its crashed predecessor owed: one start and its self-test.
 OWED_REPLACEMENT_WAIT_S = START_TIMEOUT_S + SELF_TEST_TIMEOUT_S
@@ -233,7 +238,7 @@ class FailsafeWatchdog:
         # reached a reader clears at once, as outside it.
         self._replacement_until: Optional[float] = None
         self._held_owed: Dict[str, int] = {}
-        self._held_parting: set = set()
+        self._held_parting: Dict[Tuple[str, str], int] = {}
         self._last_word_at = 0.0
         self._errors: List[float] = []
         self._stopping = False
@@ -382,12 +387,37 @@ class FailsafeWatchdog:
             if conn is not None and _writable(conn, 1.0):
                 self._send(("stop",))
             if process is not None:
-                process.join(RETIRING_WAIT_S)
-                # Not read here: the supervisor may still be reading. A
-                # process still there after the stop's own wait is stuck.
+                self._join_reading(process, conn, RETIRING_WAIT_S)
+                # A process still there after the stop's own wait is stuck.
                 self._end(process, None)
         if self._supervisor is not None:
             self._supervisor.join(2.0)
+
+    def _join_reading(self, process, conn, timeout_s: float) -> None:
+        """Waits for the stopping process, `timeout_s` at most, and reads
+        what it says meanwhile (a failsafe that went to no reader is
+        logged), once the supervisor, the pipe's other reader, has ended.
+        A supervisor still running is not raced: then only joined."""
+        deadline = self._clock() + timeout_s
+        supervisor = self._supervisor
+        if supervisor is not None:
+            supervisor.join(min(2.0, timeout_s))
+        if conn is None or (supervisor is not None and supervisor.is_alive()):
+            process.join(max(0.0, deadline - self._clock()))
+            return
+        while process.is_alive():
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return
+            try:
+                if conn.poll(min(remaining, SUPERVISE_INTERVAL_S)):
+                    message = conn.recv()
+                    # Only what is said: no state change while stopping.
+                    if message[0] in _SAID_AT_STOP:
+                        self._handle(message)
+            except (OSError, EOFError):
+                process.join(max(0.0, deadline - self._clock()))
+                return
 
     def _await_replacement_for_owed(self) -> None:
         with self._lock:
@@ -660,7 +690,7 @@ class FailsafeWatchdog:
             _, slug, topic = message
             with self._lock:
                 self._forget_parting(slug, topic)
-                self._held_parting.discard((slug, topic))
+                self._held_parting.pop((slug, topic), None)
             log.info("Publisher slug %r: the failsafe its removed writer owed on %s is not sent; a "
                      "newer command there reached a reader first", slug, topic)
         elif kind == "superseded_owed":
@@ -673,6 +703,9 @@ class FailsafeWatchdog:
                     self._held_owed.pop(slug, None)
             log.info("Publisher slug %r: the failsafe owed from the previous failsafe process is "
                      "not sent; a newer command on %s reached a reader first", slug, topic)
+        elif kind == "unheard":
+            log.warning("Publisher slug %r: its failsafe on %s went out at the stop with no reader "
+                        "matched; the robot may keep its last command", message[1], message[2])
         elif kind == "unsent_owed":
             log.warning("Publisher slug %r: the failsafe owed on %s from the previous failsafe "
                         "process was dropped with its writer, which was not created yet",
@@ -711,11 +744,12 @@ class FailsafeWatchdog:
         if self._replacement_until is not None:
             self._held_owed[slug] = max(seq, self._held_owed.get(slug, 0))
             if topic is not None:
-                self._held_parting.add((slug, topic))
+                key = (slug, topic)
+                self._held_parting[key] = max(seq, self._held_parting.get(key, 0))
             return
         self._answered(slug, seq)
         if topic is not None:
-            self._forget_parting(slug, topic)
+            self._forget_parting(slug, topic, seq)
 
     def _end_replacement_window(self, now: Optional[float] = None) -> None:
         """At the window's end, or a stop: what was sent in it counts now.
@@ -726,11 +760,11 @@ class FailsafeWatchdog:
             return
         self._replacement_until = None
         held_owed, self._held_owed = self._held_owed, {}
-        held_parting, self._held_parting = self._held_parting, set()
+        held_parting, self._held_parting = self._held_parting, {}
         for slug, seq in held_owed.items():
             self._answered(slug, seq)
-        for slug, topic in held_parting:
-            self._forget_parting(slug, topic)
+        for (slug, topic), seq in held_parting.items():
+            self._forget_parting(slug, topic, seq)
 
     def _answered(self, slug: str, seq: int) -> None:
         """A failsafe went out for `slug`, answering its publishes up to
@@ -739,11 +773,13 @@ class FailsafeWatchdog:
         if slug in self._owed and self._published_seq.get(slug, 0) <= seq:
             self._owed[slug] = False
 
-    def _forget_parting(self, slug: str, topic: str) -> None:
+    def _forget_parting(self, slug: str, topic: str, seq: Optional[int] = None) -> None:
         """A removed owed failsafe of `slug` dealt with on `topic`: forgotten
-        only if it was owed on that topic. Under `_lock`."""
+        only if it was owed on that topic, and, for a send answering the
+        publishes up to `seq`, only a record of a removal no newer than that.
+        Under `_lock`."""
         record = self._parting.get(slug)
-        if record is not None and record[0] == topic:
+        if record is not None and record[0] == topic and (seq is None or record[4] <= seq):
             del self._parting[slug]
 
     def _limited(self, slug: str, what: str, level: int, fmt: str, *args) -> None:

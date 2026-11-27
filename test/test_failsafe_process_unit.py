@@ -2,6 +2,7 @@
 """The failsafe process's loop and its supervisor, in this process, on a
 fake clock and a fake node: the paths no real process reaches on cue
 (fleetless/fleetless#1124)."""
+import logging
 import multiprocessing
 import os
 import queue
@@ -16,6 +17,8 @@ from fleetless_bridge.failsafe import STATE_OK, FailsafeWatchdog
 from fleetless_bridge.failsafe_process import (
     OWED_MATCH_WAIT_S,
     OWED_RESEND_WINDOW_S,
+    STOP_ACK_RESERVE_S,
+    STOP_WAIT_S,
     FailsafeProcess,
 )
 
@@ -62,11 +65,12 @@ class _Clock:
 
 
 @pytest.fixture
-def process():
+def process(monkeypatch):
     ours, theirs = multiprocessing.Pipe()
     clock = _Clock()
     proc = FailsafeProcess(_Node(), theirs, clock=clock)
     proc.clock = clock
+    proc.monkeypatch = monkeypatch
     yield proc
     proc._load_requests.put(None)
     os.close(proc._loaded_r)
@@ -752,6 +756,73 @@ def test_a_waiting_writer_that_owed_a_failsafe_is_reported_when_it_goes(process)
     assert ("unsent_owed", "drive", TOPIC) in _reports(process)
 
 
+def _advancing(proc, step_s=0.05, at=None):
+    """The process's clock moves on with each look, as a stop's waits need,
+    and the waits do not sleep; `at` = (seconds, action) runs once that much
+    time passed."""
+    import fleetless_bridge.failsafe_process as fp
+
+    proc.monkeypatch.setattr(fp.time, "sleep", lambda s: None)
+    start = proc.clock.now
+
+    def clock():
+        proc.clock.now += step_s
+        if at is not None and proc.clock.now - start >= at[0] and not getattr(clock, "done", False):
+            clock.done = True
+            at[1]()
+        return proc.clock.now
+
+    proc._clock = clock
+    return start
+
+
+def test_a_stop_waits_for_a_reader_as_long_as_its_shared_deadline_allows(process):
+    """The robot's reader matches 3.5 s into the stop, past the old 2 s
+    match wait: the owed failsafe still goes out to it, and is not said to
+    have gone to no reader."""
+    _pending_owed(process)
+    publishers = process._node.publishers
+
+    def robot_matches():
+        for publisher in publishers:
+            publisher.readers = 1
+
+    sent_at = []
+    _advancing(process, at=(3.5, robot_matches))
+    real_retire = process._retire_owed
+
+    def retire(slug, arm):
+        real_retire(slug, arm)
+        publisher = process._retiring[-1].publisher
+        original = publisher.publish
+        publisher.publish = lambda msg: (sent_at.append((process.clock.now, publisher.readers)),
+                                         original(msg))
+
+    process._retire_owed = retire
+    assert process._handle(("stop",)) is False
+    assert len(sent_at) == 1 and sent_at[0][1] == 1
+    assert not [r for r in _reports(process) if r[0] == "unheard"]
+
+
+def test_a_stop_s_owed_failsafe_that_found_no_reader_is_said(process):
+    _pending_owed(process)
+    start = _advancing(process)
+    assert process._handle(("stop",)) is False
+    assert len(_sent(process)) == 1
+    assert ("unheard", "drive", TOPIC) in _reports(process)
+    assert process.clock.now - start <= STOP_WAIT_S + 0.2
+    assert process.clock.now - start >= STOP_WAIT_S - STOP_ACK_RESERVE_S
+
+
+def test_a_stop_s_parting_failsafe_with_no_reader_is_said(process):
+    process._loaded[TYPE] = Twist
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    process._handle(("publish", "drive", "command", 1))
+    _advancing(process)
+    assert process._handle(("stop",)) is False
+    assert ("unheard", "drive", TOPIC) in _reports(process)
+
+
 def test_a_stop_is_not_held_by_a_new_type_waiting_for_a_kept_writer(process):
     _retargeted_in_the_window(process)
     assert process._handle(("stop",)) is False
@@ -847,6 +918,85 @@ def test_a_publisher_retargeted_while_owed_is_recorded_as_a_removal():
     assert watchdog._owed["drive"] is False
     watchdog.arm("drive", "/unit/new", TYPE, {"x": 1}, 100)  # same topic and type
     assert watchdog._parting["drive"][0] == TOPIC
+
+
+def test_the_window_s_end_keeps_a_newer_removal_record_of_the_same_slug_and_topic():
+    """Removed while owed, its parting failsafe sent (held); added back,
+    driven and removed again on the same topic: the held send answers the
+    first removal only, so the second record survives the window's end."""
+    clock = _Clock()
+    watchdog = FailsafeWatchdog("unit", clock=clock)
+    watchdog._state = STATE_OK
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._owed["drive"] = False
+    _in_replacement_window(watchdog, clock)
+    watchdog.publish("drive", Twist())  # 1
+    watchdog.disarm("drive")
+    watchdog._handle(("parting", "drive", TOPIC, 1))
+    watchdog.arm("drive", TOPIC, TYPE, {}, 100)
+    watchdog.publish("drive", Twist())  # 2
+    watchdog.disarm("drive")
+    assert watchdog._parting["drive"][4] == 2
+    clock.now += OWED_RESEND_WINDOW_S
+    with watchdog._lock:
+        watchdog._end_replacement_window(clock())
+    assert watchdog._parting["drive"][4] == 2
+
+
+class _Logged(logging.Handler):
+    """The suite's `caplog` misses these; a handler on the module logger,
+    as the runtime's tests do."""
+
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+@pytest.fixture
+def logged():
+    handler = _Logged()
+    logger = logging.getLogger("fleetless_bridge.failsafe")
+    logger.addHandler(handler)
+    yield handler.lines
+    logger.removeHandler(handler)
+
+
+def test_the_bridge_logs_a_stop_s_failsafe_that_went_to_no_reader(logged):
+    watchdog = FailsafeWatchdog("unit")
+    watchdog._handle(("unheard", "drive", TOPIC))
+    assert any("'drive'" in line and TOPIC in line and "no reader" in line for line in logged)
+
+
+class _Stopping:
+    """A process that ends once its pipe was read."""
+
+    def __init__(self, ends_after):
+        self.calls = 0
+        self.ends_after = ends_after
+
+    def is_alive(self):
+        self.calls += 1
+        return self.calls <= self.ends_after
+
+    def join(self, timeout_s):
+        pass
+
+
+def test_a_stop_reads_what_the_process_says_while_it_waits_for_it(logged):
+    watchdog = FailsafeWatchdog("unit")
+    ours, theirs = multiprocessing.Pipe()
+    try:
+        theirs.send(("unheard", "drive", TOPIC))
+        theirs.send(("fired", "drive", 100, 50.0, TOPIC, 1))  # no state change at a stop
+        watchdog._join_reading(_Stopping(ends_after=5), ours, 2.0)
+        assert any("no reader" in line for line in logged)
+        assert watchdog.state != "failed"
+    finally:
+        ours.close()
+        theirs.close()
 
 
 def test_a_stop_does_not_wait_when_nothing_is_owed():

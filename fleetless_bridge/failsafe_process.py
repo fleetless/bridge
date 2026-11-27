@@ -88,6 +88,13 @@ OWED_MATCH_WAIT_S = 2.0
 #: or a `ros2 topic echo`, not the robot, which would keep its command.
 OWED_RESEND_WINDOW_S = 30.0
 
+#: At a stop, how long every retiring writer has, together: an owed one
+#: waits for a reader as long as this allows, less `STOP_ACK_RESERVE_S`
+#: for its acknowledgement. Inside the bridge's join
+#: (`failsafe.RETIRING_WAIT_S`, one second more).
+STOP_WAIT_S = OWED_MATCH_WAIT_S + PARTING_FAILSAFE_ACK_TIMEOUT_S
+STOP_ACK_RESERVE_S = 1.0
+
 QOS_DEPTH = 10
 
 #: The most read from the pipe at once. Between two reads, what is due fires.
@@ -175,6 +182,8 @@ class FailsafeProcess:
         self._wakeup_fd = wakeup_fd
         #: Set by the SIGTERM handler; the loop acts on it between messages.
         self.terminated = False
+        # A stop, or the bridge gone (`_leave`).
+        self._leaving = False
         self._options = dict(options or {})
         self._clock = clock
         # A process that replaced a failed one: until then its writers' own
@@ -545,12 +554,8 @@ class FailsafeProcess:
             # The runtime's teardown disarmed every publisher first, so
             # nothing is owed here, unless that teardown did not run or a
             # failsafe owed from a previous process still waits for its
-            # type or a reader. A replacement's window is not waited out.
-            self._end_window()
-            for slug in list(self._writers):
-                self._disarm(slug, parting=True)
-            self._retire_owed_pending()
-            self._wait_retiring()
+            # type or a reader.
+            self._leave()
             return False
         return True
 
@@ -639,6 +644,8 @@ class FailsafeProcess:
         now = self._clock()
         if parting and touched:
             self._publish_parting(writer)
+            if self._leaving and writer.publisher.get_subscription_count() == 0:
+                self._report("unheard", slug, writer.topic)
             if self._in_window(now):
                 # The robot's reader may not have matched this process yet:
                 # the parting failsafe goes again to each reader that does.
@@ -872,6 +879,8 @@ class FailsafeProcess:
                     continue
                 if matched > retiring.matched_floor or retiring.matched_floor == 0:
                     self._send_owed(retiring)
+                    if self._leaving and matched == 0:
+                        self._report("unheard", retiring.slug, retiring.topic)
                 else:
                     # Every reader still there had it; nobody new came.
                     self._report("parting", retiring.slug, retiring.topic, retiring.last_seq)
@@ -921,13 +930,26 @@ class FailsafeProcess:
         only for a process that answered its SIGTERM. The writers' own
         failsafes first; then those owed from a previous process that still
         wait for their type, loaded here, on this thread: nothing is timed
-        any more. Those go out once a reader matched, or after
-        `OWED_MATCH_WAIT_S`."""
+        any more."""
         self._report("terminating")
+        self._leave()
+
+    def _leave(self) -> None:
+        """A stop, or the bridge gone: every writer goes with its failsafe.
+        A replacement's window is not waited out. Every retiring writer
+        shares one deadline, `STOP_WAIT_S`: an owed one waits for a reader
+        as long as that allows, less `STOP_ACK_RESERVE_S` for its
+        acknowledgement. A failsafe that goes out to no reader is said."""
+        self._leaving = True
         self._end_window()
         for slug in list(self._writers):
             self._disarm(slug, parting=True)
         self._retire_owed_pending()
+        deadline = self._clock() + STOP_WAIT_S
+        for retiring in self._retiring:
+            if retiring.send_by is not None:
+                retiring.send_by = deadline - STOP_ACK_RESERVE_S
+            retiring.deadline = deadline
         self._wait_retiring()
 
 
