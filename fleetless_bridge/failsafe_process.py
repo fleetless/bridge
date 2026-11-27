@@ -82,9 +82,10 @@ RETIRING_CHECK_INTERVAL_S = 0.05
 #: matched is lost, so it waits for a reader this long, at most.
 OWED_MATCH_WAIT_S = 2.0
 
-#: One that went out with no reader matched yet goes out again when the first
-#: reader matches, within this long: on a loaded machine discovery takes
-#: longer than `OWED_MATCH_WAIT_S`, and the robot would keep its command.
+#: Once it went out, it goes out again each time another reader matches,
+#: within this long: on a loaded machine discovery takes longer than
+#: `OWED_MATCH_WAIT_S`, and the reader that matched first may be a recorder
+#: or a `ros2 topic echo`, not the robot, which would keep its command.
 OWED_RESEND_WINDOW_S = 30.0
 
 QOS_DEPTH = 10
@@ -123,8 +124,10 @@ class _Writer:
     fired: bool = True
     # A failsafe owed from a previous process, fired once a reader matched.
     owed_since: Optional[float] = None
-    # It went out with no reader matched: sent again on the first match.
-    resend_on_match_since: Optional[float] = None
+    # It went out: until then it goes out again whenever more readers
+    # matched than at its last send (`resend_matched`).
+    resend_until: Optional[float] = None
+    resend_matched: int = 0
     # Created only once no retiring writer of another type holds the topic.
     create_after: float = 0.0
 
@@ -253,13 +256,13 @@ class FailsafeProcess:
         it has waited `IMPORT_CAP_S`."""
         if self._dispatched is not None and not self._loader.is_alive():
             # The loader died (it never should): its type, and every arm
-            # waiting for one, would wait for ever. Said, and given up.
+            # waiting for one, would wait for ever. Said, and the type it
+            # had goes to a new loader first; the arms keep waiting. A
+            # loader that dies again is a second `error`, and two end
+            # this process (`failsafe.ERROR_WINDOW_S`).
             self._report("error", "the failsafe process's loader thread ended")
             self._load_requests = queue.SimpleQueue()
-            for slug in [s for s, arm in self._pending_arms.items() if arm[1] in self._loading]:
-                del self._pending_arms[slug]
-            self._loading.clear()
-            self._load_queue.clear()
+            self._load_queue.insert(0, (self._dispatched, self._clock()))
             self._dispatched = None
             self._loader = threading.Thread(
                 target=self._load_loop, name="fleetless-failsafe-loader", daemon=True
@@ -392,7 +395,7 @@ class FailsafeProcess:
         for writer in self._writers.values():
             if writer.touched_at is not None and not writer.fired:
                 wake = min(wake, writer.touched_at + writer.timeout_s)
-            if (writer.owed_since is not None or writer.resend_on_match_since is not None
+            if (writer.owed_since is not None or writer.resend_until is not None
                     or writer.publisher is None):
                 wake = min(wake, now + RETIRING_CHECK_INTERVAL_S)
         if self._retiring or self._load_queue:
@@ -418,19 +421,24 @@ class FailsafeProcess:
         for writer in self._writers.values():
             if writer.owed_since is None or writer.publisher is None:
                 continue
-            matched = writer.publisher.get_subscription_count() > 0
-            if matched or now - writer.owed_since >= OWED_MATCH_WAIT_S:
+            matched = writer.publisher.get_subscription_count()
+            if matched > 0 or now - writer.owed_since >= OWED_MATCH_WAIT_S:
                 writer.owed_since = None
-                writer.resend_on_match_since = None if matched else now
-                self._publish_parting(writer, report="owed")
+                writer.resend_until = now + OWED_RESEND_WINDOW_S
+                writer.resend_matched = matched
+                self._publish_parting(writer, report="owed", matched=matched > 0)
         for writer in self._writers.values():
-            if writer.resend_on_match_since is None or writer.publisher is None:
+            if writer.resend_until is None or writer.publisher is None:
                 continue
-            if now - writer.resend_on_match_since >= OWED_RESEND_WINDOW_S:
-                writer.resend_on_match_since = None
-            elif writer.publisher.get_subscription_count() > 0:
-                writer.resend_on_match_since = None
-                self._publish_parting(writer, report="owed")
+            if now >= writer.resend_until:
+                writer.resend_until = None
+                continue
+            # Looked at every `RETIRING_CHECK_INTERVAL_S`: only a reader that
+            # leaves while another joins within those 50 ms hides the join.
+            matched = writer.publisher.get_subscription_count()
+            if matched > writer.resend_matched:
+                self._publish_parting(writer, report="owed", matched=True)
+            writer.resend_matched = matched
 
     # --- messages from the bridge ---------------------------------------------
 
@@ -447,7 +455,7 @@ class FailsafeProcess:
             writer.touched_at = self._clock()
             writer.fired = False
             writer.owed_since = None
-            writer.resend_on_match_since = None  # a newer command: its own failsafe follows
+            writer.resend_until = None  # a newer command: its own failsafe follows
             writer.publisher.publish(data)
         elif kind == "arm":
             _, slug, topic, type_name, body, timeout_ms, owed = message
@@ -546,10 +554,11 @@ class FailsafeProcess:
             publisher=writer.publisher, deadline=self._clock() + PARTING_FAILSAFE_ACK_TIMEOUT_S,
         ))
 
-    def _publish_parting(self, writer: _Writer, report: str = "parting") -> None:
+    def _publish_parting(self, writer: _Writer, report: str = "parting",
+                         matched: bool = True) -> None:
         """A failsafe now, outside its deadline: `parting` for a writer that
         goes (removed, or the bridge gone), `owed` for one a previous
-        process owed."""
+        process owed, with whether a reader was matched to receive it."""
         try:
             writer.publisher.publish(writer.failsafe)
         except Exception:  # noqa: BLE001 - said loudly; nothing else to do
@@ -557,7 +566,10 @@ class FailsafeProcess:
             self._report("fire_failed", writer.slug, traceback.format_exc())
             return
         writer.fired = True
-        self._report(report, writer.slug)
+        if report == "owed":
+            self._report(report, writer.slug, matched)
+        else:
+            self._report(report, writer.slug)
 
     # --- retiring writers -------------------------------------------------------
 

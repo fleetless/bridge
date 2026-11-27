@@ -538,11 +538,19 @@ class FailsafeWatchdog:
             log.warning("Publisher slug %r: removed while driven — the bridge published its failsafe",
                         message[1])
         elif kind == "owed":
+            _, slug, matched = message
+            if not matched:
+                # Sent to nobody: still owed, so a process that replaces
+                # this one before a reader matched sends it too.
+                log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
+                            "replaced — the bridge published it with no reader matched yet, and "
+                            "publishes it again as readers match", slug)
+                return
             with self._lock:
-                if message[1] in self._owed:
-                    self._owed[message[1]] = False
+                if slug in self._owed:
+                    self._owed[slug] = False
             log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
-                        "replaced — the bridge published it", message[1])
+                        "replaced — the bridge published it", slug)
         elif kind == "fire_failed":
             log.error(
                 "Publisher slug %r: its failsafe could not be published — nothing was sent, "
