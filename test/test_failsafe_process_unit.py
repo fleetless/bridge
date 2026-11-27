@@ -439,7 +439,7 @@ def test_the_bridge_keeps_a_disarmed_owed_failsafe_until_a_process_sent_it():
     watchdog = _watchdog()
     watchdog.disarm("drive")  # no process: nothing sent, nothing lost
     assert "drive" not in watchdog._armed
-    assert watchdog._parting["drive"] == (TOPIC, TYPE, {}, 100)
+    assert watchdog._parting["drive"] == (TOPIC, TYPE, {}, 100, 0)
     watchdog._handle(("parting", "drive", TOPIC, 0))
     assert watchdog._parting == {}
 
@@ -533,6 +533,76 @@ def test_the_bridge_clears_an_owed_mark_superseded_only_by_a_newer_command():
     watchdog.publish("drive", Twist())  # publish 3, sent before the report came
     watchdog._handle(("superseded_owed", "drive", TOPIC, 2))
     assert watchdog._owed["drive"] is True
+
+
+def test_a_removed_writer_s_replayed_failsafe_leaves_the_slug_owed_for_its_command_on_a_new_topic():
+    """Owed on one topic, removed, added back on another and driven there,
+    then a restart: the replayed removal answers the slug's publish at its
+    removal, so its report leaves the newer command owed."""
+    watchdog = _watchdog()
+    watchdog._state = STATE_OK
+    watchdog.publish("drive", Twist())  # 1, on TOPIC
+    watchdog.disarm("drive")
+    assert watchdog._parting["drive"][4] == 1  # what the replay sends
+    watchdog._armed["drive"] = ("/unit/new", TYPE, {}, 100)
+    watchdog._owed["drive"] = False
+    watchdog.publish("drive", Twist())  # 2, on the new topic
+    watchdog._handle(("parting", "drive", TOPIC, 1))  # the replacement sent the old one
+    assert watchdog._owed["drive"] is True
+    assert watchdog._parting == {}
+
+
+def _replacement(proc):
+    """The process as a replacement of a failed one, in its first seconds."""
+    proc._replacement_until = proc.clock() + OWED_RESEND_WINDOW_S
+
+
+def test_a_replacement_resends_a_fire_to_the_robot_s_reader_matching_late(process):
+    """After a crash only a recorder had matched: it got the owed failsafe,
+    the command and its failsafe. The robot's reader matches after the
+    deadline, and still gets the failsafe."""
+    _replacement(process)
+    publisher = _armed_owed(process)
+    _at(process, 1, publisher, 0.05)  # the recorder: the owed failsafe
+    process._handle(("publish", "drive", "command", 1))
+    _at(process, 1, publisher, 0.2)  # the command's failsafe fires
+    assert len(publisher.sent) == 3
+    _at(process, 2, publisher, 1.0)  # the robot's reader
+    assert len(publisher.sent) == 4
+    assert publisher.sent[-1] is process._writers["drive"].failsafe
+    assert ("resent", "drive", TOPIC) in _reports(process)
+    _at(process, 2, publisher, 1.0)
+    assert len(publisher.sent) == 4  # not again to the same readers
+
+
+def test_a_replacement_resends_the_superseding_publisher_s_fire_to_a_late_reader(process):
+    """`teleop`'s command reached only a recorder and superseded `drive`'s
+    inherited failsafe: `teleop`'s own failsafe reaches the robot's reader
+    that matches later."""
+    _replacement(process)
+    drive = _armed_owed(process)
+    process._arm("teleop", TOPIC, TYPE, {}, 100, False)
+    teleop = process._writers["teleop"].publisher
+    teleop.readers = 1
+    process._handle(("publish", "teleop", "command", 1))
+    process._fire_due(process.clock.now + 0.2)
+    assert teleop.sent == ["command", process._writers["teleop"].failsafe]
+    drive.readers = 2
+    teleop.readers = 2
+    process._fire_due(process.clock.now + 1.5)
+    assert len(teleop.sent) == 3
+    assert drive.sent == []
+
+
+def test_outside_a_replacement_a_fire_is_not_resent(process):
+    process._loaded[TYPE] = Twist
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    publisher = process._writers["drive"].publisher
+    publisher.readers = 1
+    process._handle(("publish", "drive", "command", 1))
+    _at(process, 1, publisher, 0.2)
+    _at(process, 2, publisher, 1.0)
+    assert len(publisher.sent) == 2
 
 
 def test_a_stop_does_not_wait_when_nothing_is_owed():

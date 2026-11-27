@@ -288,7 +288,9 @@ class FailsafeWatchdog:
         with self._lock:
             arm = self._armed.pop(slug, None)
             if self._owed.pop(slug, False) and arm is not None:
-                self._parting[slug] = arm
+                # With the slug's last publish then: the failsafe answers that
+                # one, not a command of the slug re-added since.
+                self._parting[slug] = arm + (self._published_seq.get(slug, 0),)
         self._send(("disarm", slug))
 
     def publish(self, slug: str, msg: Any) -> bool:
@@ -400,13 +402,17 @@ class FailsafeWatchdog:
         except (OSError, EOFError, ValueError):
             return False  # the supervisor sees the process gone on its own read
 
-    def _spawn_and_test(self) -> float:
+    def _spawn_and_test(self, replacement: bool = False) -> float:
         """A new process, re-armed and self-tested; returns the self-test's
-        lateness. Raises `_Gone` when the process does not answer."""
+        lateness. Raises `_Gone` when the process does not answer. A
+        `replacement` of a failed one resends its first fires to readers
+        that match late."""
         parent_sock, child_sock = socket.socketpair()
         parent_conn = Connection(parent_sock.detach())
         child_fd = child_sock.detach()
         options = dict(self._options)
+        if replacement:
+            options["replacement"] = True
         # A test's seam for a late self-test applies to the first process
         # only, so that a test can watch the watchdog recover.
         self._options.pop("block_before_self_test_s", None)
@@ -449,9 +455,8 @@ class FailsafeWatchdog:
                 seqs = dict(self._published_seq)
             # Disarmed while owed, first: an arm and its disarm, so the
             # process sends that failsafe; a slug armed again since follows.
-            for slug, (topic, type_name, body, timeout_ms) in parting:
-                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, True,
-                                   seqs.get(slug, 0)))
+            for slug, (topic, type_name, body, timeout_ms, seq) in parting:
+                self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, True, seq))
                 self._send_locked(("disarm", slug))
             for slug, (topic, type_name, body, timeout_ms), owed in arms:
                 self._send_locked(("arm", slug, topic, type_name, body, timeout_ms, owed,
@@ -613,6 +618,9 @@ class FailsafeWatchdog:
                 self._answered(slug, seq)
             log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
                         "replaced — the bridge published it", slug)
+        elif kind == "resent":
+            log.info("Publisher slug %r: its last failsafe went out again on %s, for a reader that "
+                     "matched the replaced failsafe process late", message[1], message[2])
         elif kind == "fire_failed":
             log.error(
                 "Publisher slug %r: its failsafe could not be published — nothing was sent, "
@@ -737,7 +745,7 @@ class FailsafeWatchdog:
         if self._stopping:
             return
         try:
-            lateness_ms = self._spawn_and_test()
+            lateness_ms = self._spawn_and_test(replacement=True)
         except Exception as exc:  # noqa: BLE001 - retried after a pause
             if self._stopping:
                 return

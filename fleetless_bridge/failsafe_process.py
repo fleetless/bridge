@@ -125,9 +125,11 @@ class _Writer:
     # A failsafe owed from a previous process, fired once a reader matched.
     owed_since: Optional[float] = None
     # It went out: until then it goes out again whenever more readers
-    # matched than at its last send (`resend_matched`).
+    # matched than at its last send (`resend_matched`). Also for a fire of
+    # its own in a replacement's first `OWED_RESEND_WINDOW_S` (`resend_own`).
     resend_until: Optional[float] = None
     resend_matched: int = 0
+    resend_own: bool = False
     # Created only once no retiring writer of another type holds the topic.
     create_after: float = 0.0
     # The number of the bridge's last publish this writer's failsafe answers:
@@ -171,6 +173,11 @@ class FailsafeProcess:
         self.terminated = False
         self._options = dict(options or {})
         self._clock = clock
+        # A process that replaced a failed one: until then its writers' own
+        # fires go out again to readers that match late (`_fire_due`).
+        self._replacement_until: Optional[float] = (
+            clock() + OWED_RESEND_WINDOW_S if self._options.get("replacement") else None
+        )
         self._writers: Dict[str, _Writer] = {}
         self._retiring: List[_Retiring] = []
         self._self_test_at: Optional[float] = None
@@ -447,6 +454,14 @@ class FailsafeProcess:
             lateness_ms = (self._clock() - deadline) * 1000.0
             self._report("fired", writer.slug, int(writer.timeout_s * 1000), lateness_ms, writer.topic,
                          writer.last_seq)
+            if self._replacement_until is not None and now < self._replacement_until:
+                # A replacement's first seconds: the robot's subscriber may
+                # still be rediscovering this process, and only a recorder
+                # may have had the command and this failsafe. Sent again to
+                # each reader that matches later, as an inherited one is.
+                writer.resend_until = self._replacement_until
+                writer.resend_matched = writer.publisher.get_subscription_count()
+                writer.resend_own = True
         for writer in self._writers.values():
             if writer.owed_since is None or writer.publisher is None:
                 continue
@@ -455,6 +470,7 @@ class FailsafeProcess:
                 writer.owed_since = None
                 writer.resend_until = now + OWED_RESEND_WINDOW_S
                 writer.resend_matched = matched
+                writer.resend_own = False
                 self._publish_parting(writer, report="owed", matched=matched > 0)
         for writer in self._writers.values():
             if writer.resend_until is None or writer.publisher is None:
@@ -466,7 +482,8 @@ class FailsafeProcess:
             # leaves while another joins within those 50 ms hides the join.
             matched = writer.publisher.get_subscription_count()
             if matched > writer.resend_matched:
-                self._publish_parting(writer, report="owed", matched=True)
+                self._publish_parting(writer, report="resent" if writer.resend_own else "owed",
+                                      matched=True)
             writer.resend_matched = matched
 
     # --- messages from the bridge ---------------------------------------------
@@ -703,19 +720,23 @@ class FailsafeProcess:
                          matched: bool = True) -> None:
         """A failsafe now, outside its deadline: `parting` for a writer that
         goes (removed, or the bridge gone), `owed` for one a previous
-        process owed, with whether a reader was matched to receive it."""
+        process owed, with whether a reader was matched to receive it, and
+        `resent` for its own last one, again for a reader that matched late
+        in a replacement's first seconds."""
         try:
             writer.publisher.publish(writer.failsafe)
         except Exception:  # noqa: BLE001 - said loudly; nothing else to do
             writer.fired = True
-            if report == "owed":
-                self._report("fire_failed", writer.slug, traceback.format_exc())
-            else:
+            if report == "parting":
                 self._report("owed_failed", writer.slug, writer.topic, traceback.format_exc())
+            else:
+                self._report("fire_failed", writer.slug, traceback.format_exc())
             return
         writer.fired = True
         if report == "owed":
             self._report(report, writer.slug, matched, writer.last_seq)
+        elif report == "resent":
+            self._report(report, writer.slug, writer.topic)
         else:
             self._report(report, writer.slug, writer.topic, writer.last_seq)
 
@@ -752,9 +773,13 @@ class FailsafeProcess:
         for writer in self._writers.values():
             if writer.slug == by_slug or writer.topic != topic:
                 continue
-            if writer.owed_since is not None or writer.resend_until is not None:
+            inherited = writer.owed_since is not None or (
+                writer.resend_until is not None and not writer.resend_own)
+            # A resend of its own last fire goes too: this command's own
+            # failsafe reaches late readers now.
+            writer.resend_until = None
+            if inherited:
                 writer.owed_since = None
-                writer.resend_until = None
                 active.append(writer.slug)
         for slug, arm in list(self._pending_arms.items()):
             if slug != by_slug and arm[0] == topic and arm[4]:
