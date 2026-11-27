@@ -751,11 +751,19 @@ class BacklogStore:
     def configure(self, slug: str, enabled: bool, max_values: int) -> None:
         """Called whenever a datapoint's config is (re)applied. Shrinking
         `max_values` below what is already buffered drops the oldest
-        overflow immediately, the same rule `push` uses one at a time."""
+        overflow immediately, the same rule `push` uses one at a time.
+
+        **Switching `enabled` off empties the slug's backlog at once.** The
+        same switch tells the cloud to stop storing the datapoint, so every
+        sample still held here would be backfilled over the link, often a
+        phone's, only to be thrown away on arrival. Switching it back on
+        starts from empty."""
         with self._lock:
             self._enabled[slug] = enabled
             self._max_values[slug] = max_values
             backlog = self._backlogs.setdefault(slug, deque())
+            if not enabled:
+                backlog.clear()
             while len(backlog) > max_values:
                 backlog.popleft()
 

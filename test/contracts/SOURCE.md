@@ -60,6 +60,12 @@ bridge sends (1.5 MiB against the cloud's 2 MiB socket limit). `protocol.py`
 reads it; every frame that can grow past it is shaped to fit, and the writer
 refuses the rest.
 
+Since 19.1.0-next.2 it carries `ROBOT_DATAPOINT_FIELDS`, the datapoint fields
+the bridge acts on, which the cloud pushes a publish for. Nothing in the
+running bridge reads it: `test_ros_runtime.py` checks it against the fields a
+config apply actually reads, so a field the bridge starts to act on cannot
+stay cloud-only.
+
 Since 1.3.0 it also carries the **protocol version window**:
 `PROTOCOL_VERSION`, `PROTOCOL_VERSIONS` (which bridge version first spoke
 each protocol version, and when that version was deprecated),
@@ -107,20 +113,18 @@ tolerates rather than what this bridge's own serializer produces
 
 ## Which version these came from
 
-    Source: @fleetless/contracts@18.2.0
+    Source: @fleetless/contracts@19.1.0-next.2
             artifacts/schema/, artifacts/schema-outgoing/, artifacts/constants.json
 
-The release of the contracts change of fleetless/fleetless#1222; every
-vendored file is byte-identical to the 18.2.0-next.2 prerelease it replaces.
-Diffed file by file against the copies the previous pin (15.4.0) carried.
-New: `bridge-datapoint-dropped` in
-both directories. Changed, in both directories: `bridge-job-update` and
-`bridge-job-status` (an optional `result_omitted` on the frame and on each
-entry: `reason` `too_large`, `bytes`, `limit_bytes`) and `bridge-introspect`
-(an optional `graph.omitted`: `topics`, `services`, `actions`).
-`constants.json` gains `BRIDGE_FRAME_MAX_BYTES`. Every other vendored file is
-byte-identical; nothing that moved between 15.4.0 and 18.1.0 touched a file
-the bridge vendors.
+The prerelease of the contracts change of fleetless/fleetless#1262. Diffed
+file by file against the copies the previous pin (18.2.0) carried. Changed:
+`constants.json` gains `ROBOT_DATAPOINT_FIELDS`, and `schema/cloud-config`
+carries the new descriptions of `retention.enabled` (it also switches the
+robot's buffer, and switching it off drops what the robot held) and
+`retention.max_buffer_values` (it needs `enabled`, and it also holds what
+low-bandwidth mode's rate cap holds back). No shape changed. Every other
+vendored file is byte-identical, `schema-outgoing/` included: nothing that
+changed in 19.0.0 touched a file the bridge vendors.
 
 `test/test_contracts_sync.py` compares these copies against a real
 `@fleetless/contracts` package when `FLEETLESS_CONTRACTS_DIR` names one — a

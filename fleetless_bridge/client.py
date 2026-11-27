@@ -1494,6 +1494,17 @@ class BridgeClient:
         # every ROS-fed writer source through `_GatedSource`, which is
         # where the reasoning lives. Reset per session in `_converse`.
         self._session_open = False
+        # Whether this session may backfill yet: `False` from connect until
+        # the session's first `config` has been applied. A switch-off of
+        # `retention.enabled` published while the bridge was offline empties
+        # the buffer in that apply, so a drain opened at `hello_ok` would
+        # send everything the switch-off was meant to throw away first.
+        # Released early only by a `ping` with no `config` ahead of it: the
+        # cloud sends its config right after `hello_ok` and pings only after
+        # that, so such a ping says none is coming (an older cloud, or a
+        # config this bridge's parser refused), and the buffer then goes out
+        # under the config already applied. Reset per session in `_converse`.
+        self._backfill_released = False
         self.robot_id: Optional[str] = None
         # Set True by `_converse` at the top of every session; consumed and
         # cleared by `_handle_config` on that session's first `config` frame
@@ -1994,7 +2005,14 @@ class BridgeClient:
                 # definition — so it is the one thing that can wait for the
                 # link the mode exists to spare. Read per call, so the gate
                 # opens and closes with the mode and no writer is rebuilt.
-                return is_open() and not self._link_mode.active
+                # It also waits for the session's first config (see
+                # `_backfill_released`): what is buffered is only known to be
+                # wanted once that config has been applied.
+                return (
+                    is_open()
+                    and self._backfill_released
+                    and not self._link_mode.active
+                )
 
             camera_states = _CameraStateSource(self._ros, _TIER_TELEMETRY)
             samples = _SampleSource(
@@ -2045,6 +2063,11 @@ class BridgeClient:
         self._first_config_since_hello = True
         # Closed until `hello_ok`; see `_GatedSource`.
         self._session_open = False
+        # Closed until this session's first config is applied; see
+        # `_backfill_released` in `__init__`. `config_seen` is what a `ping`
+        # reads to tell "no config is coming" from "one is being applied".
+        self._backfill_released = False
+        config_seen = False
         # Started at `hello_ok`, cancelled in `finally` — one per session, the
         # same lifecycle the control pump has.
         self._link_mode_task = None
@@ -2198,7 +2221,16 @@ class BridgeClient:
                     # this must overtake whatever bulk is queued rather
                     # than wait its turn behind it.
                     writer.enqueue(_TIER_SESSION, pong_message(message.ts_ms))
+                    if greeted and not config_seen and not self._backfill_released:
+                        log.info(
+                            "No config arrived before the first ping; backfilling "
+                            "under the config already applied"
+                        )
+                        self._backfill_released = True
+                        writer.wake()
                 elif isinstance(message, (Config, IntrospectRequest, TypeRequest, CloudJobQuery)):
+                    if isinstance(message, Config):
+                        config_seen = True
                     # Queued, never awaited here: see `_pump_control`.
                     control_queue.put_nowait(message)
                 elif isinstance(message, CloudInvoke):
@@ -2564,6 +2596,11 @@ class BridgeClient:
         writer.enqueue(
             _TIER_OUTCOME, config_applied_message(message.version, not errors, errors)
         )
+        if not self._backfill_released:
+            # The apply has returned, a switch-off's emptied buffer included:
+            # what is left in the backlog is what this config keeps.
+            self._backfill_released = True
+            writer.wake()
 
     async def _apply_low_bandwidth_section(self, message: Config) -> List[ApplyError]:
         """The document's `low_bandwidth` section, on top of the parameters.

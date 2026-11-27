@@ -65,5 +65,16 @@
         "v4l2"
       ]
     }
-  }
+  },
+  "ROBOT_DATAPOINT_FIELDS": [
+    "field",
+    "low_bandwidth",
+    "numeric.offset",
+    "numeric.scale",
+    "rate_throttle_hz",
+    "retention.enabled",
+    "retention.max_buffer_values",
+    "topic",
+    "type"
+  ]
 }

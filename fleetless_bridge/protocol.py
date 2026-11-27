@@ -341,12 +341,15 @@ class DatapointNumeric:
 class RetentionConfig:
     """`retention`, replacing the `buffer`.
 
-    Only `max_buffer_values` is a robot-side concept — it is the depth of the
-    disconnect buffer the bridge already keeps (`BacklogStore`). `enabled` and
-    `interval_seconds` are the cloud's decision about writing to history:
-    `interval_seconds` is parsed here so the shape is read whole, and is
+    `enabled` is read on both sides. The cloud stores the datapoint's
+    samples by it; the bridge switches the datapoint's buffer
+    (`BacklogStore`) by it, and switching it off empties that buffer.
+    `max_buffer_values` is the buffer's depth. `interval_seconds` is the
+    cloud's alone: it is parsed here so the shape is read whole, and is
     **never read anywhere**; its own contracts doc comment says it is "how
     often a value is written to history — not how often it is sent".
+    Contracts' `ROBOT_DATAPOINT_FIELDS` names the two the bridge acts on, and
+    `test_ros_runtime.py` checks that list against what the runtime reads.
 
     `enabled` absent means off, which contracts states outright and gives the
     reason for: stored points are billed, so a default that turned history on
