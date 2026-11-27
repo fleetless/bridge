@@ -977,13 +977,15 @@ class FailsafeProcess:
         # so that every send and report happens inside the bridge's wait.
         deadline = self._leave_deadline = self._clock() + STOP_WAIT_S
         self._leaving = True
-        # Kept for a replacement's window until now: the robot's reader may
-        # still match, whoever had the failsafe so far.
-        kept = {id(r) for r in self._retiring if r.keep_until is not None}
-        self._end_window()
+        # Parted while a replacement's window still holds, so that a writer
+        # still armed (no teardown came first) is kept as a removed one is.
         for slug in list(self._writers):
             self._disarm(slug, parting=True)
         self._retire_owed_pending()
+        # Kept for the window until now: the robot's reader may still match,
+        # whoever had the failsafe so far. The window ends here.
+        kept = {id(r) for r in self._retiring if r.keep_until is not None}
+        self._end_window()
         send_by = max(self._clock(), deadline - STOP_ACK_RESERVE_S)
         for retiring in self._retiring:
             if retiring.send_by is None and retiring.sent_to == 0:

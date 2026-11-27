@@ -933,6 +933,37 @@ def test_a_stop_gives_no_word_for_a_failsafe_a_bystander_had(process):
     assert not [r for r in _reports(process) if r[0] == "unheard"]
 
 
+def _commanded_in_the_window_with_a_recorder(proc):
+    """In a replacement's window, a recorder matched, then a command; no
+    teardown before the stop (it timed out, or the bridge is gone)."""
+    _replacement(proc)
+    proc._loaded[TYPE] = Twist
+    proc._arm("drive", TOPIC, TYPE, {}, 100, False)
+    publisher = proc._writers["drive"].publisher
+    publisher.readers = 1
+    proc._handle(("publish", "drive", "command", 1))
+    return publisher
+
+
+def test_a_stop_without_teardown_in_the_window_sends_the_parting_failsafe_to_a_new_reader(process):
+    """The writer is parted by the stop itself, still inside the window: it
+    is kept as a removed one, and the robot's reader matching 1 s into the
+    stop gets the failsafe."""
+    publisher = _commanded_in_the_window_with_a_recorder(process)
+    _advancing(process, at=(1.0, lambda: setattr(publisher, "readers", 2)))
+    assert process._handle(("stop",)) is False
+    assert publisher.sent[0] == "command" and len(publisher.sent) == 3
+    assert not [r for r in _reports(process) if r[0] == "unheard"]
+
+
+def test_a_stop_without_teardown_in_the_window_gives_no_word_when_no_new_reader_came(process):
+    publisher = _commanded_in_the_window_with_a_recorder(process)
+    _advancing(process)
+    assert process._handle(("stop",)) is False
+    assert len(publisher.sent) == 2  # the command and its parting failsafe
+    assert not [r for r in _reports(process) if r[0] == "unheard"]
+
+
 def test_a_writer_parted_outside_a_window_does_not_hold_the_stop(process):
     """Not kept: a reader had its parting failsafe and has not acknowledged
     it yet when the stop comes. The stop does not wait for a new reader."""
