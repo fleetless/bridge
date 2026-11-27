@@ -101,6 +101,7 @@ def test_a_ping_during_a_backfill_drain_is_answered_before_the_drain_ends():
             fake_ros.backlog.push("old", Sample(slug="old", value=i, timestamp_ms=i))
         client = _offline_client(fake_ros)
         client._session_open = True
+        client._backfill_released = True  # the session's first config is applied
         ws = TimedWs(0.01)  # 50 items is half a second of drain
         writer = client._build_writer(ws)
         task = asyncio.ensure_future(writer.run())
@@ -152,8 +153,13 @@ def test_backfill_drains_only_when_no_live_sample_is_ready():
             )
         await asyncio.sleep(0.02)  # let call_soon_threadsafe land before hello_ok
         await session.accept()
-        for _ in range(6):
-            received.append(await session.recv())
+        # Backfill waits for the session's first config; its ack is tier 1
+        # and not what this test orders.
+        await session.send_config(1, {})
+        while len(received) < 6:
+            frame = await session.recv()
+            if frame["type"] != "config_applied":
+                received.append(frame)
         await session.drain()
 
     async def scenario():
@@ -176,6 +182,8 @@ def test_backfill_is_oldest_first():
     fake_ros = FakeRos()
 
     async def send_and_recv(session):
+        await session.send_config(1, {})  # backfill waits for the session's first config
+        await session.recv_config_applied()
         fake_ros.backlog.configure("old", True, 10)
         for i in range(3):
             fake_ros.backlog.push("old", Sample(slug="old", value=i, timestamp_ms=i))
@@ -369,6 +377,7 @@ def test_a_live_sample_arriving_mid_drain_preempts_the_next_backfill_item():
             fake_ros.backlog.push("old", Sample(slug="old", value=i, timestamp_ms=i))
         client = _offline_client(fake_ros)
         client._session_open = True
+        client._backfill_released = True  # the session's first config is applied
         loop = asyncio.get_event_loop()
         state = {"sends_started": 0, "put": False}
 
