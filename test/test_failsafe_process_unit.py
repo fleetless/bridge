@@ -11,7 +11,7 @@ import time
 import pytest
 from geometry_msgs.msg import Twist
 
-from fleetless_bridge.failsafe import FailsafeWatchdog
+from fleetless_bridge.failsafe import STATE_OK, FailsafeWatchdog
 from fleetless_bridge.failsafe_process import (
     OWED_MATCH_WAIT_S,
     OWED_RESEND_WINDOW_S,
@@ -261,6 +261,85 @@ def test_a_newer_arm_keeps_the_failsafe_a_waiting_arm_owed(process):
     assert [slug for slug, _ in process._parting_pending] == ["drive"]
 
 
+def test_a_newer_command_on_the_topic_cancels_a_removed_writer_s_owed_failsafe(process):
+    """Removed and added back while its owed failsafe waits: a command from
+    the new writer comes after it, and the old failsafe must not follow
+    the command from the other writer."""
+    _pending_owed(process)
+    process._handle(("disarm", "drive"))
+    process._arm("drive", TOPIC, TYPE, {}, 100, False)
+    _loader_delivers(process)
+    (retiring,) = process._retiring
+    process._handle(("publish", "drive", "command"))
+    for publisher in process._node.publishers:
+        publisher.readers = 1
+    process._reap_retiring(process.clock.now + 0.1)
+    process._reap_retiring(process.clock.now + OWED_MATCH_WAIT_S)
+    assert retiring.publisher.sent == []
+    assert process._writers["drive"].publisher.sent == ["command"]
+    assert ("superseded", "drive") in _reports(process)
+
+
+def test_a_command_by_another_slug_on_the_topic_cancels_the_owed_failsafe(process):
+    _pending_owed(process)
+    process._handle(("disarm", "drive"))
+    process._arm("drive2", TOPIC, TYPE, {}, 100, False)
+    _loader_delivers(process)
+    (retiring,) = process._retiring
+    process._handle(("publish", "drive2", "command"))
+    retiring.publisher.readers = 1
+    process._reap_retiring(process.clock.now + 0.1)
+    assert retiring.publisher.sent == []
+    assert ("superseded", "drive") in _reports(process)
+
+
+def test_a_command_on_another_topic_leaves_the_owed_failsafe(process):
+    _pending_owed(process)
+    process._handle(("disarm", "drive"))
+    process._arm("other", "/unit/other", TYPE, {}, 100, False)
+    _loader_delivers(process)
+    process._handle(("publish", "other", "command"))
+    (retiring,) = process._retiring
+    retiring.publisher.readers = 1
+    process._reap_retiring(process.clock.now + 0.1)
+    assert len(retiring.publisher.sent) == 1
+
+
+def test_a_type_that_fails_to_load_names_each_publisher_whose_failsafe_is_lost(process):
+    _pending_owed(process, slug="drive")
+    _pending_owed(process, slug="steer", topic="/unit/steer")
+    process._handle(("disarm", "drive"))
+    process._load_results.put((TYPE, None, "Traceback: no such type"))
+    process._take_loaded()
+    reports = _reports(process)
+    assert ("fire_failed", "drive", "Traceback: no such type") in reports
+    assert ("fire_failed", "steer", "Traceback: no such type") in reports
+
+
+def test_a_stop_takes_the_loader_s_result_for_a_type_it_is_importing(process, monkeypatch):
+    """Not imported a second time on the loop: two threads importing one
+    package at once can deadlock in Python's import locks."""
+    import rosidl_runtime_py.utilities
+
+    def not_on_the_loop(name):
+        raise AssertionError("imported on the loop: " + name)
+
+    monkeypatch.setattr(rosidl_runtime_py.utilities, "get_message", not_on_the_loop)
+    stop = threading.Event()
+    process._loader = threading.Thread(target=stop.wait, daemon=True)
+    process._loader.start()
+    process._node.readers = 1
+    _pending_owed(process)
+    process._dispatched = TYPE
+    threading.Timer(0.2, process._load_results.put, args=((TYPE, Twist, None),)).start()
+    try:
+        process._retire_owed_pending()
+    finally:
+        stop.set()
+    process._reap_retiring(process.clock())
+    assert len(_sent(process)) == 1
+
+
 def _watchdog():
     watchdog = FailsafeWatchdog("unit")
     watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
@@ -285,6 +364,23 @@ def test_the_bridge_keeps_a_disarmed_owed_failsafe_until_a_process_sent_it():
     assert "drive" not in watchdog._armed
     assert watchdog._parting["drive"] == (TOPIC, TYPE, {}, 100)
     watchdog._handle(("parting", "drive"))
+    assert watchdog._parting == {}
+
+
+@pytest.mark.parametrize("report", [("fire_failed", "drive", "Traceback"), ("superseded", "drive")])
+def test_the_bridge_forgets_a_removed_owed_failsafe_that_failed_or_was_superseded(report):
+    watchdog = _watchdog()
+    watchdog.disarm("drive")
+    watchdog._handle(report)
+    assert watchdog._parting == {}
+
+
+def test_a_newer_command_of_the_slug_forgets_its_removed_owed_failsafe():
+    watchdog = _watchdog()
+    watchdog.disarm("drive")
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._state = STATE_OK
+    watchdog.publish("drive", Twist())
     assert watchdog._parting == {}
 
 

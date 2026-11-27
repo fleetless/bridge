@@ -296,6 +296,9 @@ class FailsafeWatchdog:
             if self._state != STATE_OK or slug not in self._armed:
                 return False
             self._owed[slug] = True
+            # A newer command: the failsafe a removed writer of this slug
+            # still owed is not sent any more (the process supersedes it).
+            self._parting.pop(slug, None)
             self._ever_published = True
         return self._send(("publish", slug, data))
 
@@ -371,7 +374,7 @@ class FailsafeWatchdog:
                     ", ".join(owed))
         if not self._rearmed.wait(OWED_REPLACEMENT_WAIT_S):
             log.error("Failsafe watchdog: no failsafe process took the failsafes owed within "
-                      "%.0f s; publishers %s are left on their last command",
+                      "%.0f s; publishers %s may be left on their last command",
                       OWED_REPLACEMENT_WAIT_S, ", ".join(owed))
 
     # --- the process -------------------------------------------------------------
@@ -602,11 +605,19 @@ class FailsafeWatchdog:
             log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
                         "replaced — the bridge published it", slug)
         elif kind == "fire_failed":
+            with self._lock:
+                # Not sent, and said so: not handed to every later process.
+                self._parting.pop(message[1], None)
             log.error(
                 "Publisher slug %r: its failsafe could not be published — nothing was sent, "
                 "which is worse than a stale value, so this is logged loudly:\n%s",
                 message[1], message[2],
             )
+        elif kind == "superseded":
+            with self._lock:
+                self._parting.pop(message[1], None)
+            log.info("Publisher slug %r: the failsafe its removed writer owed is not sent; a newer "
+                     "command on its topic came first", message[1])
         elif kind == "dropped":
             self._limited(message[1], "dropped", logging.WARNING,
                           "Publisher slug %r: publish dropped — its writer is not created yet", message[1])

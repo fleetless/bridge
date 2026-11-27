@@ -255,8 +255,14 @@ class FailsafeProcess:
             parting = [entry for entry in self._parting_pending if entry[1][1] == type_name]
             self._parting_pending = [e for e in self._parting_pending if e[1][1] != type_name]
             if message_class is None:
+                # Every publisher whose owed failsafe is lost with the type,
+                # by name.
+                lost = [slug for slug in waiting if self._pending_arms[slug][4]]
+                lost += [slug for slug, _ in parting]
                 for slug in waiting:
                     del self._pending_arms[slug]
+                for slug in lost:
+                    self._report("fire_failed", slug, error)
                 self._report("error", error)
                 continue
             self._loaded[type_name] = message_class
@@ -471,6 +477,7 @@ class FailsafeProcess:
             writer.fired = False
             writer.owed_since = None
             writer.resend_until = None  # a newer command: its own failsafe follows
+            self._supersede_owed(writer.topic)
             writer.publisher.publish(data)
         elif kind == "arm":
             _, slug, topic, type_name, body, timeout_ms, owed = message
@@ -624,6 +631,25 @@ class FailsafeProcess:
         self._retiring.append(self._owed_retiring(
             slug, topic, type_name, publisher, failsafe, self._clock()))
 
+    def _await_loader(self, type_name: str) -> None:
+        """When the loader is importing `type_name` right now, its result,
+        `IMPORT_CAP_S` at most: this thread importing the same package at
+        the same time could deadlock in Python's import locks."""
+        deadline = time.monotonic() + IMPORT_CAP_S
+        while self._dispatched == type_name and self._loader.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                loaded, message_class, _ = self._load_results.get(timeout=remaining)
+            except queue.Empty:
+                return
+            self._loading.discard(loaded)
+            if self._dispatched == loaded:
+                self._dispatched = None
+            if message_class is not None:
+                self._loaded[loaded] = message_class
+
     def _retire_owed_pending(self) -> None:
         """Every failsafe still waiting for its type, at a stop or with the
         bridge gone: the types loaded here, on this thread, since nothing
@@ -635,6 +661,7 @@ class FailsafeProcess:
         self._pending_arms.clear()
         self._parting_pending = []
         for slug, arm in owed:
+            self._await_loader(arm[1])
             try:
                 if arm[1] not in self._loaded:
                     self._loaded[arm[1]] = get_message(arm[1])
@@ -671,6 +698,21 @@ class FailsafeProcess:
             return bool(publisher.wait_for_all_acked(Duration(nanoseconds=0)))
         except Exception:  # noqa: BLE001 - an RMW without the call: nothing to wait for
             return True
+
+    def _supersede_owed(self, topic: str) -> None:
+        """A command on `topic`: every failsafe still owed there, by any
+        slug, is not sent any more. Sent first would not do: DDS keeps no
+        order across writers, and the robot could end on the old failsafe.
+        The command's own failsafe follows it."""
+        superseded = []
+        for retiring in self._retiring:
+            if retiring.topic == topic and retiring.send_by is not None:
+                retiring.send_by = None
+                superseded.append(retiring.slug)
+        superseded += [slug for slug, arm in self._parting_pending if arm[0] == topic]
+        self._parting_pending = [(s, a) for s, a in self._parting_pending if a[0] != topic]
+        for slug in superseded:
+            self._report("superseded", slug)
 
     def _send_owed(self, retiring: _Retiring) -> None:
         try:
