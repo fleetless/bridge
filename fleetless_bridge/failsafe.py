@@ -306,20 +306,20 @@ class FailsafeWatchdog:
             ready = self._ready
             owed_possible = self._ever_published
         conn = self._conn
-        if process is not None and ready and not owed_possible:
+        if process is not None and not ready:
+            # Still starting: it took no publish (they wait for its
+            # self-test), so nothing is owed. SIGKILLed, not asked: a
+            # process still importing runs no signal handler until the
+            # import returns, and the bridge's stop would wait for that.
+            process.kill()
+            process.join(0.1)
+        elif process is not None and not owed_possible:
             # Nothing was ever published, so no failsafe can be owed and no
-            # writer is retiring: told to stop, and not waited for. It ends
-            # on its own, and on the closed pipe at the latest.
+            # writer is retiring: told to stop, so its writers leave their
+            # readers at once, and not waited for. It ends on its own, and
+            # on the closed pipe at the latest.
             if conn is not None and _writable(conn, 0.1):
                 self._send(("stop",))
-            process.join(0.1)
-        elif process is not None and not ready:
-            # Still starting: nothing is armed in it yet that a stop would
-            # owe a failsafe for. Ended now, not waited for.
-            process.terminate()
-            process.join(1.0)
-            process.kill()
-            process.join(1.0)
         else:
             # Only to a process that is reading: a stuck one would block the
             # send, and the bridge's own shutdown with it. Ended below.
