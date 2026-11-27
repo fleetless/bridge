@@ -685,7 +685,7 @@ class _WitnessProcess:
         self._stopped = True
 
 
-def _start_witness_process(topic):
+def _start_witness_process(topic, transports="UDPv4"):
     """A `geometry_msgs/msg/Twist` subscriber on `topic` in a process of its
     own (`test/witness_process.py`), as a robot's subscriber is.
 
@@ -694,15 +694,19 @@ def _start_witness_process(topic):
     test. Does not wait for it: `wait_for("ready", ...)` does. Every caller
     calls `stop()` in `finally`.
 
-    On UDP, as the failsafe process is (`failsafe.CHILD_TRANSPORTS`): every
-    sample it measures comes from that process over UDP either way. With
-    shared memory the witness would only add a stall of its own. Fast DDS 2.x
-    sleeps up to 333 ms the first time it sends to the bridge's main process's
-    port once that port is more than a second old, and the samples it is
-    receiving wait too. That is a limit of the subscriber's Fast DDS, recorded
-    on fleetless/fleetless#1124, not lateness of the bridge."""
+    On UDP by default, as the failsafe process is
+    (`failsafe.CHILD_TRANSPORTS`), because it starts fresh: every sample it
+    measures comes from that process over UDP either way, and with shared
+    memory a witness that first finds the bridge would only add a stall of
+    its own. Fast DDS 2.x sleeps up to 333 ms the first time it sends to the
+    bridge's main process's port once that port is more than a second old,
+    and the samples it is receiving wait too. That is a limit of the
+    subscriber's Fast DDS, recorded on fleetless/fleetless#1124, not lateness
+    of the bridge. `transports=None` keeps this process's setting: Fast DDS's
+    defaults, as a robot's subscriber runs."""
     env = os.environ.copy()
-    env["FASTDDS_BUILTIN_TRANSPORTS"] = "UDPv4"
+    if transports is not None:
+        env["FASTDDS_BUILTIN_TRANSPORTS"] = transports
     process = subprocess.Popen(
         [sys.executable, str(WITNESS_PROCESS), topic],
         stdout=subprocess.PIPE,

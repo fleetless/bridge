@@ -65,8 +65,8 @@ def _rx(witness):
     return [(e["t"], e["x"]) for e in list(witness.events) if e["ev"] == "rx"]
 
 
-async def _matched_witness(rt, slug="drive", topic=TOPIC):
-    witness = _start_witness_process(topic)
+async def _matched_witness(rt, slug="drive", topic=TOPIC, transports="UDPv4"):
+    witness = _start_witness_process(topic, transports=transports)
     witness.wait_for("ready", WITNESS_PROCESS_READY_TIMEOUT_S, "the witness process never became ready")
     wait_until(lambda: _writer_of(rt, slug).get_subscription_count() > 0,
                timeout=WITNESS_PROCESS_READY_TIMEOUT_S)
@@ -608,11 +608,16 @@ def test_a_killed_failsafe_process_is_failed_and_replaced():
     side: Fast DDS 2.x shared memory sleeps in `Port::healthy_check` the
     first time it sends to such a port (fixed upstream in 3.6.x). That is
     the subscriber's Fast DDS, not the bridge, and fleetless/fleetless#1124
-    records the limit."""
+    records the limit.
+
+    It runs on Fast DDS's default transports, shared memory included, as a
+    robot's subscriber does: the replacement has no shared-memory port to
+    stall on, and the witness met the bridge's own port before the first
+    kill."""
 
     async def body(rt):
         assert await rt.apply_publishers(_cfg()) == []
-        witness = await _matched_witness(rt)
+        witness = await _matched_witness(rt, transports=None)
         reasons, lateness = [], []
         try:
             for _ in range(KILL_CYCLES):
