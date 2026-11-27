@@ -745,6 +745,13 @@ def test_a_kept_writer_not_acknowledged_at_the_window_s_end_leaves_after_the_typ
     assert old in process._node.destroyed
 
 
+def test_a_waiting_writer_that_owed_a_failsafe_is_reported_when_it_goes(process):
+    _retargeted_in_the_window(process)
+    process._writers["drive"].owed_since = process.clock()
+    process._handle(("disarm", "drive"))
+    assert ("unsent_owed", "drive", TOPIC) in _reports(process)
+
+
 def test_a_stop_is_not_held_by_a_new_type_waiting_for_a_kept_writer(process):
     _retargeted_in_the_window(process)
     assert process._handle(("stop",)) is False
@@ -760,6 +767,86 @@ def test_outside_a_replacement_a_fire_is_not_resent(process):
     _at(process, 1, publisher, 0.2)
     _at(process, 2, publisher, 1.0)
     assert len(publisher.sent) == 2
+
+
+def _in_replacement_window(watchdog, clock):
+    watchdog._replacement_until = clock() + OWED_RESEND_WINDOW_S
+
+
+@pytest.mark.parametrize("report", [
+    ("owed", "drive", True, 1),
+    ("fired", "drive", 100, 0.5, TOPIC, 1),
+])
+def test_in_a_replacement_s_window_a_send_keeps_the_owed_mark_until_the_window_ends(report):
+    """The send may have reached only a recorder; if this process fails
+    too, the next one must send it again."""
+    clock = _Clock()
+    watchdog = FailsafeWatchdog("unit", clock=clock)
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._state = STATE_OK
+    watchdog.publish("drive", Twist())  # 1
+    _in_replacement_window(watchdog, clock)
+    watchdog._handle(report)
+    assert watchdog._owed["drive"] is True
+    clock.now += OWED_RESEND_WINDOW_S
+    with watchdog._lock:
+        watchdog._end_replacement_window(clock())
+    assert watchdog._owed["drive"] is False
+
+
+def test_in_a_replacement_s_window_a_removed_writer_s_record_stays_until_the_window_ends():
+    clock = _Clock()
+    watchdog = FailsafeWatchdog("unit", clock=clock)
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._owed["drive"] = True
+    watchdog.disarm("drive")
+    _in_replacement_window(watchdog, clock)
+    watchdog._handle(("parting", "drive", TOPIC, 0))
+    assert "drive" in watchdog._parting
+    clock.now += OWED_RESEND_WINDOW_S
+    with watchdog._lock:
+        watchdog._end_replacement_window(clock())
+    assert watchdog._parting == {}
+
+
+def test_in_a_replacement_s_window_a_command_that_reached_a_reader_clears_at_once():
+    clock = _Clock()
+    watchdog = FailsafeWatchdog("unit", clock=clock)
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._owed["drive"] = True
+    watchdog._armed["steer"] = (TOPIC, TYPE, {}, 100)
+    watchdog._owed["steer"] = True
+    watchdog.disarm("drive")
+    _in_replacement_window(watchdog, clock)
+    watchdog._handle(("superseded", "drive", TOPIC))
+    watchdog._handle(("superseded_owed", "steer", TOPIC, 5))
+    assert watchdog._parting == {}
+    assert watchdog._owed["steer"] is False
+
+
+def test_a_stop_ends_the_bridge_s_replacement_window():
+    clock = _Clock()
+    watchdog = FailsafeWatchdog("unit", clock=clock)
+    watchdog._armed["drive"] = (TOPIC, TYPE, {}, 100)
+    watchdog._owed["drive"] = True
+    _in_replacement_window(watchdog, clock)
+    watchdog._handle(("owed", "drive", True, 0))
+    watchdog.stop()
+    assert watchdog._owed["drive"] is False
+    assert watchdog._replacement_until is None
+
+
+def test_a_publisher_retargeted_while_owed_is_recorded_as_a_removal():
+    """Armed again on another topic or type: the old arm is kept, with its
+    publish number, for a replacement to send its failsafe."""
+    watchdog = _watchdog()
+    watchdog._state = STATE_OK
+    watchdog.publish("drive", Twist())  # 1
+    watchdog.arm("drive", "/unit/new", TYPE, {}, 100)
+    assert watchdog._parting["drive"] == (TOPIC, TYPE, {}, 100, 1)
+    assert watchdog._owed["drive"] is False
+    watchdog.arm("drive", "/unit/new", TYPE, {"x": 1}, 100)  # same topic and type
+    assert watchdog._parting["drive"][0] == TOPIC
 
 
 def test_a_stop_does_not_wait_when_nothing_is_owed():

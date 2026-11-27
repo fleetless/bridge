@@ -671,6 +671,36 @@ def test_a_publisher_removed_after_its_owed_failsafe_went_to_nobody_sends_it_aga
     assert _after_the_runtime(body, samples=1) == [[0.0]]
 
 
+def test_a_second_failure_inside_the_window_still_reaches_a_late_robot_reader():
+    """Killed while driven; the replacement's owed failsafe reaches only a
+    bystander; that replacement is killed too, inside its window. The
+    robot's subscriber starts only then, and still gets the failsafe, from
+    the second replacement."""
+
+    robots = []
+
+    async def body(rt):
+        assert await rt.apply_publishers(_cfg(timeout_ms=60_000)) == []
+        bystander = await _matched_witness(rt)
+        try:
+            await _killed_while_driven(rt, bystander)
+            wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+            wait_until(lambda: len(_rx(bystander)) >= 2, timeout=10.0)  # the owed failsafe
+            os.kill(rt._failsafe.pid, signal.SIGKILL)  # our own child, by its PID
+            wait_until(lambda: rt.failsafe_state()[0] == STATE_FAILED, timeout=3.0)
+            wait_until(lambda: rt.failsafe_state()[0] == STATE_OK, timeout=20.0)
+            robots.append(_start_witness_process(TOPIC))
+            wait_until(lambda: len(_rx(robots[0])) >= 1, timeout=15.0)
+            await asyncio.sleep(0.3)
+            return [x for _, x in _rx(robots[0])]
+        finally:
+            bystander.stop()
+            for robot in robots:
+                robot.stop()
+
+    assert run(body) == [0.0]
+
+
 def test_a_killed_failsafe_process_is_failed_and_replaced():
     """SIGKILL, `crashed`, a new process, and the bound again, for a witness
     that was already running, as a robot's subscriber is: four cycles of
@@ -706,6 +736,10 @@ def test_a_killed_failsafe_process_is_failed_and_replaced():
                            timeout=WITNESS_PROCESS_READY_TIMEOUT_S)
                 wait_until(lambda: _publisher_joined_since(witness, killed_at),
                            timeout=WITNESS_PROCESS_READY_TIMEOUT_S)
+                # A kill inside the previous replacement's window: its fires
+                # still count as owed, and this one sends that failsafe once
+                # it matched. Let it land before the silences count samples.
+                await asyncio.sleep(0.3)
                 lateness += await _silences(rt, witness, 3)
         finally:
             witness.stop()

@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from fleetless_bridge.failsafe_process import (
     LATENESS_BOUND_MS,
     OWED_MATCH_WAIT_S,
+    OWED_RESEND_WINDOW_S,
     PARTING_FAILSAFE_ACK_TIMEOUT_S,
 )
 
@@ -224,6 +225,15 @@ class FailsafeWatchdog:
         self._rearmed = threading.Event()
         self._publish_seq = 0
         self._published_seq: Dict[str, int] = {}
+        # A replacement's first `OWED_RESEND_WINDOW_S`, as the process keeps
+        # it: a failsafe it reports sent may have reached only a bystander,
+        # and it resends to late readers until then. If it fails too, the
+        # next one must send it again, so a send clears nothing here until
+        # the window ends (`_held_owed`, `_held_parting`); a command that
+        # reached a reader clears at once, as outside it.
+        self._replacement_until: Optional[float] = None
+        self._held_owed: Dict[str, int] = {}
+        self._held_parting: set = set()
         self._last_word_at = 0.0
         self._errors: List[float] = []
         self._stopping = False
@@ -277,9 +287,16 @@ class FailsafeWatchdog:
 
     def arm(self, slug: str, topic: str, type_name: str, body: Any, timeout_ms: int) -> None:
         with self._lock:
+            old = self._armed.get(slug)
+            seq = self._published_seq.get(slug, 0)
+            if (old is not None and (old[0] != topic or old[1] != type_name)
+                    and self._owed.get(slug, False)):
+                # Retargeted while owed: the process parts the old writer, as
+                # a removal; recorded the same way, for a replacement.
+                self._parting[slug] = old + (seq,)
+                self._owed[slug] = False
             self._armed[slug] = (topic, type_name, body, timeout_ms)
             self._owed.setdefault(slug, False)
-            seq = self._published_seq.get(slug, 0)
         self._send(("arm", slug, topic, type_name, body, timeout_ms, False, seq))
 
     def disarm(self, slug: str) -> None:
@@ -337,6 +354,7 @@ class FailsafeWatchdog:
         waits here."""
         self._await_replacement_for_owed()
         with self._lock:
+            self._end_replacement_window()
             # Under the lock the supervisor spawns under: no process starts
             # after this line, and the one that did is in `_process`.
             self._stopping = True
@@ -569,6 +587,9 @@ class FailsafeWatchdog:
                 log.error("Failsafe watchdog: no word from the failsafe process for %.1f s",
                           self._clock() - self._last_word_at)
                 self._fail(REASON_NOT_ALIVE, None)
+            if self._state == STATE_OK:
+                with self._lock:
+                    self._end_replacement_window(self._clock())
 
     def _word_waiting(self, conn) -> bool:
         """Whether the process has said something this thread has not read
@@ -585,10 +606,9 @@ class FailsafeWatchdog:
         if kind == "fired":
             _, slug, timeout_ms, lateness_ms, topic, seq = message
             with self._lock:
-                self._answered(slug, seq)
                 # Removed just after it fired: the failsafe is the topic's
                 # last word already.
-                self._forget_parting(slug, topic)
+                self._sent(slug, seq, topic)
             log.warning(
                 "Publisher slug %r: no publish for %d ms — the bridge published its failsafe "
                 "(%.1f ms after timeout)", slug, timeout_ms, lateness_ms,
@@ -601,8 +621,7 @@ class FailsafeWatchdog:
                 self._fail(REASON_LATE_FIRE, lateness_ms)
         elif kind == "parting":
             with self._lock:
-                self._forget_parting(message[1], message[2])
-                self._answered(message[1], message[3])
+                self._sent(message[1], message[3], message[2])
             log.warning("Publisher slug %r: removed while driven — the bridge published its failsafe",
                         message[1])
         elif kind == "owed":
@@ -615,7 +634,7 @@ class FailsafeWatchdog:
                             "publishes it again as readers match", slug)
                 return
             with self._lock:
-                self._answered(slug, seq)
+                self._sent(slug, seq, None)
             log.warning("Publisher slug %r: its failsafe was owed when the failsafe process was "
                         "replaced — the bridge published it", slug)
         elif kind == "resent":
@@ -641,6 +660,7 @@ class FailsafeWatchdog:
             _, slug, topic = message
             with self._lock:
                 self._forget_parting(slug, topic)
+                self._held_parting.discard((slug, topic))
             log.info("Publisher slug %r: the failsafe its removed writer owed on %s is not sent; a "
                      "newer command there reached a reader first", slug, topic)
         elif kind == "superseded_owed":
@@ -650,8 +670,13 @@ class FailsafeWatchdog:
                 if (armed is not None and armed[0] == topic and slug in self._owed
                         and self._published_seq.get(slug, 0) < seq):
                     self._owed[slug] = False
+                    self._held_owed.pop(slug, None)
             log.info("Publisher slug %r: the failsafe owed from the previous failsafe process is "
                      "not sent; a newer command on %s reached a reader first", slug, topic)
+        elif kind == "unsent_owed":
+            log.warning("Publisher slug %r: the failsafe owed on %s from the previous failsafe "
+                        "process was dropped with its writer, which was not created yet",
+                        message[1], message[2])
         elif kind == "dropped":
             self._limited(message[1], "dropped", logging.WARNING,
                           "Publisher slug %r: publish dropped — its writer is not created yet", message[1])
@@ -678,6 +703,34 @@ class FailsafeWatchdog:
         elif kind == "terminating":
             pass  # a SIGTERM this process did not send, or one already judged
         # "alive" and "ready" only refresh `_last_word_at`.
+
+    def _sent(self, slug: str, seq: int, topic: Optional[str]) -> None:
+        """A failsafe of `slug` went out, answering its publishes up to `seq`
+        (and on `topic`, for a removed writer's record). Inside a
+        replacement's window held until it ends. Under `_lock`."""
+        if self._replacement_until is not None:
+            self._held_owed[slug] = max(seq, self._held_owed.get(slug, 0))
+            if topic is not None:
+                self._held_parting.add((slug, topic))
+            return
+        self._answered(slug, seq)
+        if topic is not None:
+            self._forget_parting(slug, topic)
+
+    def _end_replacement_window(self, now: Optional[float] = None) -> None:
+        """At the window's end, or a stop: what was sent in it counts now.
+        Under `_lock`."""
+        if self._replacement_until is None:
+            return
+        if now is not None and now < self._replacement_until:
+            return
+        self._replacement_until = None
+        held_owed, self._held_owed = self._held_owed, {}
+        held_parting, self._held_parting = self._held_parting, set()
+        for slug, seq in held_owed.items():
+            self._answered(slug, seq)
+        for slug, topic in held_parting:
+            self._forget_parting(slug, topic)
 
     def _answered(self, slug: str, seq: int) -> None:
         """A failsafe went out for `slug`, answering its publishes up to
@@ -744,6 +797,12 @@ class FailsafeWatchdog:
             conn.close()
         if self._stopping:
             return
+        with self._lock:
+            # What the failed process sent in its own window counts for
+            # nothing now: still marked, so this one sends it again.
+            self._held_owed.clear()
+            self._held_parting.clear()
+            self._replacement_until = self._clock() + OWED_RESEND_WINDOW_S
         try:
             lateness_ms = self._spawn_and_test(replacement=True)
         except Exception as exc:  # noqa: BLE001 - retried after a pause
@@ -760,6 +819,8 @@ class FailsafeWatchdog:
         log.info("Failsafe watchdog: back after a restart; self-test late by %.1f ms", lateness_ms)
         with self._lock:
             self._state, self._reason, self._lateness_ms = STATE_OK, None, lateness_ms
+            # Counted from now, so that it ends after the process's own.
+            self._replacement_until = self._clock() + OWED_RESEND_WINDOW_S
         self._notify()
 
     def _notify(self) -> None:

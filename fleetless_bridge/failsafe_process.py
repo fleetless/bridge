@@ -624,7 +624,13 @@ class FailsafeProcess:
 
     def _disarm(self, slug: str, parting: bool) -> None:
         writer = self._writers.pop(slug, None)
-        if writer is None or writer.publisher is None:
+        if writer is None:
+            return
+        if writer.publisher is None:
+            # Never created (a type change still waiting): it published
+            # nothing, but it may hold a failsafe a previous process owed.
+            if writer.owed_since is not None:
+                self._report("unsent_owed", slug, writer.topic)
             return
         touched = writer.touched_at is not None and not writer.fired
         # A previous process's failsafe, not sent yet, or sent with perhaps
