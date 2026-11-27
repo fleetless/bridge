@@ -604,6 +604,13 @@ class FailsafeProcess:
                 continue
             blocking = [r for r in self._retiring
                         if r.topic == writer.topic and r.type_name != writer.type_name]
+            if any(r.keep_until is not None for r in blocking):
+                # Kept for a reader of the old type that may still match in
+                # a replacement's first seconds: the new type waits until the
+                # keep ends, then for the type change as always. A publish
+                # to it meanwhile is dropped.
+                writer.create_after = now + TYPE_CHANGE_ACK_WAIT_S
+                continue
             if blocking and now < writer.create_after:
                 continue
             for retiring in blocking:

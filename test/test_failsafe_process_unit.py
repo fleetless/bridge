@@ -678,9 +678,8 @@ def test_a_stop_does_not_wait_out_the_replacement_window(process):
     assert not process._retiring
 
 
-def test_a_kept_writer_does_not_hold_back_a_new_writer_on_its_topic(process):
-    """Same type: the new writer is created at once. Another type: it waits
-    the type change's 0.5 s, then the kept writer goes."""
+def test_a_kept_writer_does_not_hold_back_a_new_writer_of_its_type(process):
+    """Another type waits for the keep (below)."""
     _replacement(process)
     publisher = _armed_owed(process)
     publisher.readers = 1
@@ -688,13 +687,68 @@ def test_a_kept_writer_does_not_hold_back_a_new_writer_on_its_topic(process):
     _reap(process, 0.05)
     process._arm("drive", TOPIC, TYPE, {}, 100, False)
     assert process._writers["drive"].publisher is not None
-    process._loaded["std_msgs/msg/String"] = String
-    process._arm("other", TOPIC, "std_msgs/msg/String", {}, 100, False)
-    assert process._writers["other"].publisher is None
+
+
+def _retargeted_in_the_window(proc):
+    """`drive` driven in a replacement's window, then armed again on its
+    topic with another type: its old writer is kept, the new one waits."""
+    _replacement(proc)
+    proc._loaded[TYPE] = Twist
+    proc._loaded["std_msgs/msg/String"] = String
+    proc._arm("drive", TOPIC, TYPE, {}, 100, False)
+    old = proc._writers["drive"].publisher
+    old.readers = 1  # a recorder
+    proc._handle(("publish", "drive", "command", 1))
+    proc._arm("drive", TOPIC, "std_msgs/msg/String", {}, 100, False)
+    assert old.sent == ["command", proc._retiring[0].failsafe]
+    return old
+
+
+def test_a_new_type_on_the_topic_waits_while_the_old_type_s_writer_is_kept(process):
+    """A late reader of the old type still gets the parting failsafe."""
+    old = _retargeted_in_the_window(process)
+    process.clock.now += 1.0
+    process._create_pending(process.clock.now)
+    assert process._writers["drive"].publisher is None
+    process._handle(("publish", "drive", "dropped meanwhile", 2))
+    assert ("dropped", "drive") in _reports(process)
+    old.readers = 2  # the robot, still on the old type
+    _reap(process, 0.05)
+    assert len(old.sent) == 3
+    assert old not in process._node.destroyed
+
+
+def test_the_new_type_s_writer_is_created_once_the_window_ends(process):
+    """The keep ends with the window; acknowledged, the old writer goes, and
+    the new type's writer follows."""
+    old = _retargeted_in_the_window(process)
+    process.clock.now = process._replacement_until + 0.01
+    process._reap_retiring(process.clock.now)
+    assert old in process._node.destroyed
+    process._create_pending(process.clock.now)
+    assert process._writers["drive"].publisher is not None
+
+
+def test_a_kept_writer_not_acknowledged_at_the_window_s_end_leaves_after_the_type_change_wait(
+        process, monkeypatch):
+    old = _retargeted_in_the_window(process)
+    monkeypatch.setattr(process, "_acked", lambda publisher: False)
+    process.clock.now = process._replacement_until + 0.01
+    # A turn's order: pending writers first, then the retiring ones.
+    process._create_pending(process.clock.now)
+    process._reap_retiring(process.clock.now)  # the keep ends
+    process._create_pending(process.clock.now)
+    assert process._writers["drive"].publisher is None
     process.clock.now += 0.6
     process._create_pending(process.clock.now)
-    assert process._writers["other"].publisher is not None
-    assert publisher in process._node.destroyed
+    assert process._writers["drive"].publisher is not None
+    assert old in process._node.destroyed
+
+
+def test_a_stop_is_not_held_by_a_new_type_waiting_for_a_kept_writer(process):
+    _retargeted_in_the_window(process)
+    assert process._handle(("stop",)) is False
+    assert not process._retiring
 
 
 def test_outside_a_replacement_a_fire_is_not_resent(process):
