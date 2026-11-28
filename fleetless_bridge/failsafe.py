@@ -20,7 +20,8 @@ The **supervisor thread** reads the process's reports and watches three things.
 Any of them makes the watchdog `failed`:
 
 - a fire later than the bound (`late_fire`);
-- a second without an `alive` (`not_alive`; one is sent every 0.25 s);
+- a second without a word from the process (`not_alive`; any report counts,
+  and it says `alive` every 0.25 s);
 - the process ending, or two loop errors within 60 s (`crashed`).
 
 It does not run on the executor's heartbeat timer, for one reason: the
