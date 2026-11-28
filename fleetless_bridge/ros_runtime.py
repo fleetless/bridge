@@ -50,19 +50,21 @@ callbacks, exactly like a subscription's. Those callbacks feed `self.jobs`
 uses, except `JobUpdateQueue` never drops — a job result has no successor
 the way a sensor sample does.
 
-The failsafe timer is the one piece of this file that
-must keep working with no cloud, no asyncio loop, and no client connected at
-all — it is the platform's safety primitive, independent of everything else
-here by design. It is deliberately not one rclpy `Timer` per publisher,
-reset on every publish: `Timer.reset()` does not reliably resume a
-`cancel()`-ed timer across rclpy versions, and juggling per-publisher timer
-lifecycles (create on config-apply, destroy on retarget/removal, reset on
-publish, all from different call sites) is exactly the kind of thing "one
-rule is easier to keep correct than two" argues against. Instead one shared
-timer, ticking at `FAILSAFE_CHECK_INTERVAL_S`, scans every publisher and
-compares `time.monotonic()` against `last_activity_at` — plain, testable
-arithmetic, on the executor thread, entirely untouched by whether a
-WebSocket happens to be open right now.
+The failsafe is the one piece of this bridge that must keep working with
+no cloud, no asyncio loop and no client connected at all: it is the
+platform's safety primitive, independent of everything else here by design.
+It does not live in this file any more. It runs in a process of its own
+(`failsafe.py`, `failsafe_process.py`; fleetless/fleetless#1124), because a
+thread here needs this interpreter's GIL to publish, and under a busy
+executor that made it up to hundreds of milliseconds late. That process owns
+the only writer of every publisher: `_publish` builds the client's message
+here, as before, and hands it over serialized, so the failsafe always lands
+after every command that came before it. A publish is refused while the
+watchdog is not `ok` (fail closed).
+
+What stays here is the shared watchdog tick for goals, service calls and
+terminal results (`_check_watchdogs`), and it exists only while one of them
+is due (`_watchdog_needed`).
 """
 from __future__ import annotations
 
@@ -106,7 +108,6 @@ from action_msgs.msg import GoalStatus, GoalStatusArray
 from action_msgs.srv import CancelGoal
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
 from rclpy.action import ActionClient
-from rclpy.duration import Duration
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.qos import (
     DurabilityPolicy,
@@ -123,6 +124,8 @@ from fleetless_bridge import (
     camera, camera_sources, introspection, live, live_encoder, params, sampling,
 )
 from fleetless_bridge import live_passthrough, passthrough
+from fleetless_bridge.failsafe import FailsafeWatchdog
+from fleetless_bridge.failsafe_process import PARTING_FAILSAFE_ACK_TIMEOUT_S  # noqa: F401 - re-exported
 from fleetless_bridge.jobs import JobManager, JobUpdate
 from fleetless_bridge.goal_state import (
     load_mapping, load_terminal_observations, mapping_path, save_mapping,
@@ -211,11 +214,11 @@ _WAIT_TIMEOUT_ERRORS = (
 
 DEFAULT_SAMPLE_QUEUE_SIZE = 1000
 
-# How often the shared failsafe watchdog re-checks every publisher.
-# Well below any realistic `timeout_ms` (a cmd_vel publisher's is
-# typically in the low hundreds of ms) so a fire lands within roughly this
-# margin of the deadline, never late by more than that.
-FAILSAFE_CHECK_INTERVAL_S = 0.01
+# How often the shared watchdog tick checks goals, service calls and terminal
+# results while one of them is due (`_watchdog_needed`); there is no tick
+# while nothing is. Each of those bounds is met within this of its deadline.
+# The failsafe is not on it any more (`failsafe.py`).
+WATCHDOG_INTERVAL_S = 0.01
 
 # How long `server_is_ready()` must report "not ready" *without a single
 # break* before a running goal's action server is declared gone
@@ -255,24 +258,6 @@ TERMINAL_RESULT_WAIT_S = 10.0
 # be written usually stays that way, and every own job would otherwise log
 # the same line twice.
 GOAL_STATE_ERROR_LOG_INTERVAL_S = 60.0
-
-# How long a removed publisher's handle outlives its last failsafe. A
-# reliable writer resends a sample its readers have not acknowledged; a
-# destroyed one resends nothing, so a failsafe dropped on first send and
-# destroyed a moment later never arrives and the robot keeps its last
-# command. The handle stays until every reader has acknowledged or this
-# runs out -- a reader that vanished without unmatching never will. Longer
-# than one Fast DDS heartbeat period (3 s by default), which is how long a
-# resend between processes can take.
-PARTING_FAILSAFE_ACK_TIMEOUT_S = 4.0
-
-# The one exception to not blocking for a retiring publisher: a new
-# publisher of a different type on a topic a retiring handle still holds,
-# which the middleware refuses within one node. The old handle gets this
-# long to be acknowledged, on the executor thread, and then goes. Short,
-# because every other publisher's watchdog waits with it; rare, because it
-# takes a type change on a driven publisher.
-TYPE_CHANGE_ACK_WAIT_S = 0.5
 
 # How many jobs `JobManager` may hold at once — every job not yet
 # *delivered* (jobs.py's own `finish`/`tracked_count`), whether still
@@ -346,7 +331,7 @@ GOAL_ACCEPT_TIMEOUT_S = 15.0
 DEFAULT_URDF_TOPIC = "/robot_description"
 
 # How often the active "does a publisher still exist" check runs — its own
-# timer, separate from `FAILSAFE_CHECK_INTERVAL_S`'s 10ms
+# timer, separate from `WATCHDOG_INTERVAL_S`'s 10ms
 # cadence. `count_publishers` is a real graph query, not a dict lookup, and
 # unlike a failsafe there is nothing safety-critical about noticing a lost
 # URDF within milliseconds — a few seconds of latency is the honest cost of
@@ -947,6 +932,7 @@ class GoalTracker:
     def __init__(
         self, node, action_class: type, ros_name: str,
         on_terminal_status: Optional[Callable[[str, float], None]] = None,
+        on_status: Optional[Callable[[], None]] = None,
     ) -> None:
         self._action_class = action_class
         self._ros_name = ros_name
@@ -968,6 +954,9 @@ class GoalTracker:
         # omit that goal, but its result can still be outstanding.
         self._terminal_seen_at: Dict[str, float] = {}
         self._on_terminal_status = on_terminal_status
+        # Told after every status snapshot, so a goal nobody here sent makes
+        # the watchdog tick exist (`RosRuntime._arm_watchdog`).
+        self._on_status_seen = on_status
         # Goal ids `forget_own_goal` just dropped, until a status snapshot
         # names the goal ended or no longer names it — see there. A dict
         # used as an ordered set, capped at `_RECENTLY_OWN_LIMIT` (oldest
@@ -1028,6 +1017,8 @@ class GoalTracker:
             del self._feedback[goal_id]
         for goal_id in [g for g in self._recently_own if g not in active]:
             del self._recently_own[goal_id]
+        if self._on_status_seen is not None:
+            self._on_status_seen()
 
     def _on_feedback(self, msg) -> None:
         self._feedback[_goal_id_str(msg.goal_id)] = msg.feedback
@@ -1217,27 +1208,10 @@ class _PublisherEntry:
     failsafe_body: object = None
     timeout_ms: int = 0
     quiet_timeout_ms: int = 0
-    handle: object = None  # the rclpy Publisher, set once created
-    # Watchdog bookkeeping for the failsafe timer. `None` means
-    # dormant — nobody has ever published, so there is nothing to protect
-    # against and no failsafe fires no matter how long that stays true.
-    # `_failsafe_sent` re-arms on the next publish: the timer fires the
-    # failsafe once per silence period, not on every tick of continued
-    # silence after the first.
+    # When a client's publish last went out; `None` while nobody has
+    # published. The failsafe process keeps its own clock; this one is for
+    # reading, not for firing.
     last_activity_at: Optional[float] = None
-    _failsafe_sent: bool = False
-
-
-@dataclass
-class _RetiringPublisher:
-    """A publisher already removed from `_publishers` whose handle is kept
-    until its last failsafe is acknowledged (`PARTING_FAILSAFE_ACK_TIMEOUT_S`)."""
-
-    slug: str
-    topic: str
-    type_name: str
-    handle: object
-    deadline: float
 
 
 class UploadResult(NamedTuple):
@@ -1751,6 +1725,7 @@ class RosRuntime:
         self,
         *,
         node_name: str = "fleetless_bridge",
+        failsafe_options: Optional[Dict[str, Any]] = None,
         sample_queue_maxsize: int = DEFAULT_SAMPLE_QUEUE_SIZE,
         live_publisher_factory: Optional[Callable[..., object]] = None,
         snapshot_max_bytes: int = camera.SNAPSHOT_MAX_BYTES,
@@ -1768,7 +1743,13 @@ class RosRuntime:
         self._node = None
         self._executor: Optional[SingleThreadedExecutor] = None
         self._guard = None
-        self._failsafe_timer = None
+        # The tick for goals, service calls and terminal results; exists
+        # only while one of them is due (`_arm_watchdog`).
+        self._watchdog_timer = None
+        self._failsafe: Optional[FailsafeWatchdog] = None
+        self._failsafe_options = failsafe_options
+        self._failsafe_state_callback: Optional[Callable[[str, Optional[str], Optional[float]], None]] = None
+        self._publish_refusal_logged_at: Dict[str, float] = {}
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._work_lock = threading.Lock()
@@ -1799,9 +1780,6 @@ class RosRuntime:
         self._actions: Dict[str, _ActionEntry] = {}
         self._services: Dict[str, _ServiceEntry] = {}
         self._publishers: Dict[str, _PublisherEntry] = {}
-        # Removed publishers whose parting failsafe is still unacknowledged;
-        # `_reap_retiring_publishers` destroys them from the watchdog tick.
-        self._retiring_publishers: List[_RetiringPublisher] = []
         self._cameras: Dict[str, _CameraEntry] = {}
         # The last background health error *reported to the wire* for a
         # slug, or absent — deliberately keyed by slug, not held on
@@ -2147,14 +2125,16 @@ class RosRuntime:
             ),
         )
         self._node.add_on_set_parameters_callback(self._on_set_parameters)
-        # One shared watchdog, two independent checks on the same cadence —
-        # same "one rule beats juggling a lifecycle per entity" reasoning
-        # `_check_failsafes` already uses, now applied to goal acceptance
-        # too rather than one rclpy Timer per in-flight goal. Runs for the
-        # whole life of the node, whether or not anything is configured yet.
-        self._failsafe_timer = self._node.create_timer(
-            FAILSAFE_CHECK_INTERVAL_S, self._check_watchdogs
+        # The failsafe process (fleetless/fleetless#1124), started beside
+        # the runtime and self-tested by its supervisor: no publish is taken
+        # before the watchdog proved it meets its bound. Not waited for, so
+        # a stop during the start stays as quick as it was. The goal and
+        # service tick is no longer created here: it exists only while
+        # something is due (`_arm_watchdog`).
+        self._failsafe = FailsafeWatchdog(
+            self._node_name, on_state=self._on_failsafe_state, options=self._failsafe_options,
         )
+        self._failsafe.start()
         # The 1 Hz job heartbeat (protocol 4) — its own timer, not folded
         # into `_check_watchdogs`: `JOB_HEARTBEAT_INTERVAL_MS` is a wire
         # cadence the cloud actually measures against, a hundred times
@@ -2222,6 +2202,11 @@ class RosRuntime:
                 self._submit(teardown, timeout=WORK_TIMEOUT_S)
             except Exception:  # noqa: BLE001 - shutting down anyway; the next step still runs
                 log.exception("Error during %s on shutdown", teardown.__name__)
+        if self._failsafe is not None:
+            # After the publishers' teardown above: each was disarmed, and the
+            # process sent each parting failsafe owed and waits for its
+            # acknowledgement before it exits.
+            self._failsafe.stop()
         self._executor.shutdown()
         self._node.destroy_node()
         rclpy.shutdown()
@@ -2245,9 +2230,6 @@ class RosRuntime:
     def _destroy_all_publishers(self) -> None:
         for slug in list(self._publishers):
             self._destroy_publisher(slug)
-        # Shutdown follows straight after, so the parting failsafes are
-        # waited for here rather than on a tick that will not come.
-        self._reap_retiring_publishers(block=True)
 
     def _destroy_all_cameras(self) -> None:
         """Only ever called from `RosRuntime.stop()`'s final teardown
@@ -2530,6 +2512,31 @@ class RosRuntime:
         for key in LOW_BANDWIDTH_DEFAULTS:
             values[key] = self._node.get_parameter("low_bandwidth." + key).value
         return values
+
+    def on_failsafe_state(
+        self, callback: Callable[[str, Optional[str], Optional[float]], None]
+    ) -> None:
+        """`callback(state, reason, lateness_ms)` on the asyncio loop on every
+        change of the failsafe watchdog's state; `client.py` turns it into
+        the `failsafe_watchdog` frame."""
+        self._failsafe_state_callback = callback
+
+    def failsafe_state(self) -> Tuple[str, Optional[str], Optional[float]]:
+        """The watchdog's current `(state, reason, lateness_ms)`, restated
+        after every `hello_ok`."""
+        if self._failsafe is None:
+            return ("starting", None, None)
+        return self._failsafe.snapshot()
+
+    def _on_failsafe_state(self, state: str, reason: Optional[str], lateness_ms: Optional[float]) -> None:
+        # Called from the watchdog's own threads (or `start()`'s).
+        callback = self._failsafe_state_callback
+        loop = self._loop
+        if callback is not None and loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(callback, state, reason, lateness_ms)
+            except RuntimeError:
+                pass  # the loop closed between the check and the call; nothing left to tell
 
     def on_low_bandwidth_params(
         self, callback: Callable[[Dict[str, Any]], None]
@@ -3880,6 +3887,7 @@ class RosRuntime:
         client = ActionClient(self._node, action_class, cfg.ros_name)
         tracker = GoalTracker(
             self._node, action_class, cfg.ros_name, self._record_terminal_observation,
+            on_status=self._arm_watchdog,
         )
         entry = _ActionEntry(
             ros_name=cfg.ros_name,
@@ -3932,6 +3940,7 @@ class RosRuntime:
             )
             self._reconciling[job_id] = [slug, goal_id, deadline, False]
         self._check_reconciled_goals()
+        self._arm_watchdog()
 
     def _check_reconciled_goals(self) -> None:
         """The watchdog half of `_reconcile_persisted_goals`, on every
@@ -4166,6 +4175,7 @@ class RosRuntime:
         # frame, so there is no constant left to fall back to.
         patience_s = patience_ms / 1000.0
         self._goal_deadlines[job_id] = (slug, time.monotonic() + patience_s, patience_s)
+        self._arm_watchdog()
 
         # The bridge chooses the goal id itself, rather than letting rclpy
         # generate a random one inside `send_goal_async` — so it is known,
@@ -4610,6 +4620,9 @@ class RosRuntime:
         successful `hello_ok` is simply skipped for this tick and
         discovered again, identically, on the next one, once there is
         somewhere to tell the cloud about it at all."""
+        # A backstop for an insertion that forgot to arm the watchdog tick,
+        # never the path a bound depends on (each insertion arms it).
+        self._arm_watchdog()
         if not self._actions:
             return
         timestamp_ms = sampling.capture_timestamp_ms()
@@ -4794,6 +4807,7 @@ class RosRuntime:
         # side wins the race with `_check_service_timeouts`.
         patience_s = patience_ms / 1000.0
         self._service_deadlines[job_id] = (slug, time.monotonic() + patience_s, patience_s, call_future)
+        self._arm_watchdog()
         call_future.add_done_callback(
             lambda fut, job_id=job_id, slug=slug: self._on_service_result(job_id, slug, fut)
         )
@@ -4853,6 +4867,9 @@ class RosRuntime:
                     entry.failsafe_body = failsafe_body
                     entry.timeout_ms = cfg.failsafe.timeout_ms
                     entry.quiet_timeout_ms = cfg.quiet_timeout_ms
+                    # A changed body or `timeout_ms` re-arms in the process:
+                    # a pending deadline is recomputed from the last publish.
+                    self._failsafe.arm(slug, entry.topic, entry.type_name, failsafe_body, entry.timeout_ms)
                 else:
                     self._create_publisher(slug, cfg, messages)
             except Exception as exc:  # noqa: BLE001 - one bad slug, not the whole apply
@@ -4880,8 +4897,9 @@ class RosRuntime:
             message_class, cfg.failsafe.message, shared=messages,
         )
 
-        self._release_topic_for_type(cfg.topic, cfg.type)
-        handle = self._node.create_publisher(message_class, cfg.topic, 10)
+        # The writer itself is the failsafe process's: one writer per topic,
+        # so the failsafe lands after every command before it.
+        self._failsafe.arm(slug, cfg.topic, cfg.type, failsafe_body, cfg.failsafe.timeout_ms)
         self._publishers[slug] = _PublisherEntry(
             topic=cfg.topic,
             type_name=cfg.type,
@@ -4892,112 +4910,21 @@ class RosRuntime:
             failsafe_body=failsafe_body,
             timeout_ms=cfg.failsafe.timeout_ms,
             quiet_timeout_ms=cfg.quiet_timeout_ms,
-            handle=handle,
         )
 
     def _destroy_publisher(self, slug: str) -> None:
-        """Tears down a publisher — on removal, on a retarget (which is a
-        destroy followed by a create under a new topic/type), and as part of
-        `RosRuntime.stop()` shutting every publisher down. All three funnel
-        through here, which is deliberate: an *armed* publisher (one that
-        has actually been driven and has not already fired) is about to
-        lose the only thing that could ever stop it — once `handle` is
-        destroyed, nothing will ever publish to that topic again, so a
-        client that has already gone quiet leaves the robot holding its
-        last command forever, silently, with no failsafe to catch it (a
-        config change or a shutdown mid-motion is
-        ordinary use, not an edge case, and has no platform e-stop to
-        fall back on). One last failsafe publish before teardown closes
-        that hole for all three callers at once. A publisher that was never
-        used gets no such parting shot — nothing was promised, so there is
-        nothing to make good on."""
+        """Tears down a publisher: on removal, on a retarget (a destroy
+        followed by a create under the new topic or type), and in `stop()`.
+        An *armed* publisher (driven, and its failsafe not sent since) is
+        about to lose the only thing that could ever stop it, so the failsafe
+        process sends one last failsafe, and keeps the writer until its
+        readers acknowledged it (`PARTING_FAILSAFE_ACK_TIMEOUT_S`). A
+        publisher nobody used gets no parting shot: nothing was promised."""
         entry = self._publishers.pop(slug, None)
-        if entry is None or entry.handle is None:
+        if entry is None:
             return
-        if entry.last_activity_at is not None:
-            if not entry._failsafe_sent:
-                self._fire_failsafe(slug, entry)
-            # Not destroyed yet, whether the failsafe fired just now or the
-            # watchdog fired it a moment ago: either can still be unacknowledged
-            # (PARTING_FAILSAFE_ACK_TIMEOUT_S). Kept off the executor thread's
-            # back, too -- blocking here would hold up every other publisher's
-            # watchdog for as long as the wait.
-            self._retiring_publishers.append(_RetiringPublisher(
-                slug=slug,
-                topic=entry.topic,
-                type_name=entry.type_name,
-                handle=entry.handle,
-                deadline=time.monotonic() + PARTING_FAILSAFE_ACK_TIMEOUT_S,
-            ))
-            return
-        self._node.destroy_publisher(entry.handle)
-
-    def _release_topic_for_type(self, topic: str, type_name: str) -> None:
-        """Destroys every retiring handle on `topic` whose type differs from
-        `type_name`, after at most `TYPE_CHANGE_ACK_WAIT_S` for its last
-        failsafe to be acknowledged -- otherwise the new publisher could not
-        be created at all."""
-        keep: List[_RetiringPublisher] = []
-        for retiring in self._retiring_publishers:
-            if retiring.topic != topic or retiring.type_name == type_name:
-                keep.append(retiring)
-                continue
-            wait_s = min(max(retiring.deadline - time.monotonic(), 0.0), TYPE_CHANGE_ACK_WAIT_S)
-            try:
-                acked = retiring.handle.wait_for_all_acked(Duration(nanoseconds=int(wait_s * 1e9)))
-            except Exception:  # noqa: BLE001 - the new publisher still has to be created
-                log.exception("Publisher slug %r: could not ask whether its failsafe was acknowledged", retiring.slug)
-                acked = True
-            if not acked:
-                log.warning(
-                    "Publisher slug %r: its last failsafe was not acknowledged within %.1f s; "
-                    "destroying it so %s can take %s",
-                    retiring.slug,
-                    wait_s,
-                    type_name,
-                    topic,
-                )
-            try:
-                self._node.destroy_publisher(retiring.handle)
-            except Exception:  # noqa: BLE001 - creation reports its own failure if this left the topic taken
-                log.exception("Publisher slug %r: its retired handle could not be destroyed", retiring.slug)
-        self._retiring_publishers = keep
-
-    def _reap_retiring_publishers(self, block: bool = False) -> None:
-        """Destroys every retiring publisher whose last failsafe has been
-        acknowledged, or whose time is up. From the watchdog tick it only
-        looks; from shutdown (`block=True`) it waits out each deadline. One
-        handle that fails to answer or to go does not stop the others."""
-        if not self._retiring_publishers:
-            return
-        keep: List[_RetiringPublisher] = []
-        for retiring in self._retiring_publishers:
-            remaining = retiring.deadline - time.monotonic()
-            wait_s = max(remaining, 0.0) if block else 0.0
-            try:
-                acked = retiring.handle.wait_for_all_acked(Duration(nanoseconds=int(wait_s * 1e9)))
-            except Exception:  # noqa: BLE001 - an RMW without the call must not keep the handle forever
-                log.exception(
-                    "Publisher slug %r: could not ask whether its failsafe was acknowledged; "
-                    "destroying the publisher now",
-                    retiring.slug,
-                )
-                acked = True  # nothing more to learn by waiting; the exception says what happened
-            if not acked and not block and remaining > 0:
-                keep.append(retiring)
-                continue
-            if not acked:
-                log.warning(
-                    "Publisher slug %r: its last failsafe was not acknowledged within %.1f s; "
-                    "destroying the publisher anyway",
-                    retiring.slug,
-                    PARTING_FAILSAFE_ACK_TIMEOUT_S,
-                )
-            try:
-                self._node.destroy_publisher(retiring.handle)
-            except Exception:  # noqa: BLE001 - the next handle still has to go
-                log.exception("Publisher slug %r: its retired handle could not be destroyed", retiring.slug)
-        self._retiring_publishers = keep
+        self._publish_refusal_logged_at.pop(slug, None)
+        self._failsafe.disarm(slug)
 
     def _publish(self, slug: str, message_dict: dict) -> None:
         entry = self._publishers.get(slug)
@@ -5015,14 +4942,19 @@ class RosRuntime:
         except Exception:  # noqa: BLE001 - nothing to report to; log and move on
             log.exception("Could not build a message for publisher slug %r", slug)
             return
-        entry.handle.publish(msg)
-        # Marks the publisher active — the failsafe timer measures silence
-        # from this, not from config-apply time (the format is about a
-        # publisher that *was* being driven going quiet, not an unused one)
-        # — and re-arms it: a fresh publish means a fresh silence period to
-        # watch, so the next one that runs out gets its own failsafe.
+        # The failsafe process publishes it on the topic's one writer, and
+        # that publish re-arms the failsafe there. Refused while the watchdog
+        # is not `ok`: fail closed.
+        if not self._failsafe.publish(slug, msg):
+            now = time.monotonic()
+            if now - self._publish_refusal_logged_at.get(slug, -1e9) >= 1.0:
+                self._publish_refusal_logged_at[slug] = now
+                log.warning(
+                    "Publisher slug %r: publish refused — the failsafe watchdog is %s",
+                    slug, self._failsafe.state,
+                )
+            return
         entry.last_activity_at = time.monotonic()
-        entry._failsafe_sent = False
 
     # --- cameras: apply, runs on the executor thread -----
 
@@ -5839,57 +5771,47 @@ class RosRuntime:
     # --- the shared watchdog: one timer, runs on the executor ---------------
 
     def _check_watchdogs(self) -> None:
-        """The one timer `start()` creates, ticking every
-        `FAILSAFE_CHECK_INTERVAL_S`. Independent checks share it rather than
-        each getting a timer of its own — the same reasoning
-        `_check_failsafes` already used for per-publisher timers, now
-        applied to per-goal and per-camera ones too."""
-        # Guarded: whatever goes wrong retiring an old handle must not cost
-        # the live publishers their watchdog on this tick.
-        try:
-            self._reap_retiring_publishers()
-        except Exception:  # noqa: BLE001 - the failsafe check below matters more
-            log.exception("Retiring publishers failed on this tick")
-        self._check_failsafes()
+        """The watchdog tick, every `WATCHDOG_INTERVAL_S` while something is
+        due (`_watchdog_needed`), and gone on the first tick on which nothing
+        is. Five checks share it rather than each getting a timer of its
+        own. The failsafe left it (`failsafe.py`)."""
         self._check_goal_timeouts()
         self._check_service_timeouts()
         self._check_terminal_result_timeouts()
         self._check_action_server_liveness()
         self._check_reconciled_goals()
+        if not self._watchdog_needed():
+            self._disarm_watchdog()
 
-    def _check_failsafes(self) -> None:
-        """Ticks every `FAILSAFE_CHECK_INTERVAL_S` regardless of anything
-        else happening in the process — no cloud connection, no client, no
-        asyncio loop involved at all (independent of the cloud is
-        the whole point). A publisher that has never been published to is
-        left alone; one that has and has gone quiet for `timeout_ms` gets
-        its failsafe fired exactly once, not once per tick of continued
-        silence."""
-        now = time.monotonic()
-        for slug, entry in list(self._publishers.items()):
-            if entry.last_activity_at is None or entry._failsafe_sent:
+    def _watchdog_needed(self) -> bool:
+        """Whether anything the tick watches is due: the one definition, asked
+        after every change."""
+        if self._goal_deadlines or self._service_deadlines or self._reconciling:
+            return True
+        for _job_id, _slug, state in self.jobs.active_jobs():
+            if state == "running":
+                return True
+        for entry in self._actions.values():
+            if entry.tracker is None:
                 continue
-            silent_ms = (now - entry.last_activity_at) * 1000.0
-            if silent_ms >= entry.timeout_ms:
-                self._fire_failsafe(slug, entry)
-                entry._failsafe_sent = True
+            if entry.liveness_first_tick is not None or entry.tracker.active_goal_ids():
+                return True
+        return False
 
-    def _fire_failsafe(self, slug: str, entry: "_PublisherEntry") -> None:
-        try:
-            msg = params.build_message(entry.message_class, entry.failsafe_body)
-        except Exception:  # noqa: BLE001 - config-apply already validated this; be defensive anyway
-            log.exception(
-                "Publisher slug %r: could not build its failsafe message — nothing was "
-                "published, which is worse than a stale value, so this is logged loudly",
-                slug,
-            )
+    def _arm_watchdog(self) -> None:
+        """Creates the tick if something is due and it does not exist. Only on
+        the executor thread (this file's rule for node entities)."""
+        if self._watchdog_timer is not None or self._node is None or self._stopped:
             return
-        entry.handle.publish(msg)
-        log.warning(
-            "Publisher slug %r: no publish for %d ms — the bridge published its failsafe",
-            slug,
-            entry.timeout_ms,
-        )
+        if self._watchdog_needed():
+            self._watchdog_timer = self._node.create_timer(WATCHDOG_INTERVAL_S, self._check_watchdogs)
+
+    def _disarm_watchdog(self) -> None:
+        timer, self._watchdog_timer = self._watchdog_timer, None
+        if timer is not None:
+            # Safe inside the timer's own callback on every distribution
+            # (rclpy defers the destroy until the handle is not in use).
+            self._node.destroy_timer(timer)
 
     def _check_goal_timeouts(self) -> None:
         """A goal still waiting on `_goal_deadlines` past its deadline gets
@@ -6494,7 +6416,7 @@ class RosRuntime:
     def _on_robot_description(self, msg: StringMsg) -> None:
         """The subscription callback for `DEFAULT_URDF_TOPIC` — runs on the
         executor thread, for the life of the node, independent of any
-        session being connected (same as `_check_failsafes`). Availability
+        session being connected (same as the failsafe watchdog). Availability
         only: this queues a report, never bytes.
 
         Dedupes by content hash: this is the *change* channel, queueing a

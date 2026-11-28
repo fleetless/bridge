@@ -1445,7 +1445,8 @@ DOC_EXT = {".md", ".txt", ".yaml", ".yml"}
 #: ``debian/postinst`` is a shell script; the rest of ``debian/`` and all of
 #: ``apt/reprepro/conf/`` are declarative control files that describe this
 #: package to its own reader.
-CODE_NAMES = {"rules", "postinst", "preinst", "prerm", "postrm", "Dockerfile.dev"}
+CODE_NAMES = {"rules", "postinst", "preinst", "prerm", "postrm", "Dockerfile.dev", "Dockerfile.sim",
+              "Dockerfile.viewer"}
 DOC_NAMES = {"changelog", "control", "copyright", "format", "distributions", "options",
              "fleetless_bridge", ".gitignore", "LICENSE", "NOTICE"}
 

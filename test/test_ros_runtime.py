@@ -74,6 +74,7 @@ from fleetless_bridge.ros_runtime import (
     JOB_HEARTBEAT_INTERVAL_MS,
     MESH_MAX_FAILED_PER_SYNC,
     PARTING_FAILSAFE_ACK_TIMEOUT_S,
+    WATCHDOG_INTERVAL_S,
     URDF_ASSET_NAME,
     AssetProgress,
     CameraStateQueue,
@@ -565,6 +566,17 @@ def _start_independent_subscriber(topic, msg_type, own_context=False):
     return witness.received, witness.subscription, witness.stop
 
 
+class _writer_of:
+    """A publisher's writer, which lives in the failsafe process: as much of
+    an rclpy `Publisher` as `_wait_until_matched` asks for."""
+
+    def __init__(self, rt, slug):
+        self._rt, self._slug = rt, slug
+
+    def get_subscription_count(self):
+        return self._rt._failsafe.subscription_count(self._slug)
+
+
 #: `test/witness_process.py`: a subscriber that runs as a process of its own.
 WITNESS_PROCESS = pathlib.Path(__file__).with_name("witness_process.py")
 
@@ -673,21 +685,35 @@ class _WitnessProcess:
         self._stopped = True
 
 
-def _start_witness_process(topic):
+def _start_witness_process(topic, transports="UDPv4"):
     """A `geometry_msgs/msg/Twist` subscriber on `topic` in a process of its
     own (`test/witness_process.py`), as a robot's subscriber is.
 
     Started with `sys.executable` and this process's environment, so it is in
     the same ROS domain and uses the same RMW and Fast DDS as the bridge under
     test. Does not wait for it: `wait_for("ready", ...)` does. Every caller
-    calls `stop()` in `finally`."""
+    calls `stop()` in `finally`.
+
+    On UDP by default, as the failsafe process is
+    (`failsafe.CHILD_TRANSPORTS`), because it starts fresh: every sample it
+    measures comes from that process over UDP either way, and with shared
+    memory a witness that first finds the bridge would only add a stall of
+    its own. Fast DDS 2.x sleeps up to 333 ms the first time it sends to the
+    bridge's main process's port once that port is more than a second old,
+    and the samples it is receiving wait too. That is a limit of the
+    subscriber's Fast DDS, recorded on fleetless/fleetless#1124, not lateness
+    of the bridge. `transports=None` keeps this process's setting: Fast DDS's
+    defaults, as a robot's subscriber runs."""
+    env = os.environ.copy()
+    if transports is not None:
+        env["FASTDDS_BUILTIN_TRANSPORTS"] = transports
     process = subprocess.Popen(
         [sys.executable, str(WITNESS_PROCESS), topic],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
-        env=os.environ.copy(),
+        env=env,
     )
     return _WitnessProcess(topic, process)
 
@@ -765,7 +791,7 @@ async def _drain_until_terminal(rt, timeout=5.0):
             return updates
 
 
-async def _with_runtime(body, **runtime_kwargs):
+async def _with_runtime(body, wait_for_failsafe=True, **runtime_kwargs):
     # B3: every test gets its own, empty persisted-goal-mapping directory
     # unless it names its own — countless tests below reuse the same
     # slugs and job ids ("count"/"job-1"), and without this they would all
@@ -776,6 +802,18 @@ async def _with_runtime(body, **runtime_kwargs):
     runtime_kwargs.setdefault("goal_state_dir", pathlib.Path(tempfile.mkdtemp()))
     rt = RosRuntime(node_name="test_runtime_{}".format(id(body)), **runtime_kwargs)
     rt.start(asyncio.get_event_loop())
+    # The failsafe process starts beside the runtime; until its self-test
+    # passed no publish is taken. Most tests here are not about that, so they
+    # wait for `ok`: a first self-test late on a loaded machine fails, and the
+    # supervisor retries it every second. A test that makes the self-test
+    # late on purpose waits only for the first verdict.
+    late_on_purpose = (runtime_kwargs.get("failsafe_options") or {}).get("block_before_self_test_s")
+    if not wait_for_failsafe:
+        pass
+    elif late_on_purpose:
+        wait_until(lambda: rt.failsafe_state()[0] != "starting", timeout=30.0)
+    else:
+        wait_until(lambda: rt.failsafe_state()[0] == "ok", timeout=30.0)
     # Tests default to "a session is connected", matching what every test
     # here already assumed before samples had a connected/disconnected
     # distinction. Buffering tests below call rt.set_connected(False)
@@ -2276,8 +2314,13 @@ def test_two_commands_dispatched_back_to_back_reach_ros_in_dispatch_order():
 
     async def body(rt):
         await rt.apply_publishers(by_slug([_publisher_cfg("cmd", topic="/ordering_test")]))
-        received, _sub, stop_sub = _start_independent_subscriber("/ordering_test", Twist)
+        witness = _start_witness("/ordering_test", Twist)
+        received, stop_sub = witness.received, witness.stop
         try:
+            # The writer is in the failsafe process: a sample written before
+            # the witness matched it would be lost, and the test would read
+            # that loss as an order.
+            _wait_until_matched(_writer_of(rt, "cmd"), witness)
             asyncio.get_event_loop().set_default_executor(_ReversingExecutor())
             first = asyncio.ensure_future(rt.publish("cmd", {"speed": 1.0}))
             second = asyncio.ensure_future(rt.publish("cmd", {"speed": 2.0}))
@@ -3035,7 +3078,7 @@ def test_an_aborted_external_goal_fails_as_aborted_without_a_result():
 def test_server_is_ready_raising_is_treated_as_not_ready_and_logged_once_per_job():
     """"server_is_ready() raising: treated as not-ready for the debounce,
     and logged once per job" (spec, "Error handling") — not once per tick,
-    which at `FAILSAFE_CHECK_INTERVAL_S` would be hundreds of log lines for
+    which at `WATCHDOG_INTERVAL_S` would be hundreds of log lines for
     one outage. `server_is_ready` is monkey-patched on the real
     `ActionClient` instance `apply_actions` already created — an instance
     attribute shadows the bound method for this object alone, so nothing
@@ -4063,7 +4106,9 @@ def test_a_bridge_restart_with_the_mapping_removed_lets_the_goal_appear_external
 
     async def body():
         state_dir = pathlib.Path(tempfile.mkdtemp())
-        stop_server = _start_fibonacci_server(steps=40, step_delay=0.05, own_context=True)
+        # Long enough to outlast one runtime's stop and the next one's start,
+        # each of which starts and ends a failsafe process.
+        stop_server = _start_fibonacci_server(steps=80, step_delay=0.05, own_context=True)
         rt1 = RosRuntime(
             node_name="test_restart_no_mapping_before_{}".format(id(object())),
             goal_state_dir=state_dir,
@@ -4452,6 +4497,235 @@ def test_a_service_that_never_responds_times_out_and_frees_the_slug():
     assert update.error[0] == "service_timeout"
 
 
+#: How much later than one interval a tick may start after the one before
+#: it: the timer's wake-up jitter. Microseconds on an idle machine, but more
+#: than 1 ms on a shared one (11.07 against 11.0 measured). Half an interval
+#: keeps every property the check tests: a missed tick shows as 20 ms, a
+#: missing timer as no settling tick at all.
+TICK_JITTER_MS = 5.0
+
+
+class _Settled(dict):
+    """Job id -> the start of the watchdog tick that settled it, with
+    `previous[job_id]`, the start of the tick before that one (`None` when
+    it was the first). Both `time.monotonic()`, as the deadlines are."""
+
+    def __init__(self):
+        super().__init__()
+        self.previous = {}
+
+
+def _record_settled_at(rt):
+    """Wraps the watchdog tick and `_emit_job` to learn which tick settled
+    each job. Called before the tick is armed: the timer takes the wrapped
+    callback."""
+    settled = _Settled()
+    emit = rt._emit_job
+    check = rt._check_watchdogs
+    # `current` only while a tick runs; `last` is the start of the latest.
+    ticks = {"current": None, "previous": None, "last": None}
+
+    def checking():
+        now = time.monotonic()
+        ticks["previous"], ticks["last"], ticks["current"] = ticks["last"], now, now
+        try:
+            return check()
+        finally:
+            ticks["current"] = None
+
+    def recording(job_id, slug, state, **kwargs):
+        if state in ("failed", "lost", "succeeded", "cancelled") and job_id not in settled:
+            settled[job_id] = ticks["current"]
+            settled.previous[job_id] = ticks["previous"] if ticks["current"] is not None else None
+        return emit(job_id, slug, state, **kwargs)
+
+    rt._emit_job = recording
+    rt._check_watchdogs = checking
+    return settled
+
+
+def _assert_settled_within_one_tick(settled, job_id, deadline):
+    """The deadline is met within one tick: the first tick that starts on or
+    after it settles the job, and that tick started one interval after the
+    tick before it (give or take the timer's wake jitter). A tick that did
+    not exist, or a deadline missed by a tick, fails here."""
+    started_at, previous = settled[job_id], settled.previous[job_id]
+    assert started_at is not None, "no watchdog tick settled {}".format(job_id)
+    assert previous is None or previous < deadline, (
+        "a tick at {:.1f} ms after the deadline did not settle {}".format(
+            (previous - deadline) * 1000.0, job_id))
+    late_ms = (started_at - deadline) * 1000.0
+    assert late_ms <= WATCHDOG_INTERVAL_S * 1000.0 + TICK_JITTER_MS, late_ms
+    if previous is not None:
+        assert (started_at - previous) * 1000.0 <= WATCHDOG_INTERVAL_S * 1000.0 + TICK_JITTER_MS
+
+
+def test_the_watchdog_tick_exists_only_while_a_service_call_is_due():
+    """No tick on an idle bridge; one from the call's first moment, its
+    timeout met within one tick (`WATCHDOG_INTERVAL_S`), and none again
+    once nothing is due."""
+
+    async def body(rt):
+        idle = rt._watchdog_timer
+        settled = _record_settled_at(rt)
+        stop_server = _start_trigger_server(delay=3.0)
+        try:
+            await rt.apply_services(by_slug([_service_cfg("do_it")]))
+            await rt.invoke("job-1", "do_it", {}, patience_ms=100)
+            due = rt._watchdog_timer is not None
+            deadline = rt._service_deadlines["job-1"][1]
+            await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)  # running
+            update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+            await asyncio.sleep(0.1)
+            return idle, due, update, (settled, deadline), rt._watchdog_timer
+        finally:
+            stop_server()
+
+    idle, due, update, (settled, deadline), after = run(body)
+    assert idle is None
+    assert due
+    assert update.error[0] == "service_timeout"
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
+def test_the_watchdog_tick_exists_only_while_a_goal_waits_for_acceptance():
+    async def body(rt):
+        idle = rt._watchdog_timer
+        settled = _record_settled_at(rt)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        await rt.invoke("job-1", "count", {"order": 5}, patience_ms=100)
+        due = rt._watchdog_timer is not None
+        deadline = rt._goal_deadlines["job-1"][1]
+        update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        rt.jobs.mark_delivered(update)
+        await asyncio.sleep(0.1)
+        return idle, due, update, (settled, deadline), rt._watchdog_timer
+
+    idle, due, update, (settled, deadline), after = run(body)
+    assert idle is None
+    assert due
+    assert update.error[0] == "goal_timeout"
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
+def test_the_watchdog_tick_exists_only_while_a_terminal_result_is_awaited(monkeypatch):
+    """A goal seen terminal whose result never comes: the tick exists while
+    the job runs, the job ends `job_lost` within one tick of
+    `TERMINAL_RESULT_WAIT_S` (shrunk here), and the tick goes."""
+    monkeypatch.setattr(ros_runtime, "TERMINAL_RESULT_WAIT_S", 0.3)
+
+    async def body(rt):
+        idle = rt._watchdog_timer
+        settled = _record_settled_at(rt)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        tracker = rt._actions["count"].tracker
+        goal_id = "33333333-3333-4333-8333-333333333333"
+
+        def start_and_see_terminal():
+            # On the executor, as the invoke and the status callback run.
+            rt.jobs.start("job-1", "count", "action")
+            rt._job_goal_ids["job-1"] = goal_id
+            tracker.register_own_goal(goal_id, "job-1")
+            tracker._on_status(_status_array((goal_id, GoalStatus.STATUS_SUCCEEDED)))
+            rt._arm_watchdog()
+            return tracker.terminal_seen_at(goal_id)
+
+        observed = rt._enqueue(start_and_see_terminal).result(timeout=5.0)
+        due = rt._watchdog_timer is not None
+        update = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        rt.jobs.mark_delivered(update)
+        await asyncio.sleep(0.1)
+        deadline = observed + ros_runtime.TERMINAL_RESULT_WAIT_S
+        return idle, due, update, (settled, deadline), rt._watchdog_timer
+
+    idle, due, update, (settled, deadline), after = run(body)
+    assert idle is None
+    assert due
+    assert (update.state, update.error[0]) == ("lost", "job_lost")
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
+def test_the_watchdog_tick_exists_only_while_an_action_server_is_watched(monkeypatch):
+    """An accepted goal whose server vanishes: the tick exists while the
+    goal is active, the job ends `action_server_lost` within one tick of the
+    debounce (shrunk here) running out, and the tick goes."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_LIVENESS_DEBOUNCE_S", 0.5)
+
+    async def body(rt):
+        idle = rt._watchdog_timer
+        settled = _record_settled_at(rt)
+        expired_at = []
+        settle = rt._settle_action_server_lost
+
+        def recording(slug, entry, goal_ids):
+            expired_at.append(entry.liveness_since + ros_runtime.ACTION_SERVER_LIVENESS_DEBOUNCE_S)
+            return settle(slug, entry, goal_ids)
+
+        rt._settle_action_server_lost = recording
+        stop_server = _start_fibonacci_server(steps=60, step_delay=0.05)
+        await rt.apply_actions(by_slug([_action_cfg("count")]))
+        await rt.invoke("job-1", "count", {"order": 5}, patience_ms=15000)
+        first = await asyncio.wait_for(rt.jobs.updates.get(), timeout=5.0)
+        assert first.state == "running"
+        wait_until(lambda: rt._actions["count"].liveness_confirmed_ready, timeout=15.0)
+        due = rt._watchdog_timer is not None
+        stop_server()  # the server vanishes mid-goal
+        updates = await _drain_until_terminal(rt, timeout=10.0)
+        rt.jobs.mark_delivered(updates[-1])
+        await asyncio.sleep(0.1)
+        return idle, due, updates[-1], (settled, expired_at[0]), rt._watchdog_timer
+
+    idle, due, update, (settled, deadline), after = run(body)
+    assert idle is None
+    assert due
+    assert (update.state, update.error[0]) == ("lost", "action_server_lost")
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
+def test_the_watchdog_tick_exists_only_while_a_reconciled_goal_is_awaited(monkeypatch):
+    """A goal re-attached after a restart whose server is gone: the tick
+    exists while it is reconciled, the job ends `action_server_lost` within
+    one tick of its deadline (discovery grace plus debounce, both shrunk
+    here), and the tick goes."""
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_DISCOVERY_GRACE_S", 0.3)
+    monkeypatch.setattr(ros_runtime, "ACTION_SERVER_LIVENESS_DEBOUNCE_S", 0.3)
+
+    async def body():
+        state_dir = pathlib.Path(tempfile.mkdtemp())
+        stop_server = _start_fibonacci_server(steps=40, step_delay=0.1, own_context=True)
+        try:
+            await _crash_mid_goal(state_dir, "test_tick_reconciled_before")
+        finally:
+            stop_server()
+        rt2 = RosRuntime(
+            node_name="test_tick_reconciled_after_{}".format(id(object())),
+            goal_state_dir=state_dir,
+        )
+        settled = _record_settled_at(rt2)
+        try:
+            rt2.start(asyncio.get_event_loop())
+            rt2.set_connected(True)
+            await rt2.apply_actions(by_slug([_action_cfg("count")]))
+            deadline = rt2._reconciling["job-1"][2]
+            due = rt2._watchdog_timer is not None
+            updates = await _drain_until_terminal(rt2, timeout=10.0)
+            rt2.jobs.mark_delivered(updates[-1])
+            await asyncio.sleep(0.1)
+            return due, updates[-1], (settled, deadline), rt2._watchdog_timer
+        finally:
+            rt2.stop()
+
+    due, update, (settled, deadline), after = asyncio.run(body())
+    assert due
+    assert (update.state, update.error[0]) == ("lost", "action_server_lost")
+    _assert_settled_within_one_tick(settled, "job-1", deadline)
+    assert after is None
+
+
 def test_a_slug_freed_by_service_timeout_accepts_a_new_invoke():
     """Mirrors `test_a_slug_freed_by_goal_timeout_accepts_a_new_invoke`: the
     point of `service_timeout` is that it frees the slug, not merely that it
@@ -4760,7 +5034,7 @@ def test_a_placeholder_free_shared_failsafe_is_accepted_and_is_what_actually_fir
         )
         received, _, stop_sub = _start_independent_subscriber("/chatter", StringMsg)
         try:
-            wait_until(lambda: rt._publishers["say"].handle.get_subscription_count() > 0)
+            wait_until(lambda: rt._failsafe.subscription_count("say") > 0)
             await rt.publish("say", {"text": "go"})
             wait_until(lambda: any(msg.data == "stop" for msg in received), timeout=5.0)
         finally:
@@ -4820,7 +5094,7 @@ def test_a_publish_template_may_reference_a_shared_message():
         )
         received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist)
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            wait_until(lambda: rt._failsafe.subscription_count("drive") > 0)
             await rt.publish("drive", {"speed": 2.5, "turn": 0.0})
             wait_until(lambda: len(received) > 0)
         finally:
@@ -4857,17 +5131,16 @@ def test_removing_a_publisher_slug_destroys_its_handle():
     run(body)
 
 
-def test_retargeting_a_publishers_topic_replaces_the_handle():
+def test_retargeting_a_publishers_topic_replaces_the_writer():
     async def body(rt):
         await rt.apply_publishers(by_slug([_publisher_cfg("x", topic="/cmd_vel")]))
-        before = rt._publishers["x"].handle
+        wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 1)
         await rt.apply_publishers(by_slug([_publisher_cfg("x", topic="/cmd_vel2")]))
-        after = rt._publishers["x"].handle
-        return before, after, rt._publishers["x"].topic
+        wait_until(lambda: rt._node.count_publishers("/cmd_vel2") == 1)
+        wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 0)
+        return rt._publishers["x"].topic
 
-    before, after, topic = run(body)
-    assert before is not after
-    assert topic == "/cmd_vel2"
+    assert run(body) == "/cmd_vel2"
 
 
 # --- the witness's own helpers ------------------------------------------------
@@ -5009,7 +5282,7 @@ def test_a_command_published_at_the_bridges_match_reaches_a_subscriber_in_anothe
         # A failsafe timeout the test cannot reach: no failsafe may stand in
         # for the command.
         assert await rt.apply_publishers(by_slug([_publisher_cfg("drive", topic=topic, timeout_ms=60_000)])) == []
-        handle = rt._publishers["drive"].handle
+        handle = _writer_of(rt, "drive")
         witness = _start_witness_process(topic)
         try:
             witness.wait_for("ready", WITNESS_PROCESS_READY_TIMEOUT_S, "the witness process never became ready")
@@ -5062,7 +5335,7 @@ def test_publish_sends_a_real_message_an_independent_subscriber_observes():
 
         received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist)
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            wait_until(lambda: rt._failsafe.subscription_count("drive") > 0)
             await rt.publish("drive", {"speed": 1.5, "turn": -0.3})
             wait_until(lambda: len(received) > 0)
         finally:
@@ -5129,7 +5402,7 @@ def test_the_bridge_itself_publishes_the_failsafe_after_silence():
         # topic.
         received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist)
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            wait_until(lambda: rt._failsafe.subscription_count("drive") > 0)
             await rt.publish("drive", {"speed": 1.5, "turn": -0.3})
             # The client stops publishing — by going quiet, which is all the
             # bridge can ever observe; it does not know or care whether that
@@ -5151,7 +5424,7 @@ def test_the_failsafe_fires_exactly_once_per_silence_not_repeatedly():
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=50)]))
         received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist)
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            wait_until(lambda: rt._failsafe.subscription_count("drive") > 0)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) >= 2, timeout=DELIVERY_TIMEOUT_S)
             # Several more timeout periods of continued silence — a second
@@ -5171,7 +5444,7 @@ def test_the_failsafe_re_arms_on_the_next_publish():
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=50)]))
         received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist)
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            wait_until(lambda: rt._failsafe.subscription_count("drive") > 0)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) >= 2, timeout=DELIVERY_TIMEOUT_S)  # publish, first failsafe
 
@@ -5197,8 +5470,10 @@ def test_the_failsafe_timer_needs_no_client_or_cloud_connection():
 
     async def body(rt):
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=50)]))
-        received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist)
+        witness = _start_witness("/cmd_vel", Twist)
+        received, stop_sub = witness.received, witness.stop
         try:
+            _wait_until_matched(_writer_of(rt, "drive"), witness)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) >= 2, timeout=DELIVERY_TIMEOUT_S)
         finally:
@@ -5224,7 +5499,7 @@ def test_removing_an_armed_publisher_fires_its_failsafe_before_teardown():
         witness = _start_witness("/cmd_vel", Twist, own_context=True)
         received = witness.received
         try:
-            _wait_until_matched(rt._publishers["drive"].handle, witness)
+            _wait_until_matched(_writer_of(rt, "drive"), witness)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) == 1, timeout=DELIVERY_TIMEOUT_S)
             await rt.apply_publishers(by_slug([]))  # removed well before the timeout would elapse
@@ -5254,14 +5529,14 @@ def test_a_removed_armed_publisher_is_destroyed_once_its_failsafe_is_acknowledge
         witness = _start_witness("/cmd_vel", Twist, own_context=True)
         received = witness.received
         try:
-            _wait_until_matched(rt._publishers["drive"].handle, witness)
+            _wait_until_matched(_writer_of(rt, "drive"), witness)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) == 1, timeout=DELIVERY_TIMEOUT_S)
             await rt.apply_publishers(by_slug([]))
             # Well inside the bound: gone because it was acknowledged, not
             # because the bound ran out.
-            wait_until(lambda: not rt._retiring_publishers, timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S / 2)
-            wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 0)
+            wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 0,
+                       timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S / 2)
             # Retirement means the RTPS reader *acknowledged* the sample, not
             # that this subscriber's callback has run: the witness has its own
             # context and its own executor. Asserting on `received` straight
@@ -5278,7 +5553,7 @@ def test_a_removed_armed_publisher_is_destroyed_once_its_failsafe_is_acknowledge
 
 def test_a_retiring_publisher_nobody_acknowledges_is_destroyed_at_its_bound():
     """A reader that went away without unmatching never acknowledges; the
-    handle must still go, after `PARTING_FAILSAFE_ACK_TIMEOUT_S` and not
+    writer must still go, after `PARTING_FAILSAFE_ACK_TIMEOUT_S` and not
     before, and say so."""
     import logging
 
@@ -5291,48 +5566,51 @@ def test_a_retiring_publisher_nobody_acknowledges_is_destroyed_at_its_bound():
             self.records.append(record)
 
     handler = _RecordingHandler()
-    ros_runtime_log = logging.getLogger("fleetless_bridge.ros_runtime")
-    ros_runtime_log.addHandler(handler)
+    failsafe_log = logging.getLogger("fleetless_bridge.failsafe")
+    failsafe_log.addHandler(handler)
 
     async def body(rt):
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=10_000)]))
+        wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 1)
         await rt.publish("drive", {"speed": 1.0})
-        # Stands in for the reader that never answers: the RMW call is the
-        # only thing asked, so it is the only thing replaced.
-        rt._publishers["drive"].handle.wait_for_all_acked = lambda timeout: False
         removed_at = time.monotonic()
         await rt.apply_publishers(by_slug([]))
         await asyncio.sleep(PARTING_FAILSAFE_ACK_TIMEOUT_S / 2)
-        still_retiring = len(rt._retiring_publishers)
-        wait_until(lambda: not rt._retiring_publishers, timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
+        still_retiring = rt._node.count_publishers("/cmd_vel")
+        wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 0,
+                   timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
+        wait_until(lambda: any("was not acknowledged" in r.getMessage() for r in handler.records))
         return still_retiring, time.monotonic() - removed_at
 
     try:
-        still_retiring, gone_after_s = run(body)
+        # Stands in for the reader that never answers: the acknowledgement
+        # question in the failsafe process is the only thing replaced.
+        still_retiring, gone_after_s = run(body, failsafe_options={"never_acked": True})
     finally:
-        ros_runtime_log.removeHandler(handler)
+        failsafe_log.removeHandler(handler)
     assert still_retiring == 1
     assert gone_after_s >= PARTING_FAILSAFE_ACK_TIMEOUT_S
-    assert any("was not acknowledged" in r.getMessage() for r in handler.records)
 
 
 def test_a_publisher_whose_watchdog_already_fired_still_retires():
     """Removal right after the watchdog's own failsafe: nothing new fires, but
-    that failsafe can be as unacknowledged as a parting one, so the handle
+    that failsafe can be as unacknowledged as a parting one, so the writer
     retires all the same instead of taking it down with it."""
 
     async def body(rt):
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=50)]))
+        wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 1)
         await rt.publish("drive", {"speed": 1.0})
-        wait_until(lambda: rt._publishers["drive"]._failsafe_sent)  # the watchdog fired
-        # Holds the handle in retirement for the length of the check below.
-        rt._publishers["drive"].handle.wait_for_all_acked = lambda timeout: False
+        wait_until(lambda: rt._failsafe._owed.get("drive") is False)  # the watchdog fired
         await rt.apply_publishers(by_slug([]))
-        retiring = len(rt._retiring_publishers)
-        wait_until(lambda: not rt._retiring_publishers, timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
+        await asyncio.sleep(0.5)
+        retiring = rt._node.count_publishers("/cmd_vel")
+        wait_until(lambda: rt._node.count_publishers("/cmd_vel") == 0,
+                   timeout=PARTING_FAILSAFE_ACK_TIMEOUT_S + 1.0)
         return retiring
 
-    assert run(body) == 1
+    # Holds the writer in retirement for the length of the check above.
+    assert run(body, failsafe_options={"never_acked": True}) == 1
 
 
 def test_a_driven_publisher_can_change_its_type_on_the_same_topic():
@@ -5346,7 +5624,7 @@ def test_a_driven_publisher_can_change_its_type_on_the_same_topic():
         witness = _start_witness("/cmd_vel", Twist, own_context=True)
         received = witness.received
         try:
-            _wait_until_matched(rt._publishers["drive"].handle, witness)
+            _wait_until_matched(_writer_of(rt, "drive"), witness)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(received) == 1, timeout=DELIVERY_TIMEOUT_S)
             errors = await rt.apply_publishers(by_slug([_publisher_cfg(
@@ -5378,7 +5656,7 @@ def test_removing_a_never_used_publisher_stays_silent():
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=50)]))
         received, _, stop_sub = _start_independent_subscriber("/cmd_vel", Twist)
         try:
-            wait_until(lambda: rt._publishers["drive"].handle.get_subscription_count() > 0)
+            wait_until(lambda: rt._failsafe.subscription_count("drive") > 0)
             await rt.apply_publishers(by_slug([]))  # removed without ever being published to
             await asyncio.sleep(0.2)
         finally:
@@ -5401,7 +5679,7 @@ def test_retargeting_an_armed_publisher_fires_the_failsafe_on_the_old_topic():
         new_received, _, stop_new = _start_independent_subscriber("/cmd_vel2", Twist, own_context=True)
         old_received = old_witness.received
         try:
-            _wait_until_matched(rt._publishers["drive"].handle, old_witness)
+            _wait_until_matched(_writer_of(rt, "drive"), old_witness)
             await rt.publish("drive", {"speed": 1.0})
             wait_until(lambda: len(old_received) == 1, timeout=DELIVERY_TIMEOUT_S)
             # A short timeout on the new topic, so a retarget that carried the
@@ -7237,9 +7515,10 @@ def test_stop_fires_the_failsafe_for_an_armed_publisher_before_shutting_down():
     async def scenario():
         rt = RosRuntime(node_name="test_stop_failsafe")
         rt.start(asyncio.get_event_loop())
+        wait_until(lambda: rt.failsafe_state()[0] == "ok", timeout=30.0)
         rt.set_connected(True)
         await rt.apply_publishers(by_slug([_publisher_cfg("drive", timeout_ms=60_000)]))
-        _wait_until_matched(rt._publishers["drive"].handle, witness)
+        _wait_until_matched(_writer_of(rt, "drive"), witness)
         await rt.publish("drive", {"speed": 1.0})
         rt.stop()
 

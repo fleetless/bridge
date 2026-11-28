@@ -147,9 +147,9 @@ def resolve_failsafe_body(message_class, message: Any, *, shared: Mapping[str, A
     before the robot arms a failsafe it could never send — and the moment it
     is needed is an emergency, which is the worst possible time to find out.
 
-    Resolved once, at config-apply time, and stored: `_fire_failsafe` builds
-    from the tree this returns rather than re-following the reference under a
-    watchdog tick."""
+    Resolved once, at config-apply time, and stored: the failsafe process
+    builds its message once from the tree this returns, when the publisher is
+    armed, rather than re-following the reference when the deadline is due."""
     body = templates.dereference(message, shared=shared)
     unfilled = templates.placeholder_names(body)
     if unfilled:

@@ -70,14 +70,23 @@ that needs local limits (a speed cap, an area
 restriction) sets them robot-side, in ROS, in a node the robot's owner
 controls — not through this bridge.
 
-The one child process the bridge starts itself is a Python `multiprocessing`
-worker that owns a V4L2 capture device, so a hung driver read can't block the
-rest of the bridge. It runs this package's own function, not a command line —
-the only configuration value that reaches it is the device path, and
-`validate_device_path` refuses anything but a non-traversing path under
-`/dev/`.
+The bridge starts two child processes itself. One is a Python
+`multiprocessing` worker that owns a V4L2 capture device, so a hung driver
+read can't block the rest of the bridge. It runs this package's own function,
+not a command line — the only configuration value that reaches it is the
+device path, and `validate_device_path` refuses anything but a non-traversing
+path under `/dev/`.
 
-GStreamer starts a second one, and only on a robot whose `live.encoder` is
+The other is the failsafe process, which owns every publisher's writer and
+sends its failsafe on time. The bridge starts it at start-up and starts it
+again whenever the failsafe watchdog fails, and a cloud message can bring
+that about (a publish that keeps the process busy, say). Its command line is
+fixed: this interpreter, `-m fleetless_bridge.failsafe_process`, the file
+descriptor of its socket, the bridge's node name, and options only a test
+passes (the bridge itself passes none).
+Nothing from a cloud message reaches it, and no shell runs it.
+
+GStreamer starts a third, and only on a robot whose `live.encoder` is
 not `software`. The hardware encoders are reached through GStreamer, which
 the bridge loads with the first live session that uses one. When GStreamer's
 plugin registry is missing or stale, its initialisation runs GStreamer's own

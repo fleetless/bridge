@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# The live viewer of `live_viewer.py` in an image of its own, so that it
+# decodes beside the bridge's container and not inside it. A development
+# fixture, never shipped.
+#
+#   docker build -f tools/cpu-sample/Dockerfile.viewer -t cpu-sample-viewer tools/cpu-sample
+FROM python:3.12-slim
+ARG LIVEKIT_VERSION=1.2.2
+RUN pip install --no-cache-dir "livekit==${LIVEKIT_VERSION}"
+COPY live_viewer.py /opt/cpu-sample/live_viewer.py
+USER nobody
+ENTRYPOINT ["python3", "-u", "/opt/cpu-sample/live_viewer.py"]
